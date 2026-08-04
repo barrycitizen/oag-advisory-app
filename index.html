@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>OAG Advisory</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 0; background: #f7f6f3; color: #222; }
+  .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+  .sidebar { background: #fff; border-right: 1px solid #e4e2da; padding: 1rem; }
+  .sidebar button { display: block; width: 100%; text-align: left; padding: 8px; border: none; background: transparent; border-radius: 6px; cursor: pointer; font-size: 13px; margin-bottom: 4px; }
+  .sidebar button.active { background: #f0efe9; }
+  .main { padding: 1.5rem; }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid #e4e2da; margin-bottom: 1rem; }
+  .tabs button { padding: 8px 12px; border: none; background: transparent; cursor: pointer; font-size: 13px; border-bottom: 2px solid transparent; }
+  .tabs button.active { border-bottom-color: #333; font-weight: 500; }
+  .card { background: #fff; border-radius: 8px; padding: 0.9rem; margin-bottom: 10px; border: 1px solid #e4e2da; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .muted { color: #888; font-size: 11px; }
+  .flag { background: #fdf3e0; border-radius: 6px; padding: 10px; margin-bottom: 10px; font-size: 13px; }
+  button.action { padding: 8px 14px; border-radius: 6px; border: 1px solid #ccc; background: #fff; cursor: pointer; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="sidebar">
+    <p class="muted">CLIENT PORTFOLIO</p>
+    <div id="client-list"></div>
+  </div>
+  <div class="main">
+    <h2 id="client-name">Select a client</h2>
+    <div class="tabs" id="tab-bar">
+      <button data-tab="overview" class="active">Overview</button>
+      <button data-tab="entry">Data entry</button>
+      <button data-tab="analysis">Analysis</button>
+      <button data-tab="report">Report</button>
+    </div>
+    <div id="tab-content"></div>
+  </div>
+</div>
+
+<script>
+// ---- CONFIG: fill these in ----
+const SUPABASE_URL = 'https://pptzbtxcotrxtcygxisz.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBwdHpidHhjb3RyeHRjeWd4aXN6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMzMDYyNDgsImV4cCI6MjA5ODg4MjI0OH0.mJlQpNa9yTu0gU4J0HUnyHFhQyfY8UUBSQw8cYewn5U';
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+let currentClientId = null;
+let currentTab = 'overview';
+const today = () => new Date().toISOString().slice(0, 10);
+
+async function callRead(action, client_id) {
+  const res = await fetch('/.netlify/functions/read-data', {
+    method: 'POST',
+    body: JSON.stringify({ action, client_id }),
+  });
+  return res.json();
+}
+
+async function loadClients() {
+  const data = await callRead('list_clients');
+  const list = document.getElementById('client-list');
+  list.innerHTML = '';
+  (data || []).forEach((c) => {
+    const b = document.createElement('button');
+    b.textContent = c.business_description?.split('.')[0] || c.client_id;
+    b.onclick = () => selectClient(c.client_id);
+    list.appendChild(b);
+  });
+}
+
+async function selectClient(id) {
+  currentClientId = id;
+  const ctx = await callRead('get_context', id);
+  document.getElementById('client-name').textContent = ctx?.business_description?.split('.')[0] || id;
+  renderTab();
+}
+
+document.getElementById('tab-bar').addEventListener('click', (e) => {
+  if (e.target.dataset.tab) {
+    currentTab = e.target.dataset.tab;
+    [...document.querySelectorAll('#tab-bar button')].forEach((b) => b.classList.toggle('active', b === e.target));
+    renderTab();
+  }
+});
+
+async function renderTab() {
+  const content = document.getElementById('tab-content');
+  if (!currentClientId) { content.innerHTML = ''; return; }
+  if (currentTab === 'overview') return renderOverview(content);
+  if (currentTab === 'entry') return renderEntry(content);
+  if (currentTab === 'analysis') return renderAnalysis(content);
+  if (currentTab === 'report') return renderReport(content);
+}
+
+async function renderOverview(content) {
+  const ctx = await callRead('get_context', currentClientId);
+  content.innerHTML = `
+    <div class="grid2">
+      <div class="card"><p class="muted">KEY CONTACT</p><p>${ctx?.key_contact || '—'}</p></div>
+      <div class="card"><p class="muted">ADVISER / CADENCE</p><p>${ctx?.adviser || '—'} · ${ctx?.cadence || '—'}</p></div>
+    </div>
+    <div class="card"><p class="muted">OWNER GOALS</p><p>${ctx?.owner_goals?.business || 'Not yet recorded'}</p></div>
+  `;
+}
+
+async function renderEntry(content) {
+  content.innerHTML = `<p class="muted">Sync latest financials from Xero, or check current snapshot.</p>
+    <button class="action" id="sync-btn">Sync from Xero</button>
+    <div id="entry-result" style="margin-top:12px;"></div>`;
+  document.getElementById('sync-btn').onclick = async () => {
+    document.getElementById('entry-result').textContent = 'Syncing…';
+    const res = await fetch('/.netlify/functions/xero-pull', {
+      method: 'POST',
+      body: JSON.stringify({ client_id: currentClientId, period_end: today() }),
+    });
+    const data = await res.json();
+    document.getElementById('entry-result').innerHTML = `<pre style="font-size:12px;">${JSON.stringify(data, null, 2)}</pre>`;
+  };
+}
+
+async function renderAnalysis(content) {
+  content.innerHTML = `<button class="action" id="analyze-btn">Run analysis</button>
+    <div id="analysis-result" style="margin-top:12px;"></div>`;
+  document.getElementById('analyze-btn').onclick = async () => {
+    document.getElementById('analysis-result').textContent = 'Analyzing…';
+    const res = await fetch('/.netlify/functions/analyze', {
+      method: 'POST',
+      body: JSON.stringify({ client_id: currentClientId, period_end: today() }),
+    });
+    const data = await res.json();
+    const flagsHtml = (data.flags || []).map((f) => `<div class="flag">${f.message}</div>`).join('');
+    const scoresHtml = (data.scores || []).map((s) => `<div style="display:flex;justify-content:space-between;font-size:13px;"><span>${s.pillar}</span><span>${s.score}/10</span></div>`).join('');
+    document.getElementById('analysis-result').innerHTML = `
+      ${flagsHtml}
+      <div class="card"><p class="muted">HEALTH SCORE</p><p style="font-size:20px;">${data.healthScore}/100</p></div>
+      <div class="card">${scoresHtml}</div>
+      <div class="card"><p class="muted">DIAGNOSIS (EDITABLE)</p><textarea style="width:100%;min-height:80px;">${data.diagnosis || ''}</textarea></div>
+    `;
+  };
+}
+
+async function renderReport(content) {
+  const { healthScore: hs, recommendations: recs } = await callRead('get_report_data', currentClientId);
+  content.innerHTML = `
+    <div class="card">
+      <p class="muted">BUSINESS ACTION PLAN — DRAFT</p>
+      <p>Health score: ${hs?.score ?? '—'}/100</p>
+      ${(recs || []).map((r, i) => `<p>${i + 1}. ${r.title} — <span class="muted">${r.timeframe || ''}</span></p>`).join('')}
+    </div>
+  `;
+}
+
+loadClients();
+</script>
+</body>
+</html>
