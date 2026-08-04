@@ -127,6 +127,10 @@ async function renderAnalysis(content) {
       body: JSON.stringify({ client_id: currentClientId, period_end: today() }),
     });
     const data = await res.json();
+    if (data.error) {
+      document.getElementById('analysis-result').innerHTML = `<div class="flag">Error: ${data.error}</div>`;
+      return;
+    }
     const flagsHtml = (data.flags || []).map((f) => `<div class="flag">${f.message}</div>`).join('');
     const scoresHtml = (data.scores || []).map((s) => `<div style="display:flex;justify-content:space-between;font-size:13px;"><span>${s.pillar}</span><span>${s.score}/10</span></div>`).join('');
     document.getElementById('analysis-result').innerHTML = `
