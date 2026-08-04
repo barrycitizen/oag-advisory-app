@@ -3,7 +3,6 @@
 <head>
 <meta charset="utf-8" />
 <title>OAG Advisory</title>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   body { font-family: -apple-system, sans-serif; margin: 0; background: #f7f6f3; color: #222; }
   .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
@@ -43,7 +42,6 @@
 // ---- CONFIG: fill these in ----
 const SUPABASE_URL = 'https://pptzbtxcotrxtcygxisz.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBwdHpidHhjb3RyeHRjeWd4aXN6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMzMDYyNDgsImV4cCI6MjA5ODg4MjI0OH0.mJlQpNa9yTu0gU4J0HUnyHFhQyfY8UUBSQw8cYewn5U';
-const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 let currentClientId = null;
 let currentTab = 'overview';
