@@ -37,19 +37,76 @@ async function fetchXeroReport(token, tenantId, reportName, params = '') {
   return res.json();
 }
 
-// Xero reports return a nested Rows structure — pull() finds a labelled row's value.
-function findValue(report, label) {
-  const rows = report.Reports?.[0]?.Rows || [];
-  for (const section of rows) {
-    for (const row of section.Rows || []) {
-      const cellLabel = row.Cells?.[0]?.Value;
-      if (cellLabel && cellLabel.trim().toLowerCase() === label.toLowerCase()) {
-        const val = row.Cells?.[1]?.Value;
-        return val ? parseFloat(val) : 0;
-      }
+// ---- Robust label matching ----
+// Xero reports nest rows inside sections inside sections (sometimes more than
+// one level deep — subtotal groups, summary rows, etc). The old version only
+// scanned section.Rows one level down, so valid rows could be skipped
+// entirely depending on how a client's report was structured.
+//
+// This version walks the whole tree recursively and normalizes labels
+// (trim, collapse whitespace, lowercase) so minor formatting differences
+// don't cause a miss.
+
+function normalize(label) {
+  return (label || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+// Recursively collect every {label, value} pair in the report, regardless of nesting depth.
+function collectRows(rows, out = []) {
+  for (const section of rows || []) {
+    if (section.Cells) {
+      const label = section.Cells?.[0]?.Value;
+      const rawVal = section.Cells?.[1]?.Value;
+      if (label) out.push({ label: normalize(label), value: rawVal ? parseFloat(rawVal) : 0 });
+    }
+    if (section.Rows) collectRows(section.Rows, out);
+  }
+  return out;
+}
+
+// Try each candidate label (in priority order) against the flattened row list.
+// Returns { value, matchedLabel } or null if nothing matched.
+function findValue(report, candidates) {
+  const rows = collectRows(report.Reports?.[0]?.Rows || []);
+  for (const candidate of candidates) {
+    const target = normalize(candidate);
+    const hit = rows.find((r) => r.label === target);
+    if (hit) return { value: hit.value, matchedLabel: candidate };
+  }
+  return null;
+}
+
+// Field -> ordered list of label variants to try, to cover different charts of accounts.
+const FIELD_LABELS = {
+  revenue: ['Total Income', 'Total Revenue', 'Revenue', 'Sales'],
+  cogs: ['Total Cost of Sales', 'Cost of Sales', 'Cost of Goods Sold'],
+  operating_expenses: ['Total Operating Expenses', 'Total Expenses'],
+  net_profit: ['Net Profit', 'Net Profit (Loss)', 'Profit for the year'],
+  wages: ['Wages and Salaries', 'Wages & Salaries', 'Salaries and Wages', 'Wages'],
+  debtors: ['Accounts Receivable', 'Trade Debtors', 'Debtors'],
+  creditors: ['Accounts Payable', 'Trade Creditors', 'Creditors'],
+  cash: ['Bank', 'Total Bank', 'Cash and Cash Equivalents'],
+  current_assets: ['Total Current Assets'],
+  current_liabilities: ['Total Current Liabilities'],
+  total_debt: ['Total Liabilities'],
+  equity: ['Total Equity', "Total Equity/(Deficiency)"],
+};
+
+// Pulls every field for a report, returning both the values and which fields
+// (if any) failed to match anything — instead of silently defaulting to 0.
+function extractFields(report, fieldNames) {
+  const values = {};
+  const missing = [];
+  for (const field of fieldNames) {
+    const result = findValue(report, FIELD_LABELS[field]);
+    if (result) {
+      values[field] = result.value;
+    } else {
+      values[field] = 0;
+      missing.push(field);
     }
   }
-  return 0;
+  return { values, missing };
 }
 
 exports.handler = async (event) => {
@@ -70,30 +127,39 @@ exports.handler = async (event) => {
 
     const pnl = await fetchXeroReport(token, conn.tenant_id, 'ProfitAndLoss', `?date=${period_end}`);
     const bs = await fetchXeroReport(token, conn.tenant_id, 'BalanceSheet', `?date=${period_end}`);
+    // Aged receivables/payables fetched for future use (debtor/creditor-days-by-contact
+    // drill-down) — not yet parsed into fields, kept as raw pulls for now.
     const agedReceivables = await fetchXeroReport(token, conn.tenant_id, 'AgedReceivablesByContact', `?date=${period_end}`);
     const agedPayables = await fetchXeroReport(token, conn.tenant_id, 'AgedPayablesByContact', `?date=${period_end}`);
 
-    const revenue = findValue(pnl, 'Total Income');
-    const cogs = findValue(pnl, 'Total Cost of Sales');
-    const gross_profit = revenue - cogs;
-    const operating_expenses = findValue(pnl, 'Total Operating Expenses');
-    const net_profit = findValue(pnl, 'Net Profit');
-    const wages = findValue(pnl, 'Wages and Salaries');
+    const pnlFields = extractFields(pnl, ['revenue', 'cogs', 'operating_expenses', 'net_profit', 'wages']);
+    const bsFields = extractFields(bs, ['debtors', 'creditors', 'cash', 'current_assets', 'current_liabilities', 'total_debt', 'equity']);
 
-    const debtors = findValue(bs, 'Accounts Receivable');
-    const creditors = findValue(bs, 'Accounts Payable');
-    const cash = findValue(bs, 'Bank');
-    const current_assets = findValue(bs, 'Total Current Assets');
-    const current_liabilities = findValue(bs, 'Total Current Liabilities');
-    const total_debt = findValue(bs, 'Total Liabilities');
-    const equity = findValue(bs, 'Total Equity');
+    const revenue = pnlFields.values.revenue;
+    const cogs = pnlFields.values.cogs;
+    const gross_profit = revenue - cogs;
+
+    const missing = [...pnlFields.missing, ...bsFields.missing];
 
     const row = {
       client_id, period_end,
       cadence: (await supabase.from('client_context').select('cadence').eq('client_id', client_id).single()).data?.cadence || 'quarterly',
-      revenue, cogs, gross_profit, operating_expenses, net_profit, wages,
-      debtors, creditors, cash, current_assets, current_liabilities, total_debt, equity,
-      source: 'xero', synced_at: new Date().toISOString(),
+      revenue, cogs, gross_profit,
+      operating_expenses: pnlFields.values.operating_expenses,
+      net_profit: pnlFields.values.net_profit,
+      wages: pnlFields.values.wages,
+      debtors: bsFields.values.debtors,
+      creditors: bsFields.values.creditors,
+      cash: bsFields.values.cash,
+      current_assets: bsFields.values.current_assets,
+      current_liabilities: bsFields.values.current_liabilities,
+      total_debt: bsFields.values.total_debt,
+      equity: bsFields.values.equity,
+      source: 'xero',
+      synced_at: new Date().toISOString(),
+      // Surfaces which fields (if any) couldn't be matched in this client's
+      // report, so a 0 isn't mistaken for a real figure. Null when everything matched.
+      unmatched_fields: missing.length ? missing : null,
     };
 
     const { error: upsertErr } = await supabase
@@ -103,7 +169,16 @@ exports.handler = async (event) => {
 
     await supabase.from('xero_connections').update({ last_synced_at: new Date().toISOString() }).eq('client_id', client_id);
 
-    return { statusCode: 200, body: JSON.stringify({ ok: true, snapshot: row }) };
+    return {
+      statusCode: 200,
+      body: JSON.stringify({
+        ok: true,
+        snapshot: row,
+        warning: missing.length
+          ? `Could not match: ${missing.join(', ')} — these were saved as 0. Check this client's Xero report labels.`
+          : null,
+      }),
+    };
   } catch (err) {
     return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
   }
