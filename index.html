@@ -4,38 +4,49 @@
 <meta charset="utf-8" />
 <title>OAG Advisory</title>
 <style>
-  body { font-family: -apple-system, sans-serif; margin: 0; background: #f7f6f3; color: #222; }
-  .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
-  .sidebar { background: #fff; border-right: 1px solid #e4e2da; padding: 1rem; }
-  .sidebar button { display: block; width: 100%; text-align: left; padding: 8px; border: none; background: transparent; border-radius: 6px; cursor: pointer; font-size: 13px; margin-bottom: 4px; }
-  .sidebar button.active { background: #f0efe9; }
-  .main { padding: 1.5rem; }
-  .tabs { display: flex; gap: 4px; border-bottom: 1px solid #e4e2da; margin-bottom: 1rem; }
-  .tabs button { padding: 8px 12px; border: none; background: transparent; cursor: pointer; font-size: 13px; border-bottom: 2px solid transparent; }
-  .tabs button.active { border-bottom-color: #333; font-weight: 500; }
-  .card { background: #fff; border-radius: 8px; padding: 0.9rem; margin-bottom: 10px; border: 1px solid #e4e2da; }
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .muted { color: #888; font-size: 11px; }
-  .flag { background: #fdf3e0; border-radius: 6px; padding: 10px; margin-bottom: 10px; font-size: 13px; }
-  button.action { padding: 8px 14px; border-radius: 6px; border: 1px solid #ccc; background: #fff; cursor: pointer; font-size: 13px; }
+body { font-family: -apple-system, sans-serif; margin: 0; background: #f7f6f3; color: #222; }
+.app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+.sidebar { background: #fff; border-right: 1px solid #e4e2da; padding: 1rem; }
+.sidebar button { display: block; width: 100%; text-align: left; padding: 8px; border: none; background: transparent; border-radius: 6px; cursor: pointer; font-size: 13px; margin-bottom: 4px; }
+.sidebar button.active { background: #f0efe9; }
+.main { padding: 1.5rem; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid #e4e2da; margin-bottom: 1rem; }
+.tabs button { padding: 8px 12px; border: none; background: transparent; cursor: pointer; font-size: 13px; border-bottom: 2px solid transparent; }
+.tabs button.active { border-bottom-color: #333; font-weight: 500; }
+.card { background: #fff; border-radius: 8px; padding: 0.9rem; margin-bottom: 10px; border: 1px solid #e4e2da; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.muted { color: #888; font-size: 11px; }
+.flag { background: #fdf3e0; border-radius: 6px; padding: 10px; margin-bottom: 10px; font-size: 13px; }
+button.action { padding: 8px 14px; border-radius: 6px; border: 1px solid #ccc; background: #fff; cursor: pointer; font-size: 13px; }
+.subtabs { display: flex; gap: 4px; margin-bottom: 12px; }
+.subtabs button { padding: 6px 10px; border: 1px solid #e4e2da; background: #fff; border-radius: 6px; cursor: pointer; font-size: 12px; }
+.subtabs button.active { background: #333; color: #fff; border-color: #333; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.form-grid label { display: block; font-size: 11px; color: #888; margin-bottom: 3px; }
+.form-grid input, .form-grid textarea, .form-grid select { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #ddd; border-radius: 5px; font-size: 13px; }
+.form-field { margin-bottom: 8px; }
+.form-field.full { grid-column: 1 / -1; }
+.save-msg { font-size: 12px; margin-top: 8px; }
+.save-msg.ok { color: #2a7a3b; }
+.save-msg.err { color: #b3341c; }
 </style>
 </head>
 <body>
 <div class="app">
-  <div class="sidebar">
-    <p class="muted">CLIENT PORTFOLIO</p>
-    <div id="client-list"></div>
-  </div>
-  <div class="main">
-    <h2 id="client-name">Select a client</h2>
-    <div class="tabs" id="tab-bar">
-      <button data-tab="overview" class="active">Overview</button>
-      <button data-tab="entry">Data entry</button>
-      <button data-tab="analysis">Analysis</button>
-      <button data-tab="report">Report</button>
-    </div>
-    <div id="tab-content"></div>
-  </div>
+<div class="sidebar">
+<p class="muted">CLIENT PORTFOLIO</p>
+<div id="client-list"></div>
+</div>
+<div class="main">
+<h2 id="client-name">Select a client</h2>
+<div class="tabs" id="tab-bar">
+<button data-tab="overview" class="active">Overview</button>
+<button data-tab="entry">Data entry</button>
+<button data-tab="analysis">Analysis</button>
+<button data-tab="report">Report</button>
+</div>
+<div id="tab-content"></div>
+</div>
 </div>
 
 <script>
@@ -45,6 +56,7 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 
 let currentClientId = null;
 let currentTab = 'overview';
+let currentEntrySubtab = 'manual'; // 'manual' | 'pdf' | 'xero'
 const today = () => new Date().toISOString().slice(0, 10);
 
 async function callRead(action, client_id) {
@@ -103,6 +115,217 @@ async function renderOverview(content) {
 }
 
 async function renderEntry(content) {
+  content.innerHTML = `
+    <div class="subtabs" id="entry-subtabs">
+      <button data-sub="manual" class="${currentEntrySubtab === 'manual' ? 'active' : ''}">Manual entry</button>
+      <button data-sub="pdf" class="${currentEntrySubtab === 'pdf' ? 'active' : ''}">Upload PDF</button>
+      <button data-sub="xero" class="${currentEntrySubtab === 'xero' ? 'active' : ''}">Xero sync</button>
+    </div>
+    <div id="entry-subcontent"></div>
+  `;
+  document.getElementById('entry-subtabs').addEventListener('click', (e) => {
+    if (e.target.dataset.sub) {
+      currentEntrySubtab = e.target.dataset.sub;
+      renderEntry(content);
+    }
+  });
+  const sub = document.getElementById('entry-subcontent');
+  if (currentEntrySubtab === 'manual') return renderManualEntry(sub);
+  if (currentEntrySubtab === 'pdf') return renderPdfUpload(sub);
+  if (currentEntrySubtab === 'xero') return renderXeroSync(sub);
+}
+
+const FINANCIAL_FIELD_DEFS = [
+  ['revenue', 'Revenue'], ['cogs', 'Cost of Sales'], ['operating_expenses', 'Operating Expenses'],
+  ['net_profit', 'Net Profit'], ['wages', 'Wages'], ['debtors', 'Debtors (AR)'], ['creditors', 'Creditors (AP)'],
+  ['cash', 'Cash / Bank'], ['current_assets', 'Current Assets'], ['current_liabilities', 'Current Liabilities'],
+  ['total_debt', 'Total Liabilities'], ['equity', 'Total Equity'],
+];
+
+async function renderManualEntry(content) {
+  const ctx = await callRead('get_context', currentClientId);
+  content.innerHTML = `
+    <div class="card">
+      <p class="muted">FINANCIAL SNAPSHOT — MANUAL ENTRY</p>
+      <div class="form-field">
+        <label>Period end date</label>
+        <input type="date" id="me-period-end" value="${today()}" />
+      </div>
+      <div class="form-grid" id="me-financial-fields"></div>
+      <button class="action" id="me-save-financials" style="margin-top:10px;">Save financial snapshot</button>
+      <div class="save-msg" id="me-financials-msg"></div>
+    </div>
+
+    <div class="card">
+      <p class="muted">BUSINESS &amp; OWNER CONTEXT</p>
+      <div class="form-field">
+        <label>Business description</label>
+        <textarea id="me-business-description" rows="2">${ctx?.business_description || ''}</textarea>
+      </div>
+      <div class="form-grid">
+        <div class="form-field"><label>Industry</label><input id="me-industry" value="${ctx?.industry || ''}" /></div>
+        <div class="form-field"><label>Key contact</label><input id="me-key-contact" value="${ctx?.key_contact || ''}" /></div>
+      </div>
+      <div class="form-field full">
+        <label>Owner goals — business</label>
+        <textarea id="me-owner-business" rows="2">${ctx?.owner_goals?.business || ''}</textarea>
+      </div>
+      <div class="form-field full">
+        <label>Owner goals — personal</label>
+        <textarea id="me-owner-personal" rows="2">${ctx?.owner_goals?.personal || ''}</textarea>
+      </div>
+      <button class="action" id="me-save-context" style="margin-top:10px;">Save business &amp; owner context</button>
+      <div class="save-msg" id="me-context-msg"></div>
+    </div>
+  `;
+
+  const fieldsEl = document.getElementById('me-financial-fields');
+  FINANCIAL_FIELD_DEFS.forEach(([key, label]) => {
+    const div = document.createElement('div');
+    div.className = 'form-field';
+    div.innerHTML = `<label>${label}</label><input type="number" step="0.01" id="me-${key}" />`;
+    fieldsEl.appendChild(div);
+  });
+
+  document.getElementById('me-save-financials').onclick = async () => {
+    const msg = document.getElementById('me-financials-msg');
+    msg.textContent = 'Saving…';
+    msg.className = 'save-msg';
+    const body = {
+      type: 'financials',
+      client_id: currentClientId,
+      period_end: document.getElementById('me-period-end').value,
+    };
+    FINANCIAL_FIELD_DEFS.forEach(([key]) => { body[key] = document.getElementById(`me-${key}`).value; });
+    try {
+      const res = await fetch('/.netlify/functions/manual-entry', { method: 'POST', body: JSON.stringify(body) });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      msg.textContent = 'Saved.';
+      msg.className = 'save-msg ok';
+    } catch (err) {
+      msg.textContent = 'Error: ' + err.message;
+      msg.className = 'save-msg err';
+    }
+  };
+
+  document.getElementById('me-save-context').onclick = async () => {
+    const msg = document.getElementById('me-context-msg');
+    msg.textContent = 'Saving…';
+    msg.className = 'save-msg';
+    const body = {
+      type: 'context',
+      client_id: currentClientId,
+      business_description: document.getElementById('me-business-description').value,
+      industry: document.getElementById('me-industry').value,
+      key_contact: document.getElementById('me-key-contact').value,
+      owner_goals_business: document.getElementById('me-owner-business').value,
+      owner_goals_personal: document.getElementById('me-owner-personal').value,
+    };
+    try {
+      const res = await fetch('/.netlify/functions/manual-entry', { method: 'POST', body: JSON.stringify(body) });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      msg.textContent = 'Saved.';
+      msg.className = 'save-msg ok';
+    } catch (err) {
+      msg.textContent = 'Error: ' + err.message;
+      msg.className = 'save-msg err';
+    }
+  };
+}
+
+async function renderPdfUpload(content) {
+  content.innerHTML = `
+    <div class="card">
+      <p class="muted">UPLOAD FINANCIAL STATEMENT PDF</p>
+      <p class="muted" style="margin-top:-4px;">For MYOB, Reckon, or any statement not coming from Xero. Claude reads the PDF and extracts the figures — nothing is saved until you review and confirm.</p>
+      <div class="form-field">
+        <label>Period end date</label>
+        <input type="date" id="pdf-period-end" value="${today()}" />
+      </div>
+      <div class="form-field">
+        <label>PDF file</label>
+        <input type="file" id="pdf-file" accept="application/pdf" />
+      </div>
+      <button class="action" id="pdf-extract-btn">Extract from PDF</button>
+      <div id="pdf-result" style="margin-top:12px;"></div>
+    </div>
+  `;
+
+  document.getElementById('pdf-extract-btn').onclick = async () => {
+    const fileInput = document.getElementById('pdf-file');
+    const resultEl = document.getElementById('pdf-result');
+    if (!fileInput.files[0]) { resultEl.innerHTML = '<div class="flag">Choose a PDF first.</div>'; return; }
+    resultEl.textContent = 'Reading PDF…';
+
+    const file = fileInput.files[0];
+    const base64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result.split(',')[1]);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+
+    try {
+      const res = await fetch('/.netlify/functions/pdf-extract', {
+        method: 'POST',
+        body: JSON.stringify({
+          client_id: currentClientId,
+          period_end: document.getElementById('pdf-period-end').value,
+          pdf_base64: base64,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      renderPdfReview(resultEl, data);
+    } catch (err) {
+      resultEl.innerHTML = `<div class="flag">Error: ${err.message}</div>`;
+    }
+  };
+}
+
+function renderPdfReview(container, data) {
+  const notFoundHtml = data.not_found?.length
+    ? `<div class="flag">Not found in PDF: ${data.not_found.join(', ')} — left as 0, fill in manually if known.</div>` : '';
+  const notesHtml = data.notes ? `<div class="flag">Note: ${data.notes}</div>` : '';
+
+  container.innerHTML = `
+    ${notFoundHtml}${notesHtml}
+    <p class="muted">REVIEW EXTRACTED FIGURES BEFORE SAVING</p>
+    <div class="form-grid" id="pdf-review-fields"></div>
+    <button class="action" id="pdf-confirm-save" style="margin-top:10px;">Confirm &amp; save</button>
+    <div class="save-msg" id="pdf-save-msg"></div>
+  `;
+  const fieldsEl = document.getElementById('pdf-review-fields');
+  FINANCIAL_FIELD_DEFS.forEach(([key, label]) => {
+    const div = document.createElement('div');
+    div.className = 'form-field';
+    const val = data.extracted?.[key] ?? 0;
+    div.innerHTML = `<label>${label}</label><input type="number" step="0.01" id="pdfrev-${key}" value="${val}" />`;
+    fieldsEl.appendChild(div);
+  });
+
+  document.getElementById('pdf-confirm-save').onclick = async () => {
+    const msg = document.getElementById('pdf-save-msg');
+    msg.textContent = 'Saving…';
+    msg.className = 'save-msg';
+    const body = { type: 'financials', client_id: data.client_id, period_end: data.period_end };
+    FINANCIAL_FIELD_DEFS.forEach(([key]) => { body[key] = document.getElementById(`pdfrev-${key}`).value; });
+    try {
+      const res = await fetch('/.netlify/functions/manual-entry', { method: 'POST', body: JSON.stringify(body) });
+      const saved = await res.json();
+      if (saved.error) throw new Error(saved.error);
+      msg.textContent = 'Saved.';
+      msg.className = 'save-msg ok';
+    } catch (err) {
+      msg.textContent = 'Error: ' + err.message;
+      msg.className = 'save-msg err';
+    }
+  };
+}
+
+async function renderXeroSync(content) {
   content.innerHTML = `<p class="muted">Sync latest financials from Xero, or check current snapshot.</p>
     <button class="action" id="sync-btn">Sync from Xero</button>
     <div id="entry-result" style="margin-top:12px;"></div>`;
