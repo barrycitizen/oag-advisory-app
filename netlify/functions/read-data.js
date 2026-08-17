@@ -342,6 +342,24 @@ exports.handler = async (event) => {
       return { statusCode: 200, body: JSON.stringify({ periods, kpis }) };
     }
 
+    // Risk Review domain — rolls up all sources sharing risk_items. Financial
+    // is period-scoped (re-synced every analyze.js run, see
+    // lib/financial-risk-sync.js) so it's filtered to the period being viewed;
+    // industry is generated once per client (see lib/industry-risk-checklist.js)
+    // and doesn't change per period, so it's fetched for the client regardless
+    // of which period is selected. Business (questionnaire-driven) isn't built
+    // yet — comes back empty until that source exists.
+    if (action === 'get_risk_items') {
+      const [{ data: financial }, { data: industry }, { data: business }] = await Promise.all([
+        period_end
+          ? supabase.from('risk_items').select('*').eq('client_id', client_id).eq('period_end', period_end).eq('source', 'financial').order('severity', { ascending: false })
+          : Promise.resolve({ data: [] }),
+        supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'industry').order('created_at'),
+        supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'business').order('created_at'),
+      ]);
+      return { statusCode: 200, body: JSON.stringify({ financial: financial || [], industry: industry || [], business: business || [] }) };
+    }
+
     if (action === 'get_report_data') {
       const [{ data: hs }, { data: recs }] = await Promise.all([
         supabase.from('health_scores').select('*').eq('client_id', client_id).order('period_end', { ascending: false }).limit(1).maybeSingle(),

@@ -525,6 +525,7 @@ const GLOBAL_WORKFLOWS = ['meeting', 'report']; // cross-domain, ignore sidebar 
 const WIRED_WORKFLOWS = {
   financial: ['input', 'analyse', 'diagnose'],
   goals: ['profile', 'input'],
+  risk: ['analyse'],
 };
 function isWorkflowVisible(tabKey, domain) {
   if (GLOBAL_WORKFLOWS.includes(tabKey)) return true;
@@ -838,6 +839,11 @@ async function renderMain() {
     if (currentWorkflow === 'profile') return renderGoalsProfile(content);
     if (currentWorkflow === 'input') return renderGoalsInput(content);
     return renderPlaceholder(content, `Goals — ${WORKFLOW_LABELS[currentWorkflow]} isn't wired up yet.`);
+  }
+
+  if (currentDomain === 'risk') {
+    if (currentWorkflow === 'analyse') return renderRiskAnalyse(content);
+    return renderPlaceholder(content, `Risk — ${WORKFLOW_LABELS[currentWorkflow]} isn't wired up yet.`);
   }
 
   const domainLabel = DOMAINS.find((d) => d.key === currentDomain)?.label || currentDomain;
@@ -3266,6 +3272,72 @@ async function renderFinancialDiagnose(content) {
     taxQuestionBtn.onclick = askTaxQuestion;
     taxQuestionInput.onkeydown = (e) => { if (e.key === 'Enter') askTaxQuestion(); };
   }
+}
+
+// ---- Risk: Analyse ----
+// Rolls up all sources sharing risk_items (financial/industry/business, see
+// lib/financial-risk-sync.js + lib/industry-risk-checklist.js) into one view.
+// Financial is period-scoped, so it reads for currentPeriodEnd like every
+// other Analyse tab; industry doesn't change per period (see read-data.js's
+// get_risk_items), so it always shows the client's full checklist regardless
+// of which period is selected. Business has no source yet — its section
+// stays empty (not hidden) so the domain reads as "these are the three
+// sources", not just two, once it exists.
+const RISK_SOURCE_META = {
+  financial: { label: 'Financial', hint: 'Detected automatically from this period’s ratios and trends.' },
+  industry: { label: 'Industry', hint: 'AI-generated from this client’s industry — general knowledge, not verified. Review each one.' },
+  business: { label: 'Business', hint: 'Not built yet — will come from a client check-in questionnaire.' },
+};
+const RISK_SEVERITY_BADGE = { High: 'red', Medium: 'yellow', Low: 'green' };
+const RISK_STATUS_BADGE = { Detected: 'red', Identified: 'yellow', Watch: 'yellow', Managed: 'green', 'Not applicable': 'green', Unknown: 'yellow' };
+
+function riskItemRow(r) {
+  return `
+    <div class="flag-row-wrap">
+      <div class="flag-row" style="align-items:flex-start;">
+        <span class="flag-dot ${r.severity === 'High' ? 'rust' : 'sage'}" style="margin-top:5px;"></span>
+        <div style="flex:1; min-width:0;">
+          <div style="display:flex; align-items:baseline; gap:6px; flex-wrap:wrap;">
+            <b>${r.risk_name}</b>
+            <span class="confidence-badge ${RISK_SEVERITY_BADGE[r.severity] || 'yellow'}">${r.severity || 'Medium'}</span>
+            <span class="confidence-badge ${RISK_STATUS_BADGE[r.status] || 'yellow'}">${r.status}</span>
+            ${r.is_new ? '<span class="confidence-badge yellow">New</span>' : ''}
+            ${r.is_changed ? '<span class="confidence-badge yellow">Changed</span>' : ''}
+          </div>
+          ${r.detail ? `<p class="muted plain" style="margin:4px 0 0;">${r.detail}</p>` : ''}
+          ${r.impact_estimate ? `<p class="muted plain" style="margin:2px 0 0;">${r.impact_estimate}</p>` : ''}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderRiskSourceGroup(key, rows) {
+  const meta = RISK_SOURCE_META[key];
+  return `
+    <p class="muted">${meta.label}</p>
+    <p class="muted plain" style="margin:0 0 8px;">${meta.hint}</p>
+    <div class="card">
+      ${rows.length ? rows.map(riskItemRow).join('') : `<p class="muted plain" style="margin:0;">${key === 'business' ? 'No source yet.' : 'None for this period.'}</p>`}
+    </div>
+  `;
+}
+
+async function renderRiskAnalyse(content) {
+  const myToken = renderToken;
+  if (!currentPeriodEnd) {
+    content.innerHTML = `<div class="card placeholder"><p class="muted">No data yet</p><p class="muted plain" style="margin:0;">Add a financial snapshot from Financial Performance → Input first — financial risk is detected from it, and industry risk is generated the first time a period is saved.</p></div>`;
+    return;
+  }
+  const data = await callRead('get_risk_items', currentClientId, currentPeriodEnd);
+  if (myToken !== renderToken) return;
+
+  content.innerHTML = `
+    <p class="section-title">Risk Review</p>
+    ${renderRiskSourceGroup('financial', data.financial || [])}
+    ${renderRiskSourceGroup('industry', data.industry || [])}
+    ${renderRiskSourceGroup('business', data.business || [])}
+  `;
 }
 
 // ---- Goals: Profile ----
