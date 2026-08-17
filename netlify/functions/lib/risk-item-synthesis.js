@@ -1,0 +1,81 @@
+// netlify/functions/lib/risk-item-synthesis.js
+//
+// Risk Item Synthesis
+// ------------------------------------------------------------------
+// Turns a raw anchor + follow-up Q&A from the business questionnaire into
+// an actual risk write-up: what the risk is, why it matters, and what to
+// do about it. Same pattern as the industry checklist AI call (see
+// industry-risk-checklist.js).
+//
+// Fixes: submitCategoryResponse() used to store the literal question text
+// as "detail" — answering "yes" just echoed the question back rather than
+// producing an answer. This generates real content instead.
+//
+// Run migration_risk_items_v4.sql first (adds risk_items.recommendation).
+
+const MODEL = 'claude-sonnet-4-6'; // matches the model used elsewhere (analyze.js, suggest-goal.js, industry-risk-checklist.js)
+
+const SYSTEM_PROMPT = `You turn a small business adviser's risk questionnaire answers into a
+concise risk write-up.
+
+You'll be given: a risk category, the anchor question that was answered
+"yes" (risk present), and any follow-up question/answer pairs with the
+accountant's notes.
+
+Write:
+- risk_name: short label, 2-5 words (e.g. "Key-person dependency")
+- detail: 1-2 sentences on what the actual risk is and why it matters for
+  this business, grounded in what was actually said in the answers — do
+  not invent specifics that weren't provided
+- recommendation: 1 concrete, actionable next step the adviser could
+  suggest to the client
+- severity: "High", "Medium", or "Low" based on how exposed this makes
+  the business, given what was said
+
+If the answers given are too thin to say anything specific, keep detail
+and recommendation general to the category rather than fabricating
+details.
+
+Respond with ONLY a JSON object, no markdown fences, no preamble:
+{ "risk_name": "...", "detail": "...", "recommendation": "...", "severity": "High|Medium|Low" }`;
+
+// Throws if the response isn't parseable JSON — same "let the caller
+// decide" philosophy as industry-risk-checklist.js's generateChecklistViaAI.
+// This is a foreground, user-initiated save (clicking Save on the
+// questionnaire), so a failure here should surface to the accountant
+// (they'd want to retry), not be silently swallowed.
+async function synthesizeRiskItem({ category, anchorQuestion, followUpQA }) {
+  const qaText = followUpQA.length
+    ? followUpQA.map((qa) => `Q: ${qa.questionText}\nA: ${qa.answerText || '(no detail given)'}`).join('\n\n')
+    : '(no follow-up detail given)';
+
+  const userMessage = `Category: ${category}\nAnchor question (answered "risk present"): ${anchorQuestion}\n\n${qaText}`;
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 500,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: userMessage }],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Anthropic API error: ${response.status} ${await response.text()}`);
+  }
+
+  const data = await response.json();
+  const text = (data.content || []).map((b) => b.text || '').join('').trim();
+  const cleaned = text.replace(/^```json\s*|```$/g, '').trim();
+  const parsed = JSON.parse(cleaned);
+  if (!parsed.risk_name || !parsed.detail) throw new Error('Synthesis response missing risk_name/detail');
+  return parsed; // { risk_name, detail, recommendation, severity }
+}
+
+module.exports = { synthesizeRiskItem };

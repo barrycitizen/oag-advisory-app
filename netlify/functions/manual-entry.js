@@ -4,6 +4,7 @@ const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const { generateIndustryRiskItems } = require('./lib/industry-risk-checklist');
 const { submitCategoryResponse } = require('./lib/business-risk-questionnaire');
+const { applyReviewAction } = require('./lib/risk-review-actions');
 
 // fy_end is required (not just business_name) because the frontend derives every
 // valid period-end date from cadence + fy_end — without it, Input has no dates to offer.
@@ -151,6 +152,16 @@ async function saveBusinessRiskResponse(body) {
     clientId: client_id, periodEnd: period_end, anchor,
     anchorAnswer: anchor_answer, followUpAnswers: follow_up_answers || [],
   });
+}
+
+// Risk Review actions (Confirm / Investigate / Not applicable / No longer
+// a risk) — what gives status meaning after a risk_items row is created.
+// See lib/risk-review-actions.js. Works on any row regardless of source
+// (financial/business/industry), since the same four actions apply to all.
+async function saveRiskReviewAction(body) {
+  const { risk_item_id, action, note } = body;
+  if (!risk_item_id || !action) throw new Error('risk_item_id and action required');
+  return applyReviewAction(supabase, { riskItemId: risk_item_id, action, note });
 }
 
 // Goals are period-scoped, like financial_snapshots: each period_end gets its own
@@ -322,6 +333,7 @@ exports.handler = async (event) => {
       : body.type === 'delete_period' ? await deletePeriod(body)
       : body.type === 'context' ? await saveContext(body)
       : body.type === 'business_risk_response' ? await saveBusinessRiskResponse(body)
+      : body.type === 'risk_review_action' ? await saveRiskReviewAction(body)
       : body.type === 'goal_items' ? await saveGoalItems(body)
       : body.type === 'pulse' ? await savePulse(body)
       : body.type === 'goal_category' ? await addGoalCategory(body)

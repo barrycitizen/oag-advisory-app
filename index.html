@@ -3292,9 +3292,33 @@ const RISK_SOURCE_META = {
 };
 const RISK_SEVERITY_BADGE = { High: 'red', Medium: 'yellow', Low: 'green' };
 const RISK_STATUS_BADGE = { Detected: 'red', Identified: 'yellow', Watch: 'yellow', Managed: 'green', 'Not applicable': 'green', Unknown: 'yellow' };
+const RISK_REVIEW_ACTIONS = [
+  ['confirm', 'Confirm'], ['investigate', 'Investigate'],
+  ['not_applicable', 'Not applicable'], ['no_longer_a_risk', 'No longer a risk'],
+];
 function capitalizeWord(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 
+// A "no risk identified" row from the anchor's no-risk branch (see
+// submitCategoryResponse) never gets a recommendation — a real risk always
+// does, even after a review action later marks it Managed/resolved (the
+// action only touches status, never recommendation). That's the reliable
+// way to tell "never was a risk" apart from "was a risk, now resolved"
+// without a dedicated column.
+function isQuietNoRiskRow(r) {
+  return r.source === 'business' && !r.recommendation;
+}
+
 function riskItemRow(r) {
+  if (isQuietNoRiskRow(r)) {
+    return `
+      <div class="flag-row-wrap">
+        <div class="flag-row">
+          <span class="flag-dot sage"></span>
+          <span class="muted plain" style="margin:0;">${capitalizeWord(r.category)} — reviewed, no risk identified${r.last_reviewed_date ? ` <span style="font-size:11px;">(${formatShortDate(r.last_reviewed_date)})</span>` : ''}</span>
+        </div>
+      </div>
+    `;
+  }
   return `
     <div class="flag-row-wrap">
       <div class="flag-row" style="align-items:flex-start;">
@@ -3308,9 +3332,13 @@ function riskItemRow(r) {
             ${r.is_changed ? '<span class="confidence-badge yellow">Changed</span>' : ''}
           </div>
           ${r.detail ? `<p class="muted plain" style="margin:4px 0 0;">${r.detail}</p>` : ''}
-          ${r.notes ? `<p class="muted plain" style="margin:2px 0 0;">${r.notes}</p>` : ''}
+          ${r.recommendation ? `<p class="muted plain" style="margin:2px 0 0;"><b>Recommended:</b> ${r.recommendation}</p>` : ''}
+          ${r.notes ? `<p class="muted plain" style="margin:2px 0 0; white-space:pre-wrap;">${r.notes}</p>` : ''}
           ${r.impact_estimate ? `<p class="muted plain" style="margin:2px 0 0;">${r.impact_estimate}</p>` : ''}
           ${r.last_reviewed_date ? `<p class="muted plain" style="margin:2px 0 0; font-size:11px;">Reviewed ${formatShortDate(r.last_reviewed_date)}</p>` : ''}
+          <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:6px;">
+            ${RISK_REVIEW_ACTIONS.map(([action, label]) => `<button type="button" class="mini-link risk-action-btn" style="margin-left:0;" data-risk-id="${r.id}" data-risk-action="${action}">${label}</button>`).join('')}
+          </div>
         </div>
       </div>
     </div>
@@ -3529,6 +3557,32 @@ async function renderRiskAnalyse(content) {
       } catch (err) {
         saveBtn.disabled = false;
         saveBtn.textContent = 'Save';
+        alert('Error: ' + err.message);
+      }
+    };
+  });
+
+  // Review actions (Confirm/Investigate/Not applicable/No longer a risk) —
+  // one delegated listener rather than one per button, since the count
+  // scales with however many risk_items rows are on screen. Works on any
+  // row regardless of source, see lib/risk-review-actions.js.
+  content.querySelectorAll('.risk-action-btn').forEach((btn) => {
+    btn.onclick = async () => {
+      const buttonsInRow = btn.parentElement.querySelectorAll('.risk-action-btn');
+      buttonsInRow.forEach((b) => { b.disabled = true; });
+      const original = btn.textContent;
+      btn.textContent = '…';
+      try {
+        const res = await fetch('/.netlify/functions/manual-entry', {
+          method: 'POST',
+          body: JSON.stringify({ type: 'risk_review_action', risk_item_id: btn.dataset.riskId, action: btn.dataset.riskAction }),
+        });
+        const result = await res.json();
+        if (result.error) throw new Error(result.error);
+        renderMain(); // refresh so the new status/cleared New-Changed badges and the rollup banner's bucket counts reflect it immediately
+      } catch (err) {
+        buttonsInRow.forEach((b) => { b.disabled = false; });
+        btn.textContent = original;
         alert('Error: ' + err.message);
       }
     };

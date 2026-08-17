@@ -22,8 +22,11 @@
 // Netlify function itself, required from manual-entry.js and
 // read-data.js. Uses this app's Supabase client, client_id (uuid) +
 // period_end (date) — not a raw pg pool with integer client/period ids.
-// Run migration_risk_items_v3.sql before wiring this in (adds
-// risk_questions + risk_items.notes).
+// Run migration_risk_items_v3.sql (risk_questions + risk_items.notes) and
+// migration_risk_items_v4.sql (risk_items.recommendation) before wiring
+// this in.
+
+const { synthesizeRiskItem } = require('./risk-item-synthesis');
 
 const RESURFACE_AFTER_DAYS = 365; // 12 months
 
@@ -177,12 +180,19 @@ function capitalize(s) {
 // anchorAnswer: boolean (the literal yes/no answer given)
 // followUpAnswers: [{ questionText, answerText }]
 //
-// If the anchor indicates no risk: writes ONE risk_items row,
-// status='Managed', and skips follow-ups entirely (even if some were
-// answered client-side by mistake — the anchor governs).
+// If the anchor indicates no risk: writes ONE quiet risk_items row,
+// status='Managed', no recommendation — the frontend renders this as a
+// plain "reviewed, no risk" line rather than a full risk card (see
+// index.html's riskItemRow), and skips follow-ups entirely (even if some
+// were answered client-side by mistake — the anchor governs).
 //
-// If the anchor indicates a risk: writes one risk_items row per
-// follow-up answered, status='Identified'.
+// If the anchor indicates a risk: the raw Q&A gets turned into an actual
+// write-up via synthesizeRiskItem (risk-item-synthesis.js) — risk_name,
+// detail, and a recommendation, not the question text echoed back — and
+// written as ONE risk_items row per category (not one per follow-up).
+// The raw Q&A is kept in `notes` underneath the synthesis, so nothing the
+// accountant actually typed is lost even though the row itself is now the
+// synthesized version.
 //
 // Deletes this category's existing risk_items for THIS exact period
 // before inserting — re-submitting a category (accountant corrects an
@@ -231,28 +241,24 @@ async function submitCategoryResponse(supabase, { clientId, periodEnd, anchor, a
     return { riskPresent: false, itemsWritten: 1 };
   }
 
-  const rows = followUpAnswers.map((f) => ({
-    client_id: clientId, period_end: periodEnd, source: 'business',
-    category: anchor.category, risk_name: `${capitalize(anchor.category)} risk`,
-    detail: f.questionText || anchor.question_text, notes: f.answerText,
-    status: 'Identified', severity: 'Medium', last_reviewed_date: today,
+  const synthesized = await synthesizeRiskItem({
+    category: anchor.category,
+    anchorQuestion: anchor.question_text,
+    followUpQA: followUpAnswers.map((f) => ({ questionText: f.questionText, answerText: f.answerText })),
+  });
+
+  const rawQA = followUpAnswers.length
+    ? followUpAnswers.map((f) => `Q: ${f.questionText}\nA: ${f.answerText || '(no detail given)'}`).join('\n\n')
+    : null;
+
+  const { error } = await supabase.from('risk_items').insert({
+    client_id: clientId, period_end: periodEnd, source: 'business', category: anchor.category,
+    risk_name: synthesized.risk_name, detail: synthesized.detail, recommendation: synthesized.recommendation,
+    notes: rawQA, status: 'Identified', severity: synthesized.severity || 'Medium', last_reviewed_date: today,
     is_new: isNew, is_changed: isChanged,
-  }));
-
-  // If a risk was indicated but no follow-ups were answered, still record
-  // the anchor-level risk so it isn't lost.
-  if (!rows.length) {
-    rows.push({
-      client_id: clientId, period_end: periodEnd, source: 'business',
-      category: anchor.category, risk_name: `${capitalize(anchor.category)} risk`,
-      detail: anchor.question_text, status: 'Identified', severity: 'Medium', last_reviewed_date: today,
-      is_new: isNew, is_changed: isChanged,
-    });
-  }
-
-  const { error } = await supabase.from('risk_items').insert(rows);
+  });
   if (error) throw error;
-  return { riskPresent: true, itemsWritten: rows.length };
+  return { riskPresent: true, itemsWritten: 1 };
 }
 
 module.exports = {
