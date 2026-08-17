@@ -1802,33 +1802,65 @@ function renderCashFlowGlanceCard(kpi) {
   `;
 }
 
-// Same shape as Tax outlook's simplest version (revenue growth -> profit at
-// this period's margin), one step further: apply the client's OWN historical
-// operating cash conversion rate (already computed, not invented — see
-// op_cash_conversion) to turn projected profit into projected operating
-// cash flow. Deliberately doesn't try to model capex, debt draws/repayments,
-// owner drawings, or tax payment timing — those are lumpy, judgment-heavy,
-// and exactly the kind of stacked-assumption forecast this app has stayed
-// away from all session. This is one clean extension of a number the app
-// already trusts, not a full cash flow projection.
-let cashOutlookState = { growth: 10 };
+// Same shape as Tax outlook (Financial Performance -> Analyse -> Cash) —
+// same four-level scenario buildup (net profit direct > net profit change >
+// GP change > revenue change, opex change layered on top, see
+// projectProfitScenario), same collapsed "Adjust assumptions" panel, same
+// provenance/buildup pattern — just one step further: apply the client's OWN
+// historical operating cash conversion rate (already computed, not invented
+// — see op_cash_conversion) to turn projected profit into projected
+// operating cash flow. Deliberately doesn't try to model capex, debt
+// draws/repayments, owner drawings, or tax payment timing — those are lumpy,
+// judgment-heavy, and exactly the kind of stacked-assumption forecast this
+// app has stayed away from all session. This is one clean extension of a
+// number the app already trusts, not a full cash flow projection.
+let cashOutlookState = { unit: 'pct', revenue: 0, gp: 0, opex: 0, netProfit: 0, netProfitAbsolute: '' };
+function computeCashOutlookResult(snapshot, conversion, unit, revenueChange, gpChange, opexChange, netProfitChange, netProfitAbsolute) {
+  const { projectedProfit, buildup, provenance } = projectProfitScenario(snapshot, unit, revenueChange, gpChange, opexChange, netProfitChange, netProfitAbsolute);
+  const projectedOCF = projectedProfit * conversion;
+  return {
+    headline: formatMoney(projectedOCF),
+    buildup: `${buildup} × <b>${(conversion * 100).toFixed(0)}%</b> cash conversion (this period's actual rate) = projected operating cash flow <b>${formatMoney(projectedOCF)}</b>`,
+    provenance,
+  };
+}
 function renderCashOutlookCard(snapshot, kpis) {
   const revenue = snapshot?.revenue;
   const netProfit = snapshot?.net_profit;
   const conversion = kpis?.find((k) => k.key === 'op_cash_conversion')?.value;
   if (!revenue || netProfit == null || conversion == null) return '';
+  const selectStyle = 'padding:5px 8px; border:1px solid var(--line); border-radius:6px; font-size:12px; font-family:var(--font-mono); background:var(--paper-raised); color:var(--ink);';
+  const s = cashOutlookState;
+  const row = (id, label, value) => `<div class="ocf-row"><label>${label}</label><input type="number" id="${id}" value="${value}" placeholder="0" /></div>`;
+  const panelOpen = s.revenue !== 0 || s.gp !== 0 || s.opex !== 0 || s.netProfit !== 0 || s.netProfitAbsolute !== '';
   return `
     <div class="kpi-card">
-      <div class="kpi-card-head"><p class="kpi-name">Cash outlook — if revenue grows</p></div>
-      <p class="kpi-value" id="cash-outlook-value">—</p>
-      <p class="card-label" id="cash-outlook-label" style="margin:2px 0 0;">Projected operating cash flow</p>
-      <div style="display:flex; align-items:center; gap:8px; margin:6px 0 0;">
-        <label style="font-size:12px; color:var(--ink-soft);">Revenue growth</label>
-        <input type="number" id="cash-outlook-growth" value="${cashOutlookState.growth}" style="width:60px; padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-family:var(--font-mono); background:var(--paper-raised); color:var(--ink);" />
-        <span style="font-size:13px;">%</span>
+      <div class="kpi-card-head"><p class="kpi-name">Cash outlook — model a scenario</p></div>
+      <div style="background:var(--sage-bg); border-radius:8px; padding:8px 12px; display:inline-block;">
+        <p class="kpi-value" id="cash-outlook-value" style="margin:0;">—</p>
+        <p class="card-label" style="margin:2px 0 0;">Projected operating cash flow</p>
       </div>
-      <p style="font-size:11px; color:var(--ink-soft); margin:8px 0 0;" id="cash-outlook-buildup"></p>
-      <p style="font-size:11px; color:var(--ink-soft); margin-top:8px; font-style:italic;">Rough estimate — assumes this period's margin and cash conversion rate hold. Doesn't account for capex, debt, drawings, or tax payment timing.</p>
+      <p style="font-size:11px; color:var(--ink-soft); margin:6px 0 0;">
+        <span id="cash-outlook-provenance"></span>
+        <button type="button" id="cash-outlook-provenance-link" style="background:none; border:none; padding:0; margin-left:2px; color:var(--brass); font-size:11px; cursor:pointer; text-decoration:underline; font-family:inherit;">Adjust assumptions</button>
+      </p>
+
+      <div class="cash-item cash-item-clickable" id="cash-outlook-toggle">
+        <span class="cash-item-icon">🧮</span>
+        <span class="cash-item-label">Adjust assumptions</span>
+        <span class="chevron">${panelOpen ? '▴' : '▾'}</span>
+      </div>
+      <div class="ocf-adjust-panel" id="cash-outlook-panel" style="display:${panelOpen ? 'block' : 'none'};">
+        <div class="ocf-row"><label>Change amounts as</label><select id="cash-outlook-unit" style="${selectStyle}"><option value="pct" ${s.unit === 'pct' ? 'selected' : ''}>%</option><option value="dollar" ${s.unit === 'dollar' ? 'selected' : ''}>$</option></select></div>
+        ${row('cash-outlook-revenue', 'Revenue', s.revenue)}
+        ${row('cash-outlook-gp', 'Gross profit', s.gp)}
+        ${row('cash-outlook-opex', 'Operating expenses', s.opex)}
+        ${row('cash-outlook-netprofit', 'Net profit', s.netProfit)}
+        <div class="ocf-row"><label>Or set net profit directly ($)</label><input type="number" id="cash-outlook-netprofit-absolute" value="${s.netProfitAbsolute}" placeholder="e.g. 150000" /></div>
+        <p style="font-size:11px; color:var(--ink-soft); margin:6px 0 0;">Fill in the most specific level you want to model — setting net profit directly overrides everything else, Net profit change overrides Gross profit, Gross profit overrides Revenue.</p>
+        <p style="font-size:11px; color:var(--ink-soft); margin:6px 0 0;" id="cash-outlook-buildup"></p>
+      </div>
+      <p style="font-size:11px; color:var(--ink-soft); margin-top:8px; font-style:italic;">Rough estimate — assumes this period's cash conversion rate holds. Doesn't account for capex, debt, drawings, or tax payment timing.</p>
     </div>
   `;
 }
@@ -1949,23 +1981,13 @@ function auFinancialYearLabel(periodEnd) {
   return `FY${startYear}-${String(startYear + 1).slice(-2)}`;
 }
 
-// Four levels, most specific wins: Net profit change (if filled) overrides
-// everything — the adviser already knows the number, skip the story. Else
-// Gross profit change (if filled) overrides Revenue — models a GP shift
-// (pricing, cost of materials) without needing to reverse-engineer what
-// revenue growth would produce it. Else Revenue change (at the current GP
-// margin) is the fallback, same shape as the original version. Operating
-// expenses change always applies on top, at whichever level is active,
-// since opex moves somewhat independently of revenue/GP either way.
-// unit is shared across all four fields ('pct' or 'dollar') rather than
-// per-field — a per-field toggle would double the control count for a
-// use case (a client thinking in $ this quarter, % next) that doesn't
-// really need mixed units in the same scenario.
-// cash is the CURRENT balance (no attempt to project cash forward), used
-// only to answer "could today's cash cover a bill of this size", same
-// framing as the standing Tax vs cash on hand card, just against a
-// hypothetical.
-function computeTaxOutlookResult(snapshot, cash, entityType, unit, revenueChange, gpChange, opexChange, netProfitChange, netProfitAbsolute, superContribution, equipmentPurchase, compareEntity, compareShares, compareOtherIncome) {
+// Shared by Tax outlook and Cash outlook (both "model a scenario" cards) —
+// same four-level buildup: net profit set directly overrides everything,
+// else net profit change, else GP change (opex layered on top either way),
+// else revenue change at this period's own GP margin as the fallback. One
+// function so the two cards can never drift into computing "projected
+// profit" two different ways.
+function projectProfitScenario(snapshot, unit, revenueChange, gpChange, opexChange, netProfitChange, netProfitAbsolute) {
   const revenue = snapshot.revenue;
   const netProfit = snapshot.net_profit;
   const baselineGP = snapshot.cogs != null ? revenue - snapshot.cogs : null;
@@ -2006,6 +2028,11 @@ function computeTaxOutlookResult(snapshot, cash, entityType, unit, revenueChange
     projectedProfit = projectedGP - projectedOpex;
     buildup = `Revenue <b>${formatMoney(projectedRevenue)}</b> → gross profit <b>${formatMoney(projectedGP)}</b> − operating expenses <b>${formatMoney(projectedOpex)}</b> = projected profit <b>${formatMoney(projectedProfit)}</b>`;
   }
+  return { projectedProfit, buildup, isBaseline, provenance };
+}
+
+function computeTaxOutlookResult(snapshot, cash, entityType, unit, revenueChange, gpChange, opexChange, netProfitChange, netProfitAbsolute, superContribution, equipmentPurchase, compareEntity, compareShares, compareOtherIncome) {
+  let { projectedProfit, buildup, provenance } = projectProfitScenario(snapshot, unit, revenueChange, gpChange, opexChange, netProfitChange, netProfitAbsolute);
 
   // Super contribution and equipment purchase both work the same way here —
   // a deduction against taxable profit — even though the real-world
@@ -2510,22 +2537,47 @@ function renderHealthWheelBlock(container, overview, kpis, snapshot, history) {
     };
   }
 
-  const cashOutlookGrowthInput = document.getElementById('cash-outlook-growth');
-  if (cashOutlookGrowthInput && snapshot?.revenue && snapshot?.net_profit != null) {
-    const cashOutlookValueEl = document.getElementById('cash-outlook-value');
-    const cashOutlookBuildupEl = document.getElementById('cash-outlook-buildup');
+  const cashOutlookUnit = document.getElementById('cash-outlook-unit');
+  if (cashOutlookUnit && snapshot?.revenue && snapshot?.net_profit != null) {
     const conversion = kpis.find((k) => k.key === 'op_cash_conversion')?.value;
-    const margin = snapshot.net_profit / snapshot.revenue;
+    const cashValueEl = document.getElementById('cash-outlook-value');
+    const cashProvenanceEl = document.getElementById('cash-outlook-provenance');
+    const cashBuildupEl = document.getElementById('cash-outlook-buildup');
+    const cashRevenueInput = document.getElementById('cash-outlook-revenue');
+    const cashGpInput = document.getElementById('cash-outlook-gp');
+    const cashOpexInput = document.getElementById('cash-outlook-opex');
+    const cashNetProfitInput = document.getElementById('cash-outlook-netprofit');
+    const cashNetProfitAbsoluteInput = document.getElementById('cash-outlook-netprofit-absolute');
     const recalcCashOutlook = () => {
-      cashOutlookState.growth = Number(cashOutlookGrowthInput.value || 0);
-      const projectedRevenue = snapshot.revenue * (1 + cashOutlookState.growth / 100);
-      const projectedProfit = projectedRevenue * margin;
-      const projectedOCF = projectedProfit * conversion;
-      cashOutlookValueEl.textContent = formatMoney(projectedOCF);
-      cashOutlookBuildupEl.innerHTML = `Revenue <b>${formatMoney(projectedRevenue)}</b> → profit <b>${formatMoney(projectedProfit)}</b> (at ${(margin * 100).toFixed(1)}% margin) × <b>${(conversion * 100).toFixed(0)}%</b> cash conversion (this period's actual rate)`;
+      cashOutlookState = {
+        unit: cashOutlookUnit.value, revenue: Number(cashRevenueInput.value || 0), gp: Number(cashGpInput.value || 0),
+        opex: Number(cashOpexInput.value || 0), netProfit: Number(cashNetProfitInput.value || 0), netProfitAbsolute: cashNetProfitAbsoluteInput.value,
+      };
+      const r = computeCashOutlookResult(
+        snapshot, conversion, cashOutlookState.unit,
+        cashOutlookState.revenue, cashOutlookState.gp, cashOutlookState.opex, cashOutlookState.netProfit, cashOutlookState.netProfitAbsolute
+      );
+      cashValueEl.textContent = r.headline;
+      cashProvenanceEl.textContent = r.provenance;
+      cashBuildupEl.innerHTML = r.buildup;
     };
-    cashOutlookGrowthInput.oninput = recalcCashOutlook;
+    cashOutlookUnit.onchange = recalcCashOutlook;
+    [cashRevenueInput, cashGpInput, cashOpexInput, cashNetProfitInput, cashNetProfitAbsoluteInput].forEach((el) => { el.oninput = recalcCashOutlook; });
     recalcCashOutlook();
+
+    const cashOutlookToggle = document.getElementById('cash-outlook-toggle');
+    const cashOutlookPanel = document.getElementById('cash-outlook-panel');
+    const openCashOutlookPanel = () => {
+      cashOutlookPanel.style.display = 'block';
+      cashOutlookToggle.querySelector('.chevron').textContent = '▴';
+      cashOutlookPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    };
+    cashOutlookToggle.onclick = () => {
+      const willOpen = cashOutlookPanel.style.display === 'none';
+      cashOutlookPanel.style.display = willOpen ? 'block' : 'none';
+      cashOutlookToggle.querySelector('.chevron').textContent = willOpen ? '▴' : '▾';
+    };
+    document.getElementById('cash-outlook-provenance-link').onclick = openCashOutlookPanel;
   }
 
   const taxPositionToggle = document.getElementById('tax-position-toggle');
