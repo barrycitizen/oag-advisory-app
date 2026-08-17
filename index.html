@@ -3478,7 +3478,7 @@ function renderBusinessReviewCategory(c) {
         `).join('')}
       </div>
       <button type="button" class="action" id="biz-save-${c.id}" style="display:none; margin-top:10px;">Save</button>
-      <p class="muted plain" id="biz-saved-${c.id}" style="display:none; margin:8px 0 0; color:var(--sage);">Saved.</p>
+      <div id="biz-saved-${c.id}" style="display:none; margin-top:8px;"></div>
     </div>
   `;
 }
@@ -3551,9 +3551,22 @@ async function renderRiskAnalyse(content) {
         });
         const result = await res.json();
         if (result.error) throw new Error(result.error);
+        // Shows what was actually written right here, in the card the
+        // accountant just answered in — a bare "Saved." with the AI's
+        // write-up sitting unseen further down the page (behind however
+        // many other categories are still due for review) is why this
+        // felt like nothing had happened beyond recording yes/no.
         saveBtn.style.display = 'none';
+        followUpsBlock.style.display = 'none';
+        catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => { b.disabled = true; });
         savedMsg.style.display = 'block';
-        renderMain(); // refresh so this category's new risk_items row shows in the list above and it drops off "due for review"
+        savedMsg.innerHTML = riskItemRow(result.saved.item);
+        // Deliberately NOT calling renderMain() here — that would replace
+        // content.innerHTML wholesale and wipe out the preview just shown
+        // above it. The rollup banner's counts and the read-only history
+        // list catch up next time this tab naturally re-renders (switching
+        // domains/tabs and back); this card's own result is already
+        // accurate from the server response, so it doesn't need a refetch.
       } catch (err) {
         saveBtn.disabled = false;
         saveBtn.textContent = 'Save';
@@ -3563,29 +3576,32 @@ async function renderRiskAnalyse(content) {
   });
 
   // Review actions (Confirm/Investigate/Not applicable/No longer a risk) —
-  // one delegated listener rather than one per button, since the count
-  // scales with however many risk_items rows are on screen. Works on any
-  // row regardless of source, see lib/risk-review-actions.js.
-  content.querySelectorAll('.risk-action-btn').forEach((btn) => {
-    btn.onclick = async () => {
-      const buttonsInRow = btn.parentElement.querySelectorAll('.risk-action-btn');
-      buttonsInRow.forEach((b) => { b.disabled = true; });
-      const original = btn.textContent;
-      btn.textContent = '…';
-      try {
-        const res = await fetch('/.netlify/functions/manual-entry', {
-          method: 'POST',
-          body: JSON.stringify({ type: 'risk_review_action', risk_item_id: btn.dataset.riskId, action: btn.dataset.riskAction }),
-        });
-        const result = await res.json();
-        if (result.error) throw new Error(result.error);
-        renderMain(); // refresh so the new status/cleared New-Changed badges and the rollup banner's bucket counts reflect it immediately
-      } catch (err) {
-        buttonsInRow.forEach((b) => { b.disabled = false; });
-        btn.textContent = original;
-        alert('Error: ' + err.message);
-      }
-    };
+  // one listener on `content` itself (true event delegation via bubbling,
+  // not a forEach over buttons present at render time) so it also catches
+  // clicks on action buttons injected later — e.g. the inline synthesis
+  // preview a business questionnaire Save renders directly into its own
+  // category card, well after this initial wiring pass has already run.
+  // Works on any row regardless of source, see lib/risk-review-actions.js.
+  content.addEventListener('click', async (e) => {
+    const btn = e.target.closest('.risk-action-btn');
+    if (!btn) return;
+    const buttonsInRow = btn.parentElement.querySelectorAll('.risk-action-btn');
+    buttonsInRow.forEach((b) => { b.disabled = true; });
+    const original = btn.textContent;
+    btn.textContent = '…';
+    try {
+      const res = await fetch('/.netlify/functions/manual-entry', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'risk_review_action', risk_item_id: btn.dataset.riskId, action: btn.dataset.riskAction }),
+      });
+      const result = await res.json();
+      if (result.error) throw new Error(result.error);
+      renderMain(); // refresh so the new status/cleared New-Changed badges and the rollup banner's bucket counts reflect it immediately
+    } catch (err) {
+      buttonsInRow.forEach((b) => { b.disabled = false; });
+      btn.textContent = original;
+      alert('Error: ' + err.message);
+    }
   });
 }
 

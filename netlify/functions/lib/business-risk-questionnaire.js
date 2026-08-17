@@ -231,14 +231,21 @@ async function submitCategoryResponse(supabase, { clientId, periodEnd, anchor, a
   const today = new Date().toISOString().slice(0, 10);
 
   if (!riskPresent) {
-    const { error } = await supabase.from('risk_items').insert({
+    const row = {
       client_id: clientId, period_end: periodEnd, source: 'business',
       category: anchor.category, risk_name: `${capitalize(anchor.category)} — no risk identified`,
       detail: anchor.question_text, status: 'Managed', severity: 'Low', last_reviewed_date: today,
       is_new: isNew, is_changed: isChanged,
-    });
+    };
+    const { data: inserted, error } = await supabase.from('risk_items').insert(row).select().single();
     if (error) throw error;
-    return { riskPresent: false, itemsWritten: 1 };
+    // Returns the written row (with its real id, via select().single()) —
+    // the caller (manual-entry.js's saveBusinessRiskResponse) hands this
+    // straight back to the frontend so it can show what was actually
+    // recorded immediately, in the same card the accountant just answered
+    // in, instead of just a bare "Saved." with the result sitting unseen
+    // further down the page.
+    return { riskPresent: false, itemsWritten: 1, item: inserted };
   }
 
   const synthesized = await synthesizeRiskItem({
@@ -251,14 +258,15 @@ async function submitCategoryResponse(supabase, { clientId, periodEnd, anchor, a
     ? followUpAnswers.map((f) => `Q: ${f.questionText}\nA: ${f.answerText || '(no detail given)'}`).join('\n\n')
     : null;
 
-  const { error } = await supabase.from('risk_items').insert({
+  const row = {
     client_id: clientId, period_end: periodEnd, source: 'business', category: anchor.category,
     risk_name: synthesized.risk_name, detail: synthesized.detail, recommendation: synthesized.recommendation,
     notes: rawQA, status: 'Identified', severity: synthesized.severity || 'Medium', last_reviewed_date: today,
     is_new: isNew, is_changed: isChanged,
-  });
+  };
+  const { data: inserted, error } = await supabase.from('risk_items').insert(row).select().single();
   if (error) throw error;
-  return { riskPresent: true, itemsWritten: 1 };
+  return { riskPresent: true, itemsWritten: 1, item: inserted };
 }
 
 module.exports = {
