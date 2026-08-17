@@ -2,6 +2,7 @@
 const { randomUUID } = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const { generateIndustryRiskItems } = require('./lib/industry-risk-checklist');
 
 // fy_end is required (not just business_name) because the frontend derives every
 // valid period-end date from cadence + fy_end — without it, Input has no dates to offer.
@@ -55,7 +56,7 @@ async function saveFinancials(body) {
   const { client_id, period_end } = body;
   if (!client_id || !period_end) throw new Error('client_id and period_end required');
 
-  const { data: context } = await supabase.from('client_context').select('cadence').eq('client_id', client_id).single();
+  const { data: context } = await supabase.from('client_context').select('cadence, industry').eq('client_id', client_id).single();
 
   const row = {
     client_id, period_end, source: 'manual', synced_at: new Date().toISOString(),
@@ -95,6 +96,29 @@ async function saveFinancials(body) {
 
   const { error } = await supabase.from('financial_snapshots').upsert(row, { onConflict: 'client_id,period_end' });
   if (error) throw error;
+
+  // Industry Risk Checklist (Source C of Risk Review) — generated once per
+  // client, on whichever period first has both an industry on file and no
+  // industry risk_items yet. Not re-run on every save (see the count check)
+  // — that's what industry_risk_checklist_cache is for across CLIENTS, this
+  // guard is for not repeating it for the SAME client every period. Failures
+  // here are logged, not thrown — an AI hiccup must never block a financials
+  // save. See netlify/functions/lib/industry-risk-checklist.js.
+  if (context?.industry) {
+    const { count } = await supabase
+      .from('risk_items')
+      .select('id', { count: 'exact', head: true })
+      .eq('client_id', client_id)
+      .eq('source', 'industry');
+    if (!count) {
+      try {
+        await generateIndustryRiskItems(supabase, { clientId: client_id, periodEnd: period_end, industryText: context.industry });
+      } catch (err) {
+        console.error('Industry risk checklist generation failed:', err.message);
+      }
+    }
+  }
+
   return row;
 }
 
