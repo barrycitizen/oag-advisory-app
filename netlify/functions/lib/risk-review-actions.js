@@ -22,6 +22,15 @@
 //
 // Same lib/ placement as the other Risk Review sources — not a Netlify
 // function itself, required from manual-entry.js.
+//
+// Confirming an industry-source item also triggers synthesizeIndustryRecommendation
+// (risk-item-synthesis.js) — "is this real" and "what do we do about it" are
+// two different questions, and the second is only worth asking (i.e. worth
+// an AI call) once the first is answered yes. Financial/business rows
+// already carry a recommendation from when they were created, so this only
+// fires for industry and only when one isn't already set.
+
+const { synthesizeIndustryRecommendation } = require('./risk-item-synthesis');
 
 const VALID_ACTIONS = ['confirm', 'investigate', 'not_applicable', 'no_longer_a_risk'];
 
@@ -50,6 +59,25 @@ async function applyReviewAction(supabase, { riskItemId, action, note }) {
   // just omitted entirely rather than passed as null, to leave existing
   // notes (e.g. the raw Q&A transcript from submitCategoryResponse) intact.
   if (note) update.notes = note;
+
+  if (action === 'confirm') {
+    const { data: current } = await supabase
+      .from('risk_items').select('source, category, risk_name, detail, recommendation')
+      .eq('id', riskItemId).single();
+    if (current?.source === 'industry' && !current.recommendation) {
+      try {
+        const { recommendation } = await synthesizeIndustryRecommendation({
+          category: current.category, riskName: current.risk_name, detail: current.detail,
+        });
+        update.recommendation = recommendation;
+      } catch (err) {
+        // Non-fatal — confirming the risk must still succeed even if the
+        // AI call hiccups. The recommendation can always be generated on
+        // a later confirm, since this only skips when one's missing.
+        console.error('Industry recommendation synthesis failed:', err.message);
+      }
+    }
+  }
 
   const { error } = await supabase.from('risk_items').update(update).eq('id', riskItemId);
   if (error) throw error;

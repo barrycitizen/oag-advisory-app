@@ -3560,7 +3560,7 @@ async function renderRiskAnalyse(content) {
         followUpsBlock.style.display = 'none';
         catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => { b.disabled = true; });
         savedMsg.style.display = 'block';
-        savedMsg.innerHTML = riskItemRow(result.saved.item);
+        savedMsg.innerHTML = result.saved.items.map(riskItemRow).join('');
         // Deliberately NOT calling renderMain() here — that would replace
         // content.innerHTML wholesale and wipe out the preview just shown
         // above it. The rollup banner's counts and the read-only history

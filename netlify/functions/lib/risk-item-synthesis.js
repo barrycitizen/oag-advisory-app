@@ -78,4 +78,54 @@ async function synthesizeRiskItem({ category, anchorQuestion, followUpQA }) {
   return parsed; // { risk_name, detail, recommendation, severity }
 }
 
-module.exports = { synthesizeRiskItem };
+const INDUSTRY_RECOMMENDATION_SYSTEM_PROMPT = `You give small business advisers one concrete, actionable next step for a
+risk that's just been confirmed as applicable to a specific client.
+
+You'll be given the risk's category, name, and description (generated
+earlier as a general industry-checklist item, now confirmed as real for
+this client). Suggest ONE practical thing the adviser could recommend the
+client actually do about it — specific enough to act on, not a vague
+"monitor this" platitude.
+
+Respond with ONLY a JSON object, no markdown fences, no preamble:
+{ "recommendation": "..." }`;
+
+// Deliberately NOT run when the industry checklist is first generated
+// (generateIndustryRiskItems, industry-risk-checklist.js) — that would
+// mean an AI recommendation call for every one of the 5-9 items on every
+// client, most of which get dismissed as Not applicable. Only runs once a
+// risk is actually confirmed applicable (see risk-review-actions.js's
+// 'confirm' action) — "is this real" and "what do we do about it" are two
+// different questions, and the second one is only worth asking once the
+// first is answered yes.
+async function synthesizeIndustryRecommendation({ category, riskName, detail }) {
+  const userMessage = `Category: ${category}\nRisk: ${riskName}\nDescription: ${detail}`;
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 300,
+      system: INDUSTRY_RECOMMENDATION_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: userMessage }],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Anthropic API error: ${response.status} ${await response.text()}`);
+  }
+
+  const data = await response.json();
+  const text = (data.content || []).map((b) => b.text || '').join('').trim();
+  const cleaned = text.replace(/^```json\s*|```$/g, '').trim();
+  const parsed = JSON.parse(cleaned);
+  if (!parsed.recommendation) throw new Error('Synthesis response missing recommendation');
+  return parsed; // { recommendation }
+}
+
+module.exports = { synthesizeRiskItem, synthesizeIndustryRecommendation };

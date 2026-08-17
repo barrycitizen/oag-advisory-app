@@ -186,13 +186,16 @@ function capitalize(s) {
 // index.html's riskItemRow), and skips follow-ups entirely (even if some
 // were answered client-side by mistake — the anchor governs).
 //
-// If the anchor indicates a risk: the raw Q&A gets turned into an actual
-// write-up via synthesizeRiskItem (risk-item-synthesis.js) — risk_name,
-// detail, and a recommendation, not the question text echoed back — and
-// written as ONE risk_items row per category (not one per follow-up).
-// The raw Q&A is kept in `notes` underneath the synthesis, so nothing the
-// accountant actually typed is lost even though the row itself is now the
-// synthesized version.
+// If the anchor indicates a risk: each follow-up answer gets its own
+// synthesizeRiskItem call (risk-item-synthesis.js) and its own risk_items
+// row — a category with 2 follow-ups answered writes 2 separate risks, not
+// one merged write-up, since "key employee we couldn't replace" and
+// "recruitment/retention issues" are genuinely different risks that happen
+// to live under the same category, not two facets of one thing. Each row
+// keeps its own raw Q&A in `notes`, so nothing the accountant actually
+// typed is lost even though detail/recommendation are the synthesized
+// version. If the anchor indicates risk but no follow-up was answered,
+// falls back to one anchor-level row so the risk isn't lost entirely.
 //
 // Deletes this category's existing risk_items for THIS exact period
 // before inserting — re-submitting a category (accountant corrects an
@@ -237,36 +240,45 @@ async function submitCategoryResponse(supabase, { clientId, periodEnd, anchor, a
       detail: anchor.question_text, status: 'Managed', severity: 'Low', last_reviewed_date: today,
       is_new: isNew, is_changed: isChanged,
     };
-    const { data: inserted, error } = await supabase.from('risk_items').insert(row).select().single();
+    const { data: inserted, error } = await supabase.from('risk_items').insert(row).select();
     if (error) throw error;
-    // Returns the written row (with its real id, via select().single()) —
-    // the caller (manual-entry.js's saveBusinessRiskResponse) hands this
+    // Returns the written row(s) (with real ids, via select()) — the
+    // caller (manual-entry.js's saveBusinessRiskResponse) hands this
     // straight back to the frontend so it can show what was actually
     // recorded immediately, in the same card the accountant just answered
     // in, instead of just a bare "Saved." with the result sitting unseen
-    // further down the page.
-    return { riskPresent: false, itemsWritten: 1, item: inserted };
+    // further down the page. Always `items` (array), even here where
+    // there's only ever one, so the frontend doesn't need two code paths.
+    return { riskPresent: false, itemsWritten: 1, items: inserted };
   }
 
-  const synthesized = await synthesizeRiskItem({
-    category: anchor.category,
-    anchorQuestion: anchor.question_text,
-    followUpQA: followUpAnswers.map((f) => ({ questionText: f.questionText, answerText: f.answerText })),
+  // One follow-up = one risk = one AI call, run in parallel since they're
+  // independent. Falls back to a single anchor-level synthesis (no
+  // follow-up-specific Q&A to draw on) if the accountant answered "yes"
+  // but left every follow-up blank.
+  const qaList = followUpAnswers.length ? followUpAnswers : [null];
+  const synthesizedList = await Promise.all(
+    qaList.map((f) => synthesizeRiskItem({
+      category: anchor.category,
+      anchorQuestion: anchor.question_text,
+      followUpQA: f ? [{ questionText: f.questionText, answerText: f.answerText }] : [],
+    }))
+  );
+
+  const rows = synthesizedList.map((synthesized, i) => {
+    const f = qaList[i];
+    return {
+      client_id: clientId, period_end: periodEnd, source: 'business', category: anchor.category,
+      risk_name: synthesized.risk_name, detail: synthesized.detail, recommendation: synthesized.recommendation,
+      notes: f ? `Q: ${f.questionText}\nA: ${f.answerText || '(no detail given)'}` : null,
+      status: 'Identified', severity: synthesized.severity || 'Medium', last_reviewed_date: today,
+      is_new: isNew, is_changed: isChanged,
+    };
   });
 
-  const rawQA = followUpAnswers.length
-    ? followUpAnswers.map((f) => `Q: ${f.questionText}\nA: ${f.answerText || '(no detail given)'}`).join('\n\n')
-    : null;
-
-  const row = {
-    client_id: clientId, period_end: periodEnd, source: 'business', category: anchor.category,
-    risk_name: synthesized.risk_name, detail: synthesized.detail, recommendation: synthesized.recommendation,
-    notes: rawQA, status: 'Identified', severity: synthesized.severity || 'Medium', last_reviewed_date: today,
-    is_new: isNew, is_changed: isChanged,
-  };
-  const { data: inserted, error } = await supabase.from('risk_items').insert(row).select().single();
+  const { data: inserted, error } = await supabase.from('risk_items').insert(rows).select();
   if (error) throw error;
-  return { riskPresent: true, itemsWritten: 1, item: inserted };
+  return { riskPresent: true, itemsWritten: inserted.length, items: inserted };
 }
 
 module.exports = {
