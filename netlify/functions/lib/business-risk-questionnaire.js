@@ -193,6 +193,25 @@ function capitalize(s) {
 async function submitCategoryResponse(supabase, { clientId, periodEnd, anchor, anchorAnswer, followUpAnswers = [] }) {
   const riskPresent = anchorAnswer === anchor.risk_if_yes;
 
+  // is_new/is_changed vs the most recent PRIOR review of this category
+  // (excluding this exact period, so re-submitting the same period to fix
+  // a mistake doesn't compare against the row it's about to replace) — same
+  // idea as financial-risk-sync.js's previousByName, just keyed by category
+  // since business reviews don't happen every period the way financial
+  // does. Without this, every inserted row would default to is_new=true
+  // forever (the column default), making a dashboard's "new this cycle"
+  // count meaningless.
+  const newStatus = riskPresent ? 'Identified' : 'Managed';
+  const { data: priorRows } = await supabase
+    .from('risk_items')
+    .select('status, last_reviewed_date')
+    .eq('client_id', clientId).eq('source', 'business').eq('category', anchor.category)
+    .neq('period_end', periodEnd)
+    .order('last_reviewed_date', { ascending: false }).limit(1);
+  const priorRow = priorRows?.[0] || null;
+  const isNew = !priorRow;
+  const isChanged = !!priorRow && priorRow.status !== newStatus;
+
   const { error: delError } = await supabase
     .from('risk_items').delete()
     .eq('client_id', clientId).eq('period_end', periodEnd)
@@ -206,6 +225,7 @@ async function submitCategoryResponse(supabase, { clientId, periodEnd, anchor, a
       client_id: clientId, period_end: periodEnd, source: 'business',
       category: anchor.category, risk_name: `${capitalize(anchor.category)} — no risk identified`,
       detail: anchor.question_text, status: 'Managed', severity: 'Low', last_reviewed_date: today,
+      is_new: isNew, is_changed: isChanged,
     });
     if (error) throw error;
     return { riskPresent: false, itemsWritten: 1 };
@@ -216,6 +236,7 @@ async function submitCategoryResponse(supabase, { clientId, periodEnd, anchor, a
     category: anchor.category, risk_name: `${capitalize(anchor.category)} risk`,
     detail: f.questionText || anchor.question_text, notes: f.answerText,
     status: 'Identified', severity: 'Medium', last_reviewed_date: today,
+    is_new: isNew, is_changed: isChanged,
   }));
 
   // If a risk was indicated but no follow-ups were answered, still record
@@ -225,6 +246,7 @@ async function submitCategoryResponse(supabase, { clientId, periodEnd, anchor, a
       client_id: clientId, period_end: periodEnd, source: 'business',
       category: anchor.category, risk_name: `${capitalize(anchor.category)} risk`,
       detail: anchor.question_text, status: 'Identified', severity: 'Medium', last_reviewed_date: today,
+      is_new: isNew, is_changed: isChanged,
     });
   }
 

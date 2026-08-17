@@ -3310,7 +3310,107 @@ function riskItemRow(r) {
           ${r.detail ? `<p class="muted plain" style="margin:4px 0 0;">${r.detail}</p>` : ''}
           ${r.notes ? `<p class="muted plain" style="margin:2px 0 0;">${r.notes}</p>` : ''}
           ${r.impact_estimate ? `<p class="muted plain" style="margin:2px 0 0;">${r.impact_estimate}</p>` : ''}
+          ${r.last_reviewed_date ? `<p class="muted plain" style="margin:2px 0 0; font-size:11px;">Reviewed ${formatShortDate(r.last_reviewed_date)}</p>` : ''}
         </div>
+      </div>
+    </div>
+  `;
+}
+
+// ---- Risk: rollup banner ----
+// Pure client-side rollup over what get_risk_items already returns — no new
+// query, just querying-by-status/severity as already discussed. Business
+// rows accumulate one row-set per period a category gets reviewed (the
+// delete-then-insert guard only clears THIS period's rows, so a category
+// reviewed in 2026 and again in 2027 leaves both on file as history) — the
+// rollup only wants the CURRENT standing, so it dedupes to each category's
+// most-recently-reviewed period first. Financial and industry don't need
+// this: financial's query is already period-scoped, and industry rows are
+// only ever written once, per client, on first generation.
+function dedupeBusinessToLatestPerCategory(business) {
+  const latestPeriodByCategory = {};
+  business.forEach((r) => {
+    if (!latestPeriodByCategory[r.category] || r.period_end > latestPeriodByCategory[r.category]) {
+      latestPeriodByCategory[r.category] = r.period_end;
+    }
+  });
+  return business.filter((r) => r.period_end === latestPeriodByCategory[r.category]);
+}
+
+// 'Unknown' (industry's default until an accountant confirms/dismisses each
+// one — no such UI yet, see ideas.md) counts as needing attention alongside
+// Detected/Identified/Watch; Managed/Not applicable are resolved and don't.
+const RISK_ACTIVE_STATUSES = new Set(['Detected', 'Identified', 'Watch', 'Unknown']);
+
+function computeRiskRollup(financial, business, industry) {
+  const businessLatest = dedupeBusinessToLatestPerCategory(business);
+  const activeFinancial = financial.filter((r) => RISK_ACTIVE_STATUSES.has(r.status));
+  const activeBusiness = businessLatest.filter((r) => RISK_ACTIVE_STATUSES.has(r.status));
+  const activeIndustry = industry.filter((r) => RISK_ACTIVE_STATUSES.has(r.status));
+  const allActive = [...activeFinancial, ...activeBusiness, ...activeIndustry];
+
+  const buckets = { High: [], Medium: [], Low: [] };
+  allActive.forEach((r) => { (buckets[r.severity] || buckets.Medium).push(r); });
+
+  // is_new/is_changed only means something for sources that get re-synced
+  // over time (financial every analysis run, business every review cycle)
+  // — industry is generated once and never revisited, so "new this cycle"
+  // doesn't apply to it; it gets its own "needs review" count instead,
+  // since every industry item starts at Unknown until confirmed/dismissed.
+  const newOrChangedCount = [...activeFinancial, ...activeBusiness].filter((r) => r.is_new || r.is_changed).length;
+  const industryNeedsReview = activeIndustry.filter((r) => r.status === 'Unknown').length;
+
+  const level = buckets.High.length ? 'High' : buckets.Medium.length ? 'Medium' : 'Low';
+  const isQuiet = level === 'Low' && newOrChangedCount === 0 && industryNeedsReview === 0;
+
+  return { buckets, allActiveCount: allActive.length, newOrChangedCount, industryNeedsReview, level, isQuiet };
+}
+
+function riskBucketCard(label, dotColor, rows) {
+  const names = rows.slice(0, 3).map((r) => r.risk_name);
+  const more = rows.length - names.length;
+  return `
+    <div style="background:var(--paper); border-radius:8px; padding:10px 12px; flex:1 1 140px; min-width:0;">
+      <div style="display:flex; align-items:baseline; gap:6px;">
+        <span class="flag-dot" style="background:${dotColor};"></span>
+        <b>${rows.length}</b>
+        <span class="muted" style="margin:0;">${label}</span>
+      </div>
+      ${names.length ? `<p class="muted plain" style="margin:6px 0 0; font-size:12px;">${names.join(', ')}${more > 0 ? `, +${more} more` : ''}</p>` : ''}
+    </div>
+  `;
+}
+
+function renderRiskRollupBanner(rollup) {
+  if (rollup.isQuiet) {
+    return `
+      <div class="cash-item cash-item-clickable" id="risk-rollup-toggle">
+        <span class="cash-item-icon">✅</span>
+        <span class="cash-item-label">Risk: Low — no significant new risks</span>
+        <span class="chevron">▾</span>
+      </div>
+      <div id="risk-rollup-detail" class="card" style="display:none; margin-top:8px;">
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          ${riskBucketCard('High', 'var(--rust)', rollup.buckets.High)}
+          ${riskBucketCard('Medium', 'var(--brass)', rollup.buckets.Medium)}
+          ${riskBucketCard('Low', 'var(--sage)', rollup.buckets.Low)}
+        </div>
+      </div>
+    `;
+  }
+  const bits = [];
+  if (rollup.newOrChangedCount) bits.push(`${rollup.newOrChangedCount} new or changed this cycle`);
+  if (rollup.industryNeedsReview) bits.push(`${rollup.industryNeedsReview} industry item${rollup.industryNeedsReview === 1 ? '' : 's'} awaiting review`);
+  return `
+    <div class="card">
+      <div style="display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;">
+        <p class="kpi-value ${rollup.level === 'High' ? 'bad' : ''}" style="margin:0;">Risk: ${rollup.level}</p>
+        ${bits.length ? `<span class="muted plain">${bits.join(' · ')}</span>` : ''}
+      </div>
+      <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+        ${riskBucketCard('High priority', 'var(--rust)', rollup.buckets.High)}
+        ${riskBucketCard('Medium priority', 'var(--brass)', rollup.buckets.Medium)}
+        ${riskBucketCard('Low priority', 'var(--sage)', rollup.buckets.Low)}
       </div>
     </div>
   `;
@@ -3369,12 +3469,25 @@ async function renderRiskAnalyse(content) {
     ? `<p class="muted plain" style="margin:0 0 8px;">${categoriesToReview.length} categor${categoriesToReview.length === 1 ? 'y' : 'ies'} due for review this cycle:</p>${categoriesToReview.map(renderBusinessReviewCategory).join('')}`
     : '';
 
+  const rollup = computeRiskRollup(data.financial || [], data.business || [], data.industry || []);
+
   content.innerHTML = `
     <p class="section-title">Risk Review</p>
+    ${renderRiskRollupBanner(rollup)}
     ${renderRiskSourceGroup('financial', data.financial || [])}
     ${renderRiskSourceGroup('business', data.business || [], reviewHtml)}
     ${renderRiskSourceGroup('industry', data.industry || [])}
   `;
+
+  const rollupToggle = document.getElementById('risk-rollup-toggle');
+  if (rollupToggle) {
+    const rollupDetail = document.getElementById('risk-rollup-detail');
+    rollupToggle.onclick = () => {
+      const willOpen = rollupDetail.style.display === 'none';
+      rollupDetail.style.display = willOpen ? 'block' : 'none';
+      rollupToggle.querySelector('.chevron').textContent = willOpen ? '▴' : '▾';
+    };
+  }
 
   categoriesToReview.forEach((c) => {
     const catCard = document.getElementById(`biz-cat-${c.id}`);
