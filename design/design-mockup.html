@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>OAG Advisory — Design mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #F6F4EE;
+    --paper-raised: #FFFFFF;
+    --ink: #1E2A24;
+    --ink-soft: #55605A;
+    --brass: #9C7A3C;
+    --brass-soft: #C9AE7B;
+    --sage: #5C7A63;
+    --sage-bg: #E7EEE6;
+    --rust: #9C4B3C;
+    --rust-bg: #F3E4DF;
+    --line: #DDD8C8;
+    --font-display: 'Fraunces', serif;
+    --font-body: 'Inter', sans-serif;
+    --font-mono: 'IBM Plex Mono', monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+  }
+  .app {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    min-height: 100vh;
+  }
+  .sidebar {
+    background: var(--paper-raised);
+    border-right: 1px solid var(--line);
+    padding: 28px 20px;
+  }
+  .sidebar-label {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin: 0 0 16px;
+  }
+  .client-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 10px 12px;
+    border: none;
+    background: transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: var(--font-display);
+    font-size: 15px;
+    color: var(--ink);
+    margin-bottom: 2px;
+  }
+  .client-item.active {
+    background: var(--paper);
+    border-left: 2px solid var(--brass);
+    color: var(--brass);
+    padding-left: 10px;
+  }
+  .client-item .sub {
+    display: block;
+    font-family: var(--font-body);
+    font-size: 11px;
+    color: var(--ink-soft);
+    margin-top: 2px;
+  }
+  .main {
+    padding: 40px 48px;
+  }
+  .eyebrow {
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--brass);
+    margin: 0 0 4px;
+    font-weight: 500;
+  }
+  h1 {
+    font-family: var(--font-display);
+    font-weight: 500;
+    font-size: 32px;
+    margin: 0 0 4px;
+  }
+  .subline {
+    color: var(--ink-soft);
+    font-size: 14px;
+    margin: 0 0 32px;
+  }
+  .tabs {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 32px;
+  }
+  .tabs button {
+    padding: 10px 4px;
+    margin-right: 24px;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    font-size: 13px;
+    font-family: var(--font-body);
+    color: var(--ink-soft);
+    border-bottom: 2px solid transparent;
+  }
+  .tabs button.active {
+    color: var(--ink);
+    border-bottom-color: var(--brass);
+    font-weight: 500;
+  }
+  .hero-row {
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    gap: 40px;
+    margin-bottom: 40px;
+  }
+  .wheel-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 28px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .wheel-label {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin: 0 0 4px;
+  }
+  .wheel-score {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--ink-soft);
+    margin-top: 12px;
+  }
+  .wheel-score b {
+    color: var(--ink);
+    font-size: 16px;
+    font-weight: 500;
+  }
+  .side-cards {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    align-content: start;
+  }
+  .card {
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+  .card.full { grid-column: 1 / -1; }
+  .card-label {
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin: 0 0 8px;
+  }
+  .card-value {
+    font-family: var(--font-display);
+    font-size: 18px;
+    margin: 0;
+  }
+  .card-mono {
+    font-family: var(--font-mono);
+    font-size: 22px;
+    margin: 0;
+  }
+  .flag-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 13px;
+  }
+  .flag-row:last-child { border-bottom: none; }
+  .flag-dot {
+    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  }
+  .flag-dot.rust { background: var(--rust); }
+  .flag-dot.sage { background: var(--sage); }
+  .section-title {
+    font-family: var(--font-display);
+    font-size: 18px;
+    margin: 0 0 16px;
+  }
+  .pillar-legend {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px 16px;
+    margin-top: 16px;
+    width: 100%;
+  }
+  .pillar-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+  }
+  .pillar-swatch {
+    width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0;
+  }
+  .pillar-legend-name { color: var(--ink-soft); }
+  .pillar-legend-score {
+    font-family: var(--font-mono);
+    margin-left: auto;
+    color: var(--ink);
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="sidebar">
+    <p class="sidebar-label">Client portfolio</p>
+    <button class="client-item active">Riverside Joinery<span class="sub">Quarterly · 74/100</span></button>
+    <button class="client-item">Halden &amp; Co<span class="sub">Half-yearly · 61/100</span></button>
+    <button class="client-item">Coastal Physio<span class="sub">Quarterly · 88/100</span></button>
+    <button class="client-item">Marlow Digital<span class="sub">Annual · 55/100</span></button>
+  </div>
+
+  <div class="main">
+    <p class="eyebrow">Advisory overview</p>
+    <h1>Riverside Joinery</h1>
+    <p class="subline">Quarterly cadence · Last reviewed 12 May 2026</p>
+
+    <div class="tabs">
+      <button class="active">Overview</button>
+      <button>Data entry</button>
+      <button>Analysis</button>
+      <button>Report</button>
+    </div>
+
+    <div class="hero-row">
+      <div class="wheel-card">
+        <p class="wheel-label">Business health</p>
+        <svg id="wheel" width="240" height="240" viewBox="0 0 240 240"></svg>
+        <div class="wheel-score"><b>74</b> / 100</div>
+        <div class="pillar-legend" id="legend"></div>
+      </div>
+
+      <div class="side-cards">
+        <div class="card">
+          <p class="card-label">Key contact</p>
+          <p class="card-value">Marcus Riverside</p>
+        </div>
+        <div class="card">
+          <p class="card-label">Adviser</p>
+          <p class="card-value">Kaine</p>
+        </div>
+        <div class="card full">
+          <p class="card-label">Owner goals — business</p>
+          <p class="card-value" style="font-size:15px; font-family: var(--font-body); color: var(--ink-soft);">
+            Grow toward $2m revenue by FY27 while holding gross margin above 42%. Considering a second workshop site.
+          </p>
+        </div>
+        <div class="card full">
+          <p class="card-label">Flags this period</p>
+          <div class="flag-row"><span class="flag-dot rust"></span> Debtor days up 9 vs last quarter — 52 → 61 days</div>
+          <div class="flag-row"><span class="flag-dot rust"></span> Gross margin down 3.4 points</div>
+          <div class="flag-row"><span class="flag-dot sage"></span> Cash position improved $18.4k on prior quarter</div>
+        </div>
+      </div>
+    </div>
+
+    <p class="section-title">Pillar scores</p>
+    <div class="card full" style="padding: 20px 24px;">
+      <table style="width:100%; border-collapse: collapse; font-size: 13px;">
+        <tr style="color: var(--ink-soft); text-align: left;">
+          <td style="padding: 6px 0;">Pillar</td>
+          <td style="padding: 6px 0; text-align: right;">Score</td>
+        </tr>
+        <tr id="pillar-table-rows"></tr>
+      </table>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const pillars = [
+  { name: 'Profitability', score: 8.4, color: '#5C7A63' },
+  { name: 'Cash flow', score: 6.1, color: '#8A9A6D' },
+  { name: 'Tax', score: 8.0, color: '#B8A15A' },
+  { name: 'Growth', score: 7.2, color: '#C9AE7B' },
+  { name: 'Risk', score: 6.0, color: '#C08A5E' },
+  { name: 'Systems & team', score: 5.4, color: '#B27358' },
+  { name: 'Owner wealth', score: 7.8, color: '#9C6350' },
+  { name: 'Owner goals', score: 8.6, color: '#9C4B3C' },
+];
+
+const svg = document.getElementById('wheel');
+const cx = 120, cy = 120, rOuter = 100, rInner = 44;
+const n = pillars.length;
+const gap = 0.035;
+const anglePer = (2 * Math.PI) / n;
+
+function polar(cx, cy, r, angle) {
+  return [cx + r * Math.cos(angle - Math.PI / 2), cy + r * Math.sin(angle - Math.PI / 2)];
+}
+
+pillars.forEach((p, i) => {
+  const startAngle = i * anglePer + gap / 2;
+  const endAngle = (i + 1) * anglePer - gap / 2;
+  const scoreFrac = p.score / 10;
+  const rScore = rInner + (rOuter - rInner) * scoreFrac;
+
+  const [x1, y1] = polar(cx, cy, rInner, startAngle);
+  const [x2, y2] = polar(cx, cy, rScore, startAngle);
+  const [x3, y3] = polar(cx, cy, rScore, endAngle);
+  const [x4, y4] = polar(cx, cy, rInner, endAngle);
+  const largeArc = endAngle - startAngle > Math.PI ? 1 : 0;
+
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', `M ${x1} ${y1} L ${x2} ${y2} A ${rScore} ${rScore} 0 ${largeArc} 1 ${x3} ${y3} L ${x4} ${y4} A ${rInner} ${rInner} 0 ${largeArc} 0 ${x1} ${y1} Z`);
+  path.setAttribute('fill', p.color);
+  svg.appendChild(path);
+
+  const [gx1, gy1] = polar(cx, cy, rInner, startAngle);
+  const [gx2, gy2] = polar(cx, cy, rOuter, startAngle);
+  const ghost = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  const [ox2, oy2] = polar(cx, cy, rOuter, startAngle);
+  const [ox3, oy3] = polar(cx, cy, rOuter, endAngle);
+  const [ox4, oy4] = polar(cx, cy, rInner, endAngle);
+  ghost.setAttribute('d', `M ${gx1} ${gy1} L ${ox2} ${oy2} A ${rOuter} ${rOuter} 0 ${largeArc} 1 ${ox3} ${oy3} L ${ox4} ${oy4} A ${rInner} ${rInner} 0 ${largeArc} 0 ${gx1} ${gy1} Z`);
+  ghost.setAttribute('fill', '#DDD8C8');
+  ghost.setAttribute('opacity', '0.35');
+  svg.insertBefore(ghost, path);
+});
+
+const centerText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+centerText.setAttribute('x', cx);
+centerText.setAttribute('y', cy + 6);
+centerText.setAttribute('text-anchor', 'middle');
+centerText.setAttribute('font-family', 'Fraunces, serif');
+centerText.setAttribute('font-size', '26');
+centerText.setAttribute('fill', '#1E2A24');
+centerText.textContent = '74';
+svg.appendChild(centerText);
+
+const legend = document.getElementById('legend');
+pillars.forEach(p => {
+  const item = document.createElement('div');
+  item.className = 'pillar-legend-item';
+  item.innerHTML = `<span class="pillar-swatch" style="background:${p.color}"></span><span class="pillar-legend-name">${p.name}</span><span class="pillar-legend-score">${p.score.toFixed(1)}</span>`;
+  legend.appendChild(item);
+});
+
+const rows = document.getElementById('pillar-table-rows');
+let tableHtml = '';
+pillars.forEach(p => {
+  tableHtml += `<tr><td style="padding:8px 0; border-top:1px solid var(--line);">
+    <span style="display:inline-block; width:8px; height:8px; border-radius:2px; background:${p.color}; margin-right:8px;"></span>${p.name}
+    </td><td style="padding:8px 0; border-top:1px solid var(--line); text-align:right; font-family: var(--font-mono);">${p.score.toFixed(1)}/10</td></tr>`;
+});
+document.getElementById('pillar-table-rows').outerHTML = `<tbody>${tableHtml}</tbody>`;
+</script>
+</body>
+</html>

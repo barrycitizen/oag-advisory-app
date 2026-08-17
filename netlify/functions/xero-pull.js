@@ -77,23 +77,47 @@ function findValue(report, candidates) {
 }
 
 // Field -> ordered list of label variants to try, to cover different charts of accounts.
+// Note: total_debt means interest-bearing borrowings specifically, not all
+// liabilities — this used to incorrectly match the "Total Liabilities" line.
+// It also can't reliably exclude a director/shareholder loan that a client's
+// chart of accounts lumps into the same "Loans"/"Borrowings" line as bank
+// debt — label matching alone can't tell them apart, so total_debt may come
+// through already blended with director_loan_balance in that case (same
+// limitation as PDF extraction and manual entry).
 const FIELD_LABELS = {
   revenue: ['Total Income', 'Total Revenue', 'Revenue', 'Sales'],
   cogs: ['Total Cost of Sales', 'Cost of Sales', 'Cost of Goods Sold'],
   operating_expenses: ['Total Operating Expenses', 'Total Expenses'],
-  net_profit: ['Net Profit', 'Net Profit (Loss)', 'Profit for the year'],
+  other_income: ['Other Income', 'Total Other Income'],
+  other_expenses: ['Other Expenses', 'Total Other Expenses'],
+  interest_expense: ['Interest Expense', 'Interest Paid', 'Finance Costs'],
+  depreciation_amortisation: ['Depreciation', 'Depreciation and Amortisation', 'Depreciation & Amortisation'],
+  // net_profit means PRE-tax profit throughout this app — prioritise labels
+  // that say so explicitly, since a report with both a pre- and post-tax line
+  // would otherwise match "Net Profit" (usually the after-tax one) first.
+  net_profit: ['Profit Before Tax', 'Profit Before Income Tax', 'Net Profit Before Tax', 'Net Profit', 'Net Profit (Loss)', 'Profit for the year'],
   wages: ['Wages and Salaries', 'Wages & Salaries', 'Salaries and Wages', 'Wages'],
+  tax_expense: ['Income Tax Expense', 'Tax Expense', 'Provision for Income Tax'],
   debtors: ['Accounts Receivable', 'Trade Debtors', 'Debtors'],
   creditors: ['Accounts Payable', 'Trade Creditors', 'Creditors'],
   cash: ['Bank', 'Total Bank', 'Cash and Cash Equivalents'],
+  inventory: ['Inventory', 'Stock', 'Inventory on Hand'],
   current_assets: ['Total Current Assets'],
   current_liabilities: ['Total Current Liabilities'],
-  total_debt: ['Total Liabilities'],
+  total_assets: ['Total Assets'],
+  total_liabilities: ['Total Liabilities'],
+  total_debt: ['Total Loans', 'Total Borrowings', 'Interest-bearing Liabilities', 'Bank Loans'],
   equity: ['Total Equity', "Total Equity/(Deficiency)"],
+  fixed_assets: ['Total Fixed Assets', 'Property, Plant and Equipment', 'Fixed Assets'],
+  // Chart-of-accounts naming for this varies a lot more than most fields —
+  // matched on a best-effort basis, left null (and flagged missing) rather
+  // than guessed at if nothing matches.
+  director_loan_balance: ['Loan from Director', "Director's Loan", 'Directors Loan Account', 'Shareholder Loan', 'Loan - Director'],
 };
 
 // Pulls every field for a report, returning both the values and which fields
-// (if any) failed to match anything — instead of silently defaulting to 0.
+// (if any) failed to match anything — null (not 0) so a KPI needing this field
+// can honestly show Unavailable instead of calculating off a fake zero.
 function extractFields(report, fieldNames) {
   const values = {};
   const missing = [];
@@ -102,7 +126,7 @@ function extractFields(report, fieldNames) {
     if (result) {
       values[field] = result.value;
     } else {
-      values[field] = 0;
+      values[field] = null;
       missing.push(field);
     }
   }
@@ -132,29 +156,49 @@ exports.handler = async (event) => {
     const agedReceivables = await fetchXeroReport(token, conn.tenant_id, 'AgedReceivablesByContact', `?date=${period_end}`);
     const agedPayables = await fetchXeroReport(token, conn.tenant_id, 'AgedPayablesByContact', `?date=${period_end}`);
 
-    const pnlFields = extractFields(pnl, ['revenue', 'cogs', 'operating_expenses', 'net_profit', 'wages']);
-    const bsFields = extractFields(bs, ['debtors', 'creditors', 'cash', 'current_assets', 'current_liabilities', 'total_debt', 'equity']);
+    const pnlFields = extractFields(pnl, [
+      'revenue', 'cogs', 'operating_expenses', 'other_income', 'other_expenses',
+      'interest_expense', 'depreciation_amortisation', 'wages', 'tax_expense', 'net_profit',
+    ]);
+    const bsFields = extractFields(bs, [
+      'cash', 'debtors', 'inventory', 'current_assets', 'creditors', 'current_liabilities',
+      'total_assets', 'total_liabilities', 'total_debt', 'equity', 'fixed_assets', 'director_loan_balance',
+    ]);
 
     const revenue = pnlFields.values.revenue;
     const cogs = pnlFields.values.cogs;
-    const gross_profit = revenue - cogs;
+    const gross_profit = (revenue == null || cogs == null) ? null : revenue - cogs;
 
-    const missing = [...pnlFields.missing, ...bsFields.missing];
+    // operating_cash_flow needs Xero's Cash Flow Statement, which isn't pulled
+    // here (P&L + Balance Sheet only) — left null and flagged as missing
+    // honestly, rather than guessing at a report that was never fetched.
+    const missing = [...pnlFields.missing, ...bsFields.missing, 'operating_cash_flow'];
 
     const row = {
       client_id, period_end,
       cadence: (await supabase.from('client_context').select('cadence').eq('client_id', client_id).single()).data?.cadence || 'quarterly',
       revenue, cogs, gross_profit,
       operating_expenses: pnlFields.values.operating_expenses,
-      net_profit: pnlFields.values.net_profit,
+      other_income: pnlFields.values.other_income,
+      other_expenses: pnlFields.values.other_expenses,
+      interest_expense: pnlFields.values.interest_expense,
+      depreciation_amortisation: pnlFields.values.depreciation_amortisation,
       wages: pnlFields.values.wages,
-      debtors: bsFields.values.debtors,
-      creditors: bsFields.values.creditors,
+      tax_expense: pnlFields.values.tax_expense,
+      net_profit: pnlFields.values.net_profit,
       cash: bsFields.values.cash,
+      debtors: bsFields.values.debtors,
+      inventory: bsFields.values.inventory,
       current_assets: bsFields.values.current_assets,
+      creditors: bsFields.values.creditors,
       current_liabilities: bsFields.values.current_liabilities,
+      total_assets: bsFields.values.total_assets,
+      total_liabilities: bsFields.values.total_liabilities,
       total_debt: bsFields.values.total_debt,
       equity: bsFields.values.equity,
+      fixed_assets: bsFields.values.fixed_assets,
+      director_loan_balance: bsFields.values.director_loan_balance,
+      operating_cash_flow: null,
       source: 'xero',
       synced_at: new Date().toISOString(),
       // Surfaces which fields (if any) couldn't be matched in this client's
