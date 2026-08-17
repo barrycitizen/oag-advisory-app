@@ -7,6 +7,7 @@
 
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const { getCategoriesForReview, getFollowUpQuestions } = require('./lib/business-risk-questionnaire');
 
 exports.handler = async (event) => {
   try {
@@ -357,7 +358,26 @@ exports.handler = async (event) => {
         supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'industry').order('created_at'),
         supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'business').order('created_at'),
       ]);
-      return { statusCode: 200, body: JSON.stringify({ financial: financial || [], industry: industry || [], business: business || [] }) };
+
+      // Isolated from the block above on purpose — until migration_risk_items_v3.sql
+      // (risk_questions) is run, this throws, and it must not take down
+      // financial/industry/business (which already work) along with it.
+      let categoriesWithFollowUps = [];
+      try {
+        // Client-level, not period-scoped — resurfacing depends on when a
+        // category was last reviewed at all, not the period being viewed.
+        const categoriesToReview = await getCategoriesForReview(supabase, client_id);
+        // Follow-ups are fetched up front (only ~1-2 per category) so the
+        // frontend can show them the instant a risk-indicating answer is
+        // given, without a round trip per anchor.
+        categoriesWithFollowUps = await Promise.all(
+          categoriesToReview.map(async (anchor) => ({ ...anchor, followUps: await getFollowUpQuestions(supabase, anchor.id) }))
+        );
+      } catch (err) {
+        console.error('getCategoriesForReview failed:', err.message);
+      }
+
+      return { statusCode: 200, body: JSON.stringify({ financial: financial || [], industry: industry || [], business: business || [], categoriesToReview: categoriesWithFollowUps }) };
     }
 
     if (action === 'get_report_data') {

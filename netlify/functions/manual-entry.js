@@ -3,6 +3,7 @@ const { randomUUID } = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const { generateIndustryRiskItems } = require('./lib/industry-risk-checklist');
+const { submitCategoryResponse } = require('./lib/business-risk-questionnaire');
 
 // fy_end is required (not just business_name) because the frontend derives every
 // valid period-end date from cadence + fy_end — without it, Input has no dates to offer.
@@ -136,6 +137,20 @@ async function saveContext(body) {
   const { error } = await supabase.from('client_context').update(update).eq('client_id', client_id);
   if (error) throw error;
   return update;
+}
+
+// Risk Review, Source B — one call per category questionnaire, whether or
+// not follow-ups were shown. See lib/business-risk-questionnaire.js for the
+// anchor/follow-up/resurfacing logic; this just unpacks the request body.
+async function saveBusinessRiskResponse(body) {
+  const { client_id, period_end, anchor, anchor_answer, follow_up_answers } = body;
+  if (!client_id || !period_end || !anchor) throw new Error('client_id, period_end and anchor required');
+  if (typeof anchor_answer !== 'boolean') throw new Error('anchor_answer (boolean) required');
+
+  return submitCategoryResponse(supabase, {
+    clientId: client_id, periodEnd: period_end, anchor,
+    anchorAnswer: anchor_answer, followUpAnswers: follow_up_answers || [],
+  });
 }
 
 // Goals are period-scoped, like financial_snapshots: each period_end gets its own
@@ -306,6 +321,7 @@ exports.handler = async (event) => {
       : body.type === 'add_client' ? await addClient(body)
       : body.type === 'delete_period' ? await deletePeriod(body)
       : body.type === 'context' ? await saveContext(body)
+      : body.type === 'business_risk_response' ? await saveBusinessRiskResponse(body)
       : body.type === 'goal_items' ? await saveGoalItems(body)
       : body.type === 'pulse' ? await savePulse(body)
       : body.type === 'goal_category' ? await addGoalCategory(body)

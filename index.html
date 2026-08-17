@@ -3275,21 +3275,24 @@ async function renderFinancialDiagnose(content) {
 }
 
 // ---- Risk: Analyse ----
-// Rolls up all sources sharing risk_items (financial/industry/business, see
-// lib/financial-risk-sync.js + lib/industry-risk-checklist.js) into one view.
-// Financial is period-scoped, so it reads for currentPeriodEnd like every
-// other Analyse tab; industry doesn't change per period (see read-data.js's
-// get_risk_items), so it always shows the client's full checklist regardless
-// of which period is selected. Business has no source yet — its section
-// stays empty (not hidden) so the domain reads as "these are the three
-// sources", not just two, once it exists.
+// Rolls up all sources sharing risk_items (financial/business/industry, see
+// lib/financial-risk-sync.js, lib/business-risk-questionnaire.js,
+// lib/industry-risk-checklist.js) into one view, in that order — the order
+// the accountant would actually work through them: the numbers first
+// (already computed), then what only a human can answer, then general
+// industry context last. Financial is period-scoped, so it reads for
+// currentPeriodEnd like every other Analyse tab; industry and business
+// don't change per period (see read-data.js's get_risk_items), so both
+// always show the client's full history regardless of which period is
+// selected.
 const RISK_SOURCE_META = {
   financial: { label: 'Financial', hint: 'Detected automatically from this period’s ratios and trends.' },
+  business: { label: 'Business', hint: 'From check-in questions only a human can answer.' },
   industry: { label: 'Industry', hint: 'AI-generated from this client’s industry — general knowledge, not verified. Review each one.' },
-  business: { label: 'Business', hint: 'Not built yet — will come from a client check-in questionnaire.' },
 };
 const RISK_SEVERITY_BADGE = { High: 'red', Medium: 'yellow', Low: 'green' };
 const RISK_STATUS_BADGE = { Detected: 'red', Identified: 'yellow', Watch: 'yellow', Managed: 'green', 'Not applicable': 'green', Unknown: 'yellow' };
+function capitalizeWord(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 
 function riskItemRow(r) {
   return `
@@ -3305,6 +3308,7 @@ function riskItemRow(r) {
             ${r.is_changed ? '<span class="confidence-badge yellow">Changed</span>' : ''}
           </div>
           ${r.detail ? `<p class="muted plain" style="margin:4px 0 0;">${r.detail}</p>` : ''}
+          ${r.notes ? `<p class="muted plain" style="margin:2px 0 0;">${r.notes}</p>` : ''}
           ${r.impact_estimate ? `<p class="muted plain" style="margin:2px 0 0;">${r.impact_estimate}</p>` : ''}
         </div>
       </div>
@@ -3312,13 +3316,41 @@ function riskItemRow(r) {
   `;
 }
 
-function renderRiskSourceGroup(key, rows) {
+function renderRiskSourceGroup(key, rows, extraHtml) {
   const meta = RISK_SOURCE_META[key];
   return `
     <p class="muted">${meta.label}</p>
     <p class="muted plain" style="margin:0 0 8px;">${meta.hint}</p>
+    ${extraHtml || ''}
     <div class="card">
-      ${rows.length ? rows.map(riskItemRow).join('') : `<p class="muted plain" style="margin:0;">${key === 'business' ? 'No source yet.' : 'None for this period.'}</p>`}
+      ${rows.length ? rows.map(riskItemRow).join('') : `<p class="muted plain" style="margin:0;">Nothing on file yet.</p>`}
+    </div>
+  `;
+}
+
+// One category's anchor question + (conditionally) its follow-ups. Kept as
+// its own card per category rather than one big form — each is answered
+// and saved independently, so leaving mid-review doesn't lose progress on
+// categories already done.
+function renderBusinessReviewCategory(c) {
+  return `
+    <div class="card" id="biz-cat-${c.id}" data-category="${escAttr(c.category)}" data-risk-if-yes="${c.risk_if_yes}">
+      <p class="muted">${capitalizeWord(c.category)} — due for review</p>
+      <p class="muted plain" style="margin:0 0 10px;">${c.question_text}</p>
+      <div class="biz-anchor-buttons" style="display:flex; gap:8px;">
+        <button type="button" class="action secondary biz-anchor-btn" data-anchor-id="${c.id}" data-value="true">Yes</button>
+        <button type="button" class="action secondary biz-anchor-btn" data-anchor-id="${c.id}" data-value="false">No</button>
+      </div>
+      <div class="biz-followups" id="biz-followups-${c.id}" style="display:none; margin-top:10px;">
+        ${c.followUps.map((f) => `
+          <div class="form-field" style="margin-bottom:8px;">
+            <label>${f.question_text}</label>
+            <textarea class="biz-followup-input" data-question-id="${f.id}" data-question-text="${escAttr(f.question_text)}" rows="2" placeholder="Notes…"></textarea>
+          </div>
+        `).join('')}
+      </div>
+      <button type="button" class="action" id="biz-save-${c.id}" style="display:none; margin-top:10px;">Save</button>
+      <p class="muted plain" id="biz-saved-${c.id}" style="display:none; margin:8px 0 0; color:var(--sage);">Saved.</p>
     </div>
   `;
 }
@@ -3332,12 +3364,62 @@ async function renderRiskAnalyse(content) {
   const data = await callRead('get_risk_items', currentClientId, currentPeriodEnd);
   if (myToken !== renderToken) return;
 
+  const categoriesToReview = data.categoriesToReview || [];
+  const reviewHtml = categoriesToReview.length
+    ? `<p class="muted plain" style="margin:0 0 8px;">${categoriesToReview.length} categor${categoriesToReview.length === 1 ? 'y' : 'ies'} due for review this cycle:</p>${categoriesToReview.map(renderBusinessReviewCategory).join('')}`
+    : '';
+
   content.innerHTML = `
     <p class="section-title">Risk Review</p>
     ${renderRiskSourceGroup('financial', data.financial || [])}
+    ${renderRiskSourceGroup('business', data.business || [], reviewHtml)}
     ${renderRiskSourceGroup('industry', data.industry || [])}
-    ${renderRiskSourceGroup('business', data.business || [])}
   `;
+
+  categoriesToReview.forEach((c) => {
+    const catCard = document.getElementById(`biz-cat-${c.id}`);
+    const followUpsBlock = document.getElementById(`biz-followups-${c.id}`);
+    const saveBtn = document.getElementById(`biz-save-${c.id}`);
+    const savedMsg = document.getElementById(`biz-saved-${c.id}`);
+    let anchorAnswer = null;
+
+    catCard.querySelectorAll('.biz-anchor-btn').forEach((btn) => {
+      btn.onclick = () => {
+        anchorAnswer = btn.dataset.value === 'true';
+        catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => b.classList.toggle('secondary', b !== btn));
+        const riskPresent = anchorAnswer === c.risk_if_yes;
+        followUpsBlock.style.display = riskPresent && c.followUps.length ? 'block' : 'none';
+        saveBtn.style.display = 'block';
+      };
+    });
+
+    saveBtn.onclick = async () => {
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Saving…';
+      const followUpAnswers = [...followUpsBlock.querySelectorAll('.biz-followup-input')]
+        .map((el) => ({ questionText: el.dataset.questionText, answerText: el.value.trim() }))
+        .filter((f) => f.answerText);
+      try {
+        const res = await fetch('/.netlify/functions/manual-entry', {
+          method: 'POST',
+          body: JSON.stringify({
+            type: 'business_risk_response', client_id: currentClientId, period_end: currentPeriodEnd,
+            anchor: { category: c.category, question_text: c.question_text, risk_if_yes: c.risk_if_yes },
+            anchor_answer: anchorAnswer, follow_up_answers: followUpAnswers,
+          }),
+        });
+        const result = await res.json();
+        if (result.error) throw new Error(result.error);
+        saveBtn.style.display = 'none';
+        savedMsg.style.display = 'block';
+        renderMain(); // refresh so this category's new risk_items row shows in the list above and it drops off "due for review"
+      } catch (err) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save';
+        alert('Error: ' + err.message);
+      }
+    };
+  });
 }
 
 // ---- Goals: Profile ----
