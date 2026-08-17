@@ -7,6 +7,7 @@
 
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const { syncFinancialRiskItems } = require('./lib/financial-risk-sync');
 
 // Which pillars are active at each cadence — mirrors the framework's cadence map.
 const CADENCE_PILLARS = {
@@ -398,6 +399,20 @@ KPIs available this period: ${JSON.stringify(availableKpis.map((k) => ({
         ...(parsed.tax_planning || []).map((o) => ({ client_id, period_end, type: 'tax_planning', title: o.title, impact: o.impact, difficulty: o.difficulty, timeframe: o.timeframe })),
       ]),
     ]);
+
+    // Risk Review, Source A — mirrors flags/pillar_scores/etc. into risk_items
+    // so financial risk lives in the same table as business/industry risk,
+    // with new/changed/resolved tracking (see lib/financial-risk-sync.js).
+    // Non-fatal: an issue here must never take down analysis itself.
+    try {
+      await syncFinancialRiskItems(supabase, {
+        clientId: client_id, periodEnd: period_end,
+        previousPeriodEnd: priorFs?.period_end || null,
+        flags,
+      });
+    } catch (err) {
+      console.error('Financial risk sync failed:', err.message);
+    }
 
     const kpisWithInterpretation = kpis.map((k) => ({ ...k, interpretation: kpiInterpretations[k.key] || null, benchmark: kpiBenchmarks[k.key] || null }));
 
