@@ -352,12 +352,21 @@ exports.handler = async (event) => {
     // so both are fetched for the client regardless of which period is
     // selected.
     if (action === 'get_risk_items') {
+      // .order('id') as a tiebreaker on every query here: industry's rows
+      // are all written in one bulk insert (see generateIndustryRiskItems),
+      // so they share the exact same created_at down to the microsecond —
+      // Postgres has no defined order for ties on created_at alone, and an
+      // UPDATE (e.g. a review action changing status) can shuffle which
+      // row comes back first for those ties. id is random but permanent,
+      // so adding it as a secondary sort makes the order deterministic and
+      // stable across reads regardless of what's been updated. Same risk
+      // exists for financial's severity ties, so it gets the tiebreaker too.
       const [{ data: financial }, { data: industry }, { data: business }] = await Promise.all([
         period_end
-          ? supabase.from('risk_items').select('*').eq('client_id', client_id).eq('period_end', period_end).eq('source', 'financial').order('severity', { ascending: false })
+          ? supabase.from('risk_items').select('*').eq('client_id', client_id).eq('period_end', period_end).eq('source', 'financial').order('severity', { ascending: false }).order('id')
           : Promise.resolve({ data: [] }),
-        supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'industry').order('created_at'),
-        supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'business').order('created_at'),
+        supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'industry').order('created_at').order('id'),
+        supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'business').order('created_at').order('id'),
       ]);
 
       // Isolated from the block above on purpose — until migration_risk_items_v3.sql

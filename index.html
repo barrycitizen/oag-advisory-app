@@ -812,6 +812,41 @@ function onWorkflowClick(e) {
 document.getElementById('workflow-tabs').addEventListener('click', onWorkflowClick);
 document.getElementById('global-tabs').addEventListener('click', onWorkflowClick);
 
+// Risk review actions (Confirm/Investigate/Not applicable/No longer a risk)
+// — wired ONCE here rather than inside renderRiskAnalyse. #tab-content is a
+// single persistent element that only ever gets its innerHTML replaced, not
+// recreated, so an addEventListener call inside a function that reruns
+// every time the Risk tab is opened (renderRiskAnalyse does, via renderMain)
+// would stack up one extra listener per visit — every click on a status
+// button would then fire the save, and the refresh, once per stacked
+// listener, racing several overlapping refreshRiskLists() calls against
+// each other. That's what was making the industry list's order look like it
+// was shuffling itself and the whole section flicker/reset on a click: it
+// wasn't one click, it was N of them landing at once. Delegation still
+// catches buttons injected later (e.g. a business questionnaire's inline
+// synthesis result), same as before — this only changes WHERE it's wired.
+document.getElementById('tab-content').addEventListener('click', async (e) => {
+  const btn = e.target.closest('.risk-action-btn');
+  if (!btn) return;
+  const buttonsInRow = btn.parentElement.querySelectorAll('.risk-action-btn');
+  buttonsInRow.forEach((b) => { b.disabled = true; });
+  const original = btn.textContent;
+  btn.textContent = '…';
+  try {
+    const res = await fetch('/.netlify/functions/manual-entry', {
+      method: 'POST',
+      body: JSON.stringify({ type: 'risk_review_action', risk_item_id: btn.dataset.riskId, action: btn.dataset.riskAction }),
+    });
+    const result = await res.json();
+    if (result.error) throw new Error(result.error);
+    await refreshRiskLists();
+  } catch (err) {
+    buttonsInRow.forEach((b) => { b.disabled = false; });
+    btn.textContent = original;
+    alert('Error: ' + err.message);
+  }
+});
+
 document.getElementById('period-select').addEventListener('change', (e) => {
   currentPeriodEnd = e.target.value || null;
   goalSuggestionsCache = {};
@@ -3442,6 +3477,7 @@ function computeRiskRollup(financial, business, industry) {
   // any managed business item entirely (resolved doesn't mean sourceless).
   const allShown = [...allActive, ...managed];
   const countBySource = (src) => allShown.filter((r) => r.source === src).length;
+  const countByStatus = (status) => allShown.filter((r) => r.status === status).length;
 
   // is_new/is_changed only means something for sources that get re-synced
   // over time (financial every analysis run, business every review cycle)
@@ -3458,6 +3494,10 @@ function computeRiskRollup(financial, business, industry) {
   return {
     buckets, managed,
     counts: { financial: countBySource('financial'), business: countBySource('business'), industry: countBySource('industry') },
+    statusCounts: {
+      Detected: countByStatus('Detected'), Identified: countByStatus('Identified'), Watch: countByStatus('Watch'),
+      Managed: countByStatus('Managed'), 'Not applicable': countByStatus('Not applicable'), Unknown: countByStatus('Unknown'),
+    },
     allActiveCount: allActive.length, newCount, changedCount, industryNeedsReview,
     level, isQuiet,
   };
@@ -3467,6 +3507,20 @@ const RISK_SOURCE_PILL = {
   financial: { icon: '📊', label: 'Financial' },
   business: { icon: '🧑', label: 'Business' },
   industry: { icon: '🏭', label: 'Industry' },
+};
+
+// Deliberately distinct from Priority's red/orange/green dots (High/Medium/
+// Managed) even though some of these overlap in meaning — using the same
+// colored-dot icons on two different axes would read as duplicate
+// information instead of two different questions ("how urgent" vs "what
+// stage of review is it at").
+const RISK_STATUS_PILL = {
+  Detected: { icon: '🆕', label: 'Detected' },
+  Identified: { icon: '⚠️', label: 'Identified' },
+  Watch: { icon: '👀', label: 'Watch' },
+  Managed: { icon: '✅', label: 'Managed' },
+  'Not applicable': { icon: '🚫', label: 'Not applicable' },
+  Unknown: { icon: '❓', label: 'Unknown' },
 };
 
 // One clickable line per risk in the summary — name, then three pills in
@@ -3492,7 +3546,7 @@ function riskSummaryRow(r, level) {
   const preview = detail.length > 90 ? detail.slice(0, 90) + '…' : detail;
   const sourceMeta = RISK_SOURCE_PILL[r.source] || { icon: '', label: r.source };
   return `
-    <div class="risk-summary-row" data-source="${r.source}" data-level="${level}" style="padding:8px 0; border-bottom:1px solid var(--line); cursor:pointer;">
+    <div class="risk-summary-row" data-source="${r.source}" data-level="${level}" data-status="${r.status}" style="padding:8px 0; border-bottom:1px solid var(--line); cursor:pointer;">
       <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
         <b style="font-size:13px;">${r.risk_name}</b>
         <span class="risk-pill risk-pill-severity ${(r.severity || 'Medium').toLowerCase()}">${r.severity || 'Medium'}</span>
@@ -3572,6 +3626,8 @@ function renderRiskRollupContent(rollup) {
         { value: 'business', icon: '🧑', label: 'Business', count: rollup.counts.business },
         { value: 'industry', icon: '🏭', label: 'Industry', count: rollup.counts.industry },
       ])}
+      ${riskFilterAxis('Status', 'status', Object.entries(RISK_STATUS_PILL)
+        .map(([status, meta]) => ({ value: status, icon: meta.icon, label: meta.label, count: rollup.statusCounts[status] })))}
       <div id="risk-summary-sections" style="margin-top:10px;">
         ${riskSummarySection('🔴', 'High priority', 'High', rollup.buckets.High)}
         ${riskSummarySection('🟠', 'Medium priority', 'Medium', rollup.buckets.Medium)}
@@ -3680,36 +3736,36 @@ function wireRiskSummaryRegion(rollup) {
   //
   // Each pill's own count is FACETED, not fixed at render time — it always
   // reflects how many rows would match if you picked it TOGETHER with
-  // whatever's currently active on the other axis, recomputed after every
+  // whatever's currently active on the OTHER axes, recomputed after every
   // filter change. "Industry" under Type of Risk showing (4) when Priority
   // = Medium means 4 industry risks are Medium, not "4 industry risks
   // total" — the two numbers are different questions, and this always
   // answers the one that matches what's actually about to happen if you
-  // click it.
-  let activeLevel = 'all';
-  let activeSource = 'all';
+  // click it. Three axes now (level/source/status) driven off one config
+  // object rather than one pair of hardcoded variables/branches per axis —
+  // axis names match their .risk-summary-row data-* attribute 1:1
+  // (data-level/data-source/data-status), so row.dataset[axis] reads
+  // straight through with no per-axis special-casing.
+  const AXES = ['level', 'source', 'status'];
+  const activeFilters = { level: 'all', source: 'all', status: 'all' };
   const rows = () => [...summaryEl.querySelectorAll('.risk-summary-row')];
+  const rowMatchesOtherAxes = (row, exceptAxis) =>
+    AXES.every((axis) => axis === exceptAxis || activeFilters[axis] === 'all' || row.dataset[axis] === activeFilters[axis]);
   const updateRiskFilterCounts = () => {
-    summaryEl.querySelectorAll('.risk-filter-pill[data-filter-axis="level"]').forEach((pill) => {
-      const value = pill.dataset.filterValue;
-      const count = rows().filter((row) =>
-        (value === 'all' || row.dataset.level === value) && (activeSource === 'all' || row.dataset.source === activeSource)
-      ).length;
-      pill.querySelector('.risk-filter-count').textContent = `(${count})`;
-    });
-    summaryEl.querySelectorAll('.risk-filter-pill[data-filter-axis="source"]').forEach((pill) => {
-      const value = pill.dataset.filterValue;
-      const count = rows().filter((row) =>
-        (value === 'all' || row.dataset.source === value) && (activeLevel === 'all' || row.dataset.level === activeLevel)
-      ).length;
-      pill.querySelector('.risk-filter-count').textContent = `(${count})`;
+    AXES.forEach((axis) => {
+      summaryEl.querySelectorAll(`.risk-filter-pill[data-filter-axis="${axis}"]`).forEach((pill) => {
+        const value = pill.dataset.filterValue;
+        const count = rows().filter((row) =>
+          (value === 'all' || row.dataset[axis] === value) && rowMatchesOtherAxes(row, axis)
+        ).length;
+        pill.querySelector('.risk-filter-count').textContent = `(${count})`;
+      });
     });
   };
   const applyRiskFilters = () => {
     rows().forEach((row) => {
-      const matchesLevel = activeLevel === 'all' || row.dataset.level === activeLevel;
-      const matchesSource = activeSource === 'all' || row.dataset.source === activeSource;
-      row.style.display = (matchesLevel && matchesSource) ? '' : 'none';
+      const matches = AXES.every((axis) => activeFilters[axis] === 'all' || row.dataset[axis] === activeFilters[axis]);
+      row.style.display = matches ? '' : 'none';
     });
     summaryEl.querySelectorAll('.risk-section-header').forEach((header) => {
       let sib = header.nextElementSibling;
@@ -3727,7 +3783,7 @@ function wireRiskSummaryRegion(rollup) {
       const axis = pill.dataset.filterAxis;
       const value = pill.dataset.filterValue;
       summaryEl.querySelectorAll(`.risk-filter-pill[data-filter-axis="${axis}"]`).forEach((p) => p.classList.toggle('active', p === pill));
-      if (axis === 'level') activeLevel = value; else activeSource = value;
+      activeFilters[axis] = value;
       applyRiskFilters();
     };
   });
@@ -4188,35 +4244,6 @@ async function renderRiskAnalyse(content) {
   categoriesToReview.forEach((c) => {
     c.questions.forEach((q) => wireBusinessQuestion(q, c.category));
     wireAddQuestionForm(c.category);
-  });
-
-  // Review actions (Confirm/Investigate/Not applicable/No longer a risk) —
-  // one listener on `content` itself (true event delegation via bubbling,
-  // not a forEach over buttons present at render time) so it also catches
-  // clicks on action buttons injected later — e.g. the inline synthesis
-  // preview a business questionnaire Save renders directly into its own
-  // category card, well after this initial wiring pass has already run.
-  // Works on any row regardless of source, see lib/risk-review-actions.js.
-  content.addEventListener('click', async (e) => {
-    const btn = e.target.closest('.risk-action-btn');
-    if (!btn) return;
-    const buttonsInRow = btn.parentElement.querySelectorAll('.risk-action-btn');
-    buttonsInRow.forEach((b) => { b.disabled = true; });
-    const original = btn.textContent;
-    btn.textContent = '…';
-    try {
-      const res = await fetch('/.netlify/functions/manual-entry', {
-        method: 'POST',
-        body: JSON.stringify({ type: 'risk_review_action', risk_item_id: btn.dataset.riskId, action: btn.dataset.riskAction }),
-      });
-      const result = await res.json();
-      if (result.error) throw new Error(result.error);
-      await refreshRiskLists();
-    } catch (err) {
-      buttonsInRow.forEach((b) => { b.disabled = false; });
-      btn.textContent = original;
-      alert('Error: ' + err.message);
-    }
   });
 }
 
