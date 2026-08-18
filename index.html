@@ -3386,6 +3386,7 @@ function riskItemRow(r, opts = {}) {
           ${r.last_reviewed_date ? `<p class="muted plain" style="margin:2px 0 0; font-size:11px;">Reviewed ${formatShortDate(r.last_reviewed_date)}</p>` : ''}
           <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:6px;">
             ${RISK_REVIEW_ACTIONS.map(([action, label]) => `<button type="button" class="mini-link risk-action-btn" style="margin-left:0;" data-risk-id="${r.id}" data-risk-action="${action}">${label}</button>`).join('')}
+            ${editable && r.question_id ? `<button type="button" class="mini-link" style="margin-left:0;" data-unanswer-risk-row-id="${r.id}">Unanswer</button>` : ''}
           </div>
         </div>
       </div>
@@ -3756,6 +3757,7 @@ function renderBusinessHistoryGrouped(rows) {
   rows.forEach((r) => { (byCategory[r.category] = byCategory[r.category] || []).push(r); });
   const categories = Object.keys(byCategory).sort((a, b) => businessCategoryLabel(a).localeCompare(businessCategoryLabel(b)));
   return `
+    <p class="muted" style="margin:14px 0 6px;">Past answers, by category — click to view, edit, or unanswer</p>
     <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;">
       ${categories.map((cat) => `<button type="button" class="risk-filter-pill" data-biz-history-pill="${escAttr(cat)}">${businessCategoryLabel(cat)} <span class="risk-filter-count">(${byCategory[cat].length})</span></button>`).join('')}
     </div>
