@@ -3630,15 +3630,19 @@ function renderRiskRollupContent(rollup) {
         <button type="button" class="mini-link" style="margin-left:0;" id="risk-ai-summary-btn">✨ Generate AI summary</button>
         <div id="risk-ai-summary-content" style="display:none; margin-top:6px;"></div>
       </div>
-      <!-- Priority is High/Medium only — it used to also offer a "Managed"
-           option as a catch-all third bucket, but that's exactly what the
-           Status axis's Managed + Not applicable pills already cover, only
-           more precisely (Status keeps them separate). Having "Managed" as
-           an option under two different axis labels was confusing, not
-           useful — picking either used to filter to the exact same rows. -->
+      <!-- Third pill's value is still "Managed" (same rollup.managed rows,
+           same data-level token as the Resolved section below) but the
+           LABEL says "No priority" — resolved items don't have an urgency
+           tier, and Status already has its own "Managed" pill with a
+           different, more precise count (Managed only, not Not applicable
+           too). Reusing the word "Managed" here would put the same label
+           on two different numbers again. This way Priority's own options
+           still add up to All, like Type of Risk and Status do, without
+           the naming collision. -->
       ${riskFilterAxis('Priority', 'level', [
         { value: 'High', icon: '🔴', label: 'High', count: rollup.buckets.High.length },
         { value: 'Medium', icon: '🟠', label: 'Medium', count: rollup.buckets.Medium.length },
+        { value: 'Managed', icon: '⚪', label: 'No priority', count: rollup.managed.length },
       ], totalCount)}
       ${riskFilterAxis('Type of Risk', 'source', [
         { value: 'financial', icon: '📊', label: 'Financial', count: rollup.counts.financial },
@@ -3650,7 +3654,15 @@ function renderRiskRollupContent(rollup) {
       <div id="risk-summary-sections" style="margin-top:10px;">
         ${riskSummarySection('🔴', 'High priority', 'High', rollup.buckets.High)}
         ${riskSummarySection('🟠', 'Medium priority', 'Medium', rollup.buckets.Medium)}
-        ${riskSummarySection('🟢', 'Managed', 'Managed', rollup.managed)}
+        <!-- Label says "Resolved", not "Managed" — this bucket is Managed
+             AND Not applicable combined (see computeRiskRollup), and the
+             Status axis right above it has its own separate "Managed"
+             pill with a DIFFERENT, smaller count (Managed only, no Not
+             applicable). Same word, two different numbers side by side
+             was the actual bug being reported — the section itself
+             (rollup.managed / the 'Managed' internal level/CSS token)
+             is unchanged, only this user-facing label. -->
+        ${riskSummarySection('🟢', 'Resolved', 'Managed', rollup.managed)}
       </div>
       <button type="button" class="action" id="risk-review-btn" style="margin-top:14px;">Review risks</button>
     </div>
