@@ -3564,7 +3564,7 @@ function riskSummaryRow(r, level) {
 
 function riskSummarySection(icon, label, level, rows) {
   if (!rows.length) return '';
-  return `<div class="risk-section-header ${level}">${icon} ${label} (${rows.length})</div>${rows.map((r) => riskSummaryRow(r, level)).join('')}`;
+  return `<div class="risk-section-header ${level}">${icon} ${label} <span class="risk-section-count">(${rows.length})</span></div>${rows.map((r) => riskSummaryRow(r, level)).join('')}`;
 }
 
 // One row of pills for one filter axis. The count in each pill is faceted
@@ -3574,8 +3574,18 @@ function riskSummarySection(icon, label, level, rows) {
 // is currently selected, not a fixed number frozen at render time. The
 // count sits in its own span so it can be updated in place without
 // touching the icon/label text. "All" always sits first and starts active.
-function riskFilterAxis(axisLabel, axis, options) {
-  const allCount = options.reduce((sum, o) => sum + o.count, 0);
+//
+// totalCount is the true total row count, passed in explicitly rather than
+// summed from options — Priority only lists High/Medium as pills (Managed
+// isn't a priority), so summing its options undercounts "All" against what
+// clicking it actually shows (everything, Managed included: "All" means no
+// restriction from this axis, not "sum of this axis's own listed values").
+// Without this, the initial render showed "All (2)" but any click at all
+// triggered a live recompute in updateRiskFilterCounts that correctly used
+// the true total and showed "All (10)" — same data, two different numbers
+// for the same label depending on interaction history.
+function riskFilterAxis(axisLabel, axis, options, totalCount) {
+  const allCount = totalCount !== undefined ? totalCount : options.reduce((sum, o) => sum + o.count, 0);
   return `
     <p class="muted" style="margin:14px 0 4px;">${axisLabel}</p>
     <div style="display:flex; gap:6px; flex-wrap:wrap;">
@@ -3607,6 +3617,10 @@ function renderRiskRollupContent(rollup) {
   const bits = [];
   if (rollup.newCount) bits.push(`${rollup.newCount} new`);
   if (rollup.changedCount) bits.push(`${rollup.changedCount} changed`);
+  // Same denominator for every axis's "All" pill — the true count of every
+  // risk item on file, since selecting "All" on any one axis means "don't
+  // restrict by this axis," not "sum of whatever this axis happens to list."
+  const totalCount = rollup.buckets.High.length + rollup.buckets.Medium.length + rollup.managed.length;
   return `
     <div class="card">
       <p class="muted" style="margin:0 0 6px;">Overall Risk</p>
@@ -3625,14 +3639,14 @@ function renderRiskRollupContent(rollup) {
       ${riskFilterAxis('Priority', 'level', [
         { value: 'High', icon: '🔴', label: 'High', count: rollup.buckets.High.length },
         { value: 'Medium', icon: '🟠', label: 'Medium', count: rollup.buckets.Medium.length },
-      ])}
+      ], totalCount)}
       ${riskFilterAxis('Type of Risk', 'source', [
         { value: 'financial', icon: '📊', label: 'Financial', count: rollup.counts.financial },
         { value: 'business', icon: '🧑', label: 'Business', count: rollup.counts.business },
         { value: 'industry', icon: '🏭', label: 'Industry', count: rollup.counts.industry },
-      ])}
+      ], totalCount)}
       ${riskFilterAxis('Status', 'status', Object.entries(RISK_STATUS_PILL)
-        .map(([status, meta]) => ({ value: status, icon: meta.icon, label: meta.label, count: rollup.statusCounts[status] })))}
+        .map(([status, meta]) => ({ value: status, icon: meta.icon, label: meta.label, count: rollup.statusCounts[status] })), totalCount)}
       <div id="risk-summary-sections" style="margin-top:10px;">
         ${riskSummarySection('🔴', 'High priority', 'High', rollup.buckets.High)}
         ${riskSummarySection('🟠', 'Medium priority', 'Medium', rollup.buckets.Medium)}
@@ -3783,12 +3797,20 @@ function wireRiskSummaryRegion(rollup) {
     });
     summaryEl.querySelectorAll('.risk-section-header').forEach((header) => {
       let sib = header.nextElementSibling;
-      let anyVisible = false;
+      let visibleCount = 0;
       while (sib && sib.classList.contains('risk-summary-row')) {
-        if (sib.style.display !== 'none') anyVisible = true;
+        if (sib.style.display !== 'none') visibleCount += 1;
         sib = sib.nextElementSibling;
       }
-      header.style.display = anyVisible ? '' : 'none';
+      // The header's own count used to be static text baked in at initial
+      // render — filtering down to Watch would hide all but one row under
+      // "Medium priority" but the heading still said "(2)" from before any
+      // filter was applied, since nothing ever rewrote it. Now it tracks
+      // however many of its rows are actually showing, same as the filter
+      // pills' own counts do.
+      const countEl = header.querySelector('.risk-section-count');
+      if (countEl) countEl.textContent = `(${visibleCount})`;
+      header.style.display = visibleCount > 0 ? '' : 'none';
     });
     updateRiskFilterCounts();
   };
