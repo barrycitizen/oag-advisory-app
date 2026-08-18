@@ -22,9 +22,15 @@
 // Netlify function itself, required from manual-entry.js and
 // read-data.js. Uses this app's Supabase client, client_id (uuid) +
 // period_end (date) — not a raw pg pool with integer client/period ids.
-// Run migration_risk_items_v3.sql (risk_questions + risk_items.notes) and
-// migration_risk_items_v4.sql (risk_items.recommendation) before wiring
+// Run migration_risk_items_v3.sql (risk_questions + risk_items.notes),
+// migration_risk_items_v4.sql (risk_items.recommendation), and
+// migration_risk_items_v5.sql (risk_items.question_id) before wiring
 // this in.
+//
+// Each question in a category (anchor + its follow-ups) is answered and
+// synthesized ONE AT A TIME, not bundled into a single category-wide
+// submit — see submitAnchorNoRisk / submitFollowUpAnswer below, and
+// index.html's sequential follow-up rendering in the Risk -> Analyse tab.
 
 const { synthesizeRiskItem } = require('./risk-item-synthesis');
 
@@ -174,56 +180,38 @@ function capitalize(s) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-// Submit a full category response in one call — anchor answer plus any
-// follow-up answers (only present if the anchor indicated a risk).
-//
-// anchorAnswer: boolean (the literal yes/no answer given)
-// followUpAnswers: [{ questionText, answerText }]
-//
-// If the anchor indicates no risk: writes ONE quiet risk_items row,
-// status='Managed', no recommendation — the frontend renders this as a
-// plain "reviewed, no risk" line rather than a full risk card (see
-// index.html's riskItemRow), and skips follow-ups entirely (even if some
-// were answered client-side by mistake — the anchor governs).
-//
-// If the anchor indicates a risk: each follow-up answer gets its own
-// synthesizeRiskItem call (risk-item-synthesis.js) and its own risk_items
-// row — a category with 2 follow-ups answered writes 2 separate risks, not
-// one merged write-up, since "key employee we couldn't replace" and
-// "recruitment/retention issues" are genuinely different risks that happen
-// to live under the same category, not two facets of one thing. Each row
-// keeps its own raw Q&A in `notes`, so nothing the accountant actually
-// typed is lost even though detail/recommendation are the synthesized
-// version. If the anchor indicates risk but no follow-up was answered,
-// falls back to one anchor-level row so the risk isn't lost entirely.
-//
-// Deletes this category's existing risk_items for THIS exact period
-// before inserting — re-submitting a category (accountant corrects an
-// answer) must not pile up duplicates, same idempotency guard
-// financial-risk-sync.js uses. Scoped to period_end + category so other
-// periods' history (what getCategoriesForReview's staleness check
-// reads) stays intact.
-async function submitCategoryResponse(supabase, { clientId, periodEnd, anchor, anchorAnswer, followUpAnswers = [] }) {
-  const riskPresent = anchorAnswer === anchor.risk_if_yes;
-
-  // is_new/is_changed vs the most recent PRIOR review of this category
-  // (excluding this exact period, so re-submitting the same period to fix
-  // a mistake doesn't compare against the row it's about to replace) — same
-  // idea as financial-risk-sync.js's previousByName, just keyed by category
-  // since business reviews don't happen every period the way financial
-  // does. Without this, every inserted row would default to is_new=true
-  // forever (the column default), making a dashboard's "new this cycle"
-  // count meaningless.
-  const newStatus = riskPresent ? 'Identified' : 'Managed';
+// is_new/is_changed vs the most recent PRIOR review of this EXACT question
+// (anchor or a specific follow-up, identified by question_id — excluding
+// this exact period, so re-submitting the same period to fix a mistake
+// doesn't compare against the row it's about to replace). Keyed per-
+// question rather than per-category now that each question is its own
+// row: "the key-employee answer changed" and "the recruitment answer
+// changed" are different facts, not one shared category-level flag.
+async function computeNewChanged(supabase, { clientId, periodEnd, category, questionId, newStatus }) {
   const { data: priorRows } = await supabase
     .from('risk_items')
     .select('status, last_reviewed_date')
-    .eq('client_id', clientId).eq('source', 'business').eq('category', anchor.category)
+    .eq('client_id', clientId).eq('source', 'business').eq('category', category).eq('question_id', questionId)
     .neq('period_end', periodEnd)
     .order('last_reviewed_date', { ascending: false }).limit(1);
   const priorRow = priorRows?.[0] || null;
-  const isNew = !priorRow;
-  const isChanged = !!priorRow && priorRow.status !== newStatus;
+  return { isNew: !priorRow, isChanged: !!priorRow && priorRow.status !== newStatus };
+}
+
+// Anchor answered "no risk" — writes one quiet row (status='Managed', no
+// recommendation; index.html's riskItemRow renders this as a plain
+// "reviewed, no risk" line, not a full risk card), tied to the anchor's
+// own question_id.
+//
+// Deletes ALL of this category's existing rows for this period first, not
+// just the anchor's own — if the accountant had previously answered "yes"
+// and saved one or more follow-ups before changing their mind back to
+// "no," those follow-up rows are now stale/contradictory and shouldn't
+// survive alongside a fresh "no risk" verdict.
+async function submitAnchorNoRisk(supabase, { clientId, periodEnd, anchor }) {
+  const { isNew, isChanged } = await computeNewChanged(supabase, {
+    clientId, periodEnd, category: anchor.category, questionId: anchor.id, newStatus: 'Managed',
+  });
 
   const { error: delError } = await supabase
     .from('risk_items').delete()
@@ -231,60 +219,63 @@ async function submitCategoryResponse(supabase, { clientId, periodEnd, anchor, a
     .eq('source', 'business').eq('category', anchor.category);
   if (delError) throw delError;
 
-  const today = new Date().toISOString().slice(0, 10);
+  const row = {
+    client_id: clientId, period_end: periodEnd, source: 'business', question_id: anchor.id,
+    category: anchor.category, risk_name: `${capitalize(anchor.category)} — no risk identified`,
+    detail: anchor.question_text, status: 'Managed', severity: 'Low', last_reviewed_date: new Date().toISOString().slice(0, 10),
+    is_new: isNew, is_changed: isChanged,
+  };
+  const { data: inserted, error } = await supabase.from('risk_items').insert(row).select().single();
+  if (error) throw error;
+  return { riskPresent: false, item: inserted };
+}
 
-  if (!riskPresent) {
-    const row = {
-      client_id: clientId, period_end: periodEnd, source: 'business',
-      category: anchor.category, risk_name: `${capitalize(anchor.category)} — no risk identified`,
-      detail: anchor.question_text, status: 'Managed', severity: 'Low', last_reviewed_date: today,
-      is_new: isNew, is_changed: isChanged,
-    };
-    const { data: inserted, error } = await supabase.from('risk_items').insert(row).select();
-    if (error) throw error;
-    // Returns the written row(s) (with real ids, via select()) — the
-    // caller (manual-entry.js's saveBusinessRiskResponse) hands this
-    // straight back to the frontend so it can show what was actually
-    // recorded immediately, in the same card the accountant just answered
-    // in, instead of just a bare "Saved." with the result sitting unseen
-    // further down the page. Always `items` (array), even here where
-    // there's only ever one, so the frontend doesn't need two code paths.
-    return { riskPresent: false, itemsWritten: 1, items: inserted };
-  }
-
-  // One follow-up = one risk = one AI call, run in parallel since they're
-  // independent. Falls back to a single anchor-level synthesis (no
-  // follow-up-specific Q&A to draw on) if the accountant answered "yes"
-  // but left every follow-up blank.
-  const qaList = followUpAnswers.length ? followUpAnswers : [null];
-  const synthesizedList = await Promise.all(
-    qaList.map((f) => synthesizeRiskItem({
-      category: anchor.category,
-      anchorQuestion: anchor.question_text,
-      followUpQA: f ? [{ questionText: f.questionText, answerText: f.answerText }] : [],
-    }))
-  );
-
-  const rows = synthesizedList.map((synthesized, i) => {
-    const f = qaList[i];
-    return {
-      client_id: clientId, period_end: periodEnd, source: 'business', category: anchor.category,
-      risk_name: synthesized.risk_name, detail: synthesized.detail, recommendation: synthesized.recommendation,
-      notes: f ? `Q: ${f.questionText}\nA: ${f.answerText || '(no detail given)'}` : null,
-      status: 'Identified', severity: synthesized.severity || 'Medium', last_reviewed_date: today,
-      is_new: isNew, is_changed: isChanged,
-    };
+// One follow-up question, answered and synthesized on its own — the
+// sequential flow (anchor -> follow-up 1 -> its own AI write-up ->
+// follow-up 2 -> its own AI write-up, not all bundled into one form) means
+// each question is submitted, and can be edited, independently of its
+// siblings.
+//
+// Deletes rows matching THIS question_id (so re-saving/editing replaces
+// rather than duplicates) OR the anchor's own question_id (clears a stale
+// "no risk identified" row left over if the accountant had previously
+// answered the anchor "no" and is now switching to "yes") — but leaves any
+// OTHER follow-up's row in this category untouched, since those are
+// answered independently and shouldn't be wiped out by this one saving.
+async function submitFollowUpAnswer(supabase, { clientId, periodEnd, anchor, questionId, questionText, answerText }) {
+  const { isNew, isChanged } = await computeNewChanged(supabase, {
+    clientId, periodEnd, category: anchor.category, questionId, newStatus: 'Identified',
   });
 
-  const { data: inserted, error } = await supabase.from('risk_items').insert(rows).select();
+  const { error: delError } = await supabase
+    .from('risk_items').delete()
+    .eq('client_id', clientId).eq('period_end', periodEnd)
+    .eq('source', 'business').eq('category', anchor.category)
+    .in('question_id', [questionId, anchor.id]);
+  if (delError) throw delError;
+
+  const synthesized = await synthesizeRiskItem({
+    category: anchor.category, anchorQuestion: anchor.question_text,
+    followUpQA: [{ questionText, answerText }],
+  });
+
+  const row = {
+    client_id: clientId, period_end: periodEnd, source: 'business', question_id: questionId,
+    category: anchor.category, risk_name: synthesized.risk_name, detail: synthesized.detail,
+    recommendation: synthesized.recommendation, notes: `Q: ${questionText}\nA: ${answerText || '(no detail given)'}`,
+    status: 'Identified', severity: synthesized.severity || 'Medium', last_reviewed_date: new Date().toISOString().slice(0, 10),
+    is_new: isNew, is_changed: isChanged,
+  };
+  const { data: inserted, error } = await supabase.from('risk_items').insert(row).select().single();
   if (error) throw error;
-  return { riskPresent: true, itemsWritten: inserted.length, items: inserted };
+  return { item: inserted };
 }
 
 module.exports = {
   seedQuestions,
   getCategoriesForReview,
   getFollowUpQuestions,
-  submitCategoryResponse,
+  submitAnchorNoRisk,
+  submitFollowUpAnswer,
   QUESTION_BANK,
 };

@@ -3,7 +3,7 @@ const { randomUUID } = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const { generateIndustryRiskItems } = require('./lib/industry-risk-checklist');
-const { submitCategoryResponse } = require('./lib/business-risk-questionnaire');
+const { submitAnchorNoRisk, submitFollowUpAnswer } = require('./lib/business-risk-questionnaire');
 const { applyReviewAction } = require('./lib/risk-review-actions');
 
 // fy_end is required (not just business_name) because the frontend derives every
@@ -140,17 +140,25 @@ async function saveContext(body) {
   return update;
 }
 
-// Risk Review, Source B — one call per category questionnaire, whether or
-// not follow-ups were shown. See lib/business-risk-questionnaire.js for the
-// anchor/follow-up/resurfacing logic; this just unpacks the request body.
-async function saveBusinessRiskResponse(body) {
-  const { client_id, period_end, anchor, anchor_answer, follow_up_answers } = body;
+// Risk Review, Source B — each question in a category is submitted
+// separately (anchor's no-risk answer is its own call; each follow-up
+// answered is its own call), not bundled into one category-wide save. See
+// lib/business-risk-questionnaire.js for the anchor/follow-up/resurfacing
+// logic; these just unpack the request body.
+async function saveBusinessAnchorNoRisk(body) {
+  const { client_id, period_end, anchor } = body;
   if (!client_id || !period_end || !anchor) throw new Error('client_id, period_end and anchor required');
-  if (typeof anchor_answer !== 'boolean') throw new Error('anchor_answer (boolean) required');
+  return submitAnchorNoRisk(supabase, { clientId: client_id, periodEnd: period_end, anchor });
+}
 
-  return submitCategoryResponse(supabase, {
+async function saveBusinessFollowUpAnswer(body) {
+  const { client_id, period_end, anchor, question_id, question_text, answer_text } = body;
+  if (!client_id || !period_end || !anchor || !question_id || !question_text) {
+    throw new Error('client_id, period_end, anchor, question_id and question_text required');
+  }
+  return submitFollowUpAnswer(supabase, {
     clientId: client_id, periodEnd: period_end, anchor,
-    anchorAnswer: anchor_answer, followUpAnswers: follow_up_answers || [],
+    questionId: question_id, questionText: question_text, answerText: answer_text || '',
   });
 }
 
@@ -332,7 +340,8 @@ exports.handler = async (event) => {
       : body.type === 'add_client' ? await addClient(body)
       : body.type === 'delete_period' ? await deletePeriod(body)
       : body.type === 'context' ? await saveContext(body)
-      : body.type === 'business_risk_response' ? await saveBusinessRiskResponse(body)
+      : body.type === 'business_risk_anchor_no_risk' ? await saveBusinessAnchorNoRisk(body)
+      : body.type === 'business_risk_followup' ? await saveBusinessFollowUpAnswer(body)
       : body.type === 'risk_review_action' ? await saveRiskReviewAction(body)
       : body.type === 'goal_items' ? await saveGoalItems(body)
       : body.type === 'pulse' ? await savePulse(body)

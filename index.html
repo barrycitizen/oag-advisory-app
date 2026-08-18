@@ -3456,10 +3456,10 @@ function renderRiskSourceGroup(key, rows, extraHtml) {
   `;
 }
 
-// One category's anchor question + (conditionally) its follow-ups. Kept as
-// its own card per category rather than one big form — each is answered
-// and saved independently, so leaving mid-review doesn't lose progress on
-// categories already done.
+// One category's anchor question, plus a spot for its follow-ups to
+// appear one at a time as each is answered (see renderFollowUpStep in the
+// wiring below) — kept as its own card per category so leaving mid-review
+// doesn't lose progress on categories already done.
 function renderBusinessReviewCategory(c) {
   return `
     <div class="card" id="biz-cat-${c.id}" data-category="${escAttr(c.category)}" data-risk-if-yes="${c.risk_if_yes}">
@@ -3469,16 +3469,8 @@ function renderBusinessReviewCategory(c) {
         <button type="button" class="action secondary biz-anchor-btn" data-anchor-id="${c.id}" data-value="true">Yes</button>
         <button type="button" class="action secondary biz-anchor-btn" data-anchor-id="${c.id}" data-value="false">No</button>
       </div>
-      <div class="biz-followups" id="biz-followups-${c.id}" style="display:none; margin-top:10px;">
-        ${c.followUps.map((f) => `
-          <div class="form-field" style="margin-bottom:8px;">
-            <label>${f.question_text}</label>
-            <textarea class="biz-followup-input" data-question-id="${f.id}" data-question-text="${escAttr(f.question_text)}" rows="2" placeholder="Notes…"></textarea>
-          </div>
-        `).join('')}
-      </div>
-      <button type="button" class="action" id="biz-save-${c.id}" style="display:none; margin-top:10px;">Save</button>
-      <div id="biz-saved-${c.id}" style="display:none; margin-top:8px;"></div>
+      <div id="biz-anchor-result-${c.id}" style="margin-top:8px;"></div>
+      <div id="biz-fu-sequence-${c.id}"></div>
     </div>
   `;
 }
@@ -3519,77 +3511,120 @@ async function renderRiskAnalyse(content) {
 
   categoriesToReview.forEach((c) => {
     const catCard = document.getElementById(`biz-cat-${c.id}`);
-    const followUpsBlock = document.getElementById(`biz-followups-${c.id}`);
-    const saveBtn = document.getElementById(`biz-save-${c.id}`);
-    const savedMsg = document.getElementById(`biz-saved-${c.id}`);
-    let anchorAnswer = null;
+    const anchorResultEl = document.getElementById(`biz-anchor-result-${c.id}`);
+    const sequenceEl = document.getElementById(`biz-fu-sequence-${c.id}`);
 
-    catCard.querySelectorAll('.biz-anchor-btn').forEach((btn) => {
-      btn.onclick = () => {
-        anchorAnswer = btn.dataset.value === 'true';
-        catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => b.classList.toggle('secondary', b !== btn));
-        const riskPresent = anchorAnswer === c.risk_if_yes;
-        followUpsBlock.style.display = riskPresent && c.followUps.length ? 'block' : 'none';
-        saveBtn.style.display = 'block';
-      };
-    });
+    const postBiz = async (type, extra) => {
+      const res = await fetch('/.netlify/functions/manual-entry', {
+        method: 'POST',
+        body: JSON.stringify({
+          type, client_id: currentClientId, period_end: currentPeriodEnd,
+          anchor: { category: c.category, question_text: c.question_text, risk_if_yes: c.risk_if_yes },
+          ...extra,
+        }),
+      });
+      const result = await res.json();
+      if (result.error) throw new Error(result.error);
+      // Shows what was actually written right here, in the card the
+      // accountant just answered in — a bare "Saved." with the AI's
+      // write-up sitting unseen further down the page is why this used to
+      // feel like nothing had happened beyond recording yes/no.
+      return result.saved;
+    };
 
-    saveBtn.onclick = async () => {
-      saveBtn.disabled = true;
-      saveBtn.textContent = 'Saving…';
-      const followUpAnswers = [...followUpsBlock.querySelectorAll('.biz-followup-input')]
-        .map((el) => ({ questionText: el.dataset.questionText, answerText: el.value.trim() }))
-        .filter((f) => f.answerText);
-      try {
-        const res = await fetch('/.netlify/functions/manual-entry', {
-          method: 'POST',
-          body: JSON.stringify({
-            type: 'business_risk_response', client_id: currentClientId, period_end: currentPeriodEnd,
-            anchor: { category: c.category, question_text: c.question_text, risk_if_yes: c.risk_if_yes },
-            anchor_answer: anchorAnswer, follow_up_answers: followUpAnswers,
-          }),
-        });
-        const result = await res.json();
-        if (result.error) throw new Error(result.error);
-        // Shows what was actually written right here, in the card the
-        // accountant just answered in — a bare "Saved." with the AI's
-        // write-up sitting unseen further down the page (behind however
-        // many other categories are still due for review) is why this
-        // felt like nothing had happened beyond recording yes/no.
-        saveBtn.style.display = 'none';
-        followUpsBlock.style.display = 'none';
-        catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => { b.disabled = true; });
-        savedMsg.style.display = 'block';
-        savedMsg.innerHTML = result.saved.items.map(riskItemRow).join('')
-          + `<button type="button" class="mini-link" style="margin-top:8px;" id="biz-edit-${c.id}">Edit this answer</button>`;
-        document.getElementById(`biz-edit-${c.id}`).onclick = () => {
-          // Re-opens the form exactly as it was left — the anchor/follow-up
-          // inputs were only ever hidden (display:none), never cleared, so
-          // whatever was last typed is still sitting in them. Answering and
-          // saving again re-runs submitCategoryResponse, which already
-          // deletes this category's existing rows for this period before
-          // inserting the new ones, so re-saving replaces rather than
-          // duplicates.
-          savedMsg.style.display = 'none';
-          savedMsg.innerHTML = '';
-          catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => { b.disabled = false; });
-          if (anchorAnswer !== null) followUpsBlock.style.display = (anchorAnswer === c.risk_if_yes) && c.followUps.length ? 'block' : 'none';
-          saveBtn.style.display = 'block';
+    // Renders follow-up question `index` as its own step (text box + its
+    // own Save, its own AI result, its own Edit link) — appended only once
+    // the prior step has actually been answered, so the accountant works
+    // through People's 2 questions (or Legal's 2, etc.) one at a time, each
+    // getting its own write-up, rather than filling in a whole form at once.
+    function renderFollowUpStep(index) {
+      const f = c.followUps[index];
+      const stepId = `biz-fu-${c.id}-${index}`;
+      sequenceEl.insertAdjacentHTML('beforeend', `
+        <div id="${stepId}" style="margin-top:10px; padding-top:10px; border-top:1px solid var(--line);">
+          <div class="form-field" id="${stepId}-field" style="margin-bottom:0;">
+            <label>${f.question_text}</label>
+            <textarea id="${stepId}-input" rows="2" placeholder="Notes…"></textarea>
+          </div>
+          <button type="button" class="action" id="${stepId}-save" style="margin-top:8px;">Save</button>
+          <div id="${stepId}-result" style="display:none; margin-top:8px;"></div>
+        </div>
+      `);
+      const fieldEl = document.getElementById(`${stepId}-field`);
+      const textarea = document.getElementById(`${stepId}-input`);
+      const saveBtn = document.getElementById(`${stepId}-save`);
+      const resultEl = document.getElementById(`${stepId}-result`);
+
+      saveBtn.onclick = async () => {
+        saveBtn.disabled = true;
+        saveBtn.textContent = 'Saving…';
+        try {
+          const saved = await postBiz('business_risk_followup', {
+            question_id: f.id, question_text: f.question_text, answer_text: textarea.value.trim(),
+          });
+          fieldEl.style.display = 'none';
+          saveBtn.style.display = 'none';
+          resultEl.style.display = 'block';
+          resultEl.innerHTML = riskItemRow(saved.item)
+            + `<button type="button" class="mini-link" style="margin-top:6px;" id="${stepId}-edit">Edit this answer</button>`;
+          document.getElementById(`${stepId}-edit`).onclick = () => {
+            // The textarea was only ever hidden, never cleared, so
+            // whatever was last typed is still there to revise. Re-saving
+            // re-runs submitFollowUpAnswer, which deletes this exact
+            // question's existing row before inserting the new one —
+            // sibling follow-up questions' rows are untouched.
+            resultEl.style.display = 'none';
+            fieldEl.style.display = 'block';
+            saveBtn.style.display = 'inline-block';
+            saveBtn.disabled = false;
+            saveBtn.textContent = 'Save';
+          };
+          // Reveal the next question only the first time this one's
+          // completed — re-saving via Edit shouldn't re-append a duplicate
+          // step for whatever comes after it.
+          if (index + 1 < c.followUps.length && !document.getElementById(`biz-fu-${c.id}-${index + 1}`)) {
+            renderFollowUpStep(index + 1);
+          }
+        } catch (err) {
           saveBtn.disabled = false;
           saveBtn.textContent = 'Save';
-        };
-        // Deliberately NOT calling renderMain() here — that would replace
-        // content.innerHTML wholesale and wipe out the preview just shown
-        // above it. The rollup banner's counts and the read-only history
-        // list catch up next time this tab naturally re-renders (switching
-        // domains/tabs and back); this card's own result is already
-        // accurate from the server response, so it doesn't need a refetch.
-      } catch (err) {
-        saveBtn.disabled = false;
-        saveBtn.textContent = 'Save';
-        alert('Error: ' + err.message);
-      }
-    };
+          alert('Error: ' + err.message);
+        }
+      };
+    }
+
+    catCard.querySelectorAll('.biz-anchor-btn').forEach((btn) => {
+      btn.onclick = async () => {
+        const anchorAnswer = btn.dataset.value === 'true';
+        catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => b.classList.toggle('secondary', b !== btn));
+        const riskPresent = anchorAnswer === c.risk_if_yes;
+        sequenceEl.innerHTML = '';
+        anchorResultEl.innerHTML = '';
+
+        if (!riskPresent) {
+          catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => { b.disabled = true; });
+          try {
+            const saved = await postBiz('business_risk_anchor_no_risk', {});
+            anchorResultEl.innerHTML = riskItemRow(saved.item)
+              + `<button type="button" class="mini-link" style="margin-top:6px;" id="biz-anchor-edit-${c.id}">Edit this answer</button>`;
+            document.getElementById(`biz-anchor-edit-${c.id}`).onclick = () => {
+              anchorResultEl.innerHTML = '';
+              catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => { b.disabled = false; });
+            };
+          } catch (err) {
+            catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => { b.disabled = false; });
+            alert('Error: ' + err.message);
+          }
+        } else if (c.followUps.length) {
+          renderFollowUpStep(0);
+        }
+        // Deliberately NOT calling renderMain() anywhere in this flow —
+        // that would replace content.innerHTML wholesale and wipe out
+        // whatever's been answered so far in this card. The rollup
+        // banner's counts and the read-only history list catch up next
+        // time this tab naturally re-renders.
+      };
+    });
   });
 
   // Review actions (Confirm/Investigate/Not applicable/No longer a risk) —
