@@ -3414,6 +3414,13 @@ function computeRiskRollup(financial, business, industry) {
   allActive.forEach((r) => { (buckets[r.severity] || buckets.Medium).push(r); });
   const managed = [...financial, ...businessLatest, ...industry].filter((r) => r.status === 'Managed' || r.status === 'Not applicable');
 
+  // Source counts span everything shown (active + managed), not just
+  // active — otherwise the Source filter axis's "All" total wouldn't match
+  // the Priority axis's "All" total, and clicking "Business" would hide
+  // any managed business item entirely (resolved doesn't mean sourceless).
+  const allShown = [...allActive, ...managed];
+  const countBySource = (src) => allShown.filter((r) => r.source === src).length;
+
   // is_new/is_changed only means something for sources that get re-synced
   // over time (financial every analysis run, business every review cycle)
   // — industry is generated once and never revisited, so "new this cycle"
@@ -3428,19 +3435,10 @@ function computeRiskRollup(financial, business, industry) {
 
   return {
     buckets, managed,
-    counts: { financial: activeFinancial.length, business: activeBusiness.length, industry: activeIndustry.length },
+    counts: { financial: countBySource('financial'), business: countBySource('business'), industry: countBySource('industry') },
     allActiveCount: allActive.length, newCount, changedCount, industryNeedsReview,
     level, isQuiet,
   };
-}
-
-function riskStat(label, value) {
-  return `
-    <div style="text-align:center; flex:1 1 64px; min-width:0;">
-      <p style="margin:0; font-family:var(--font-display); font-size:19px;">${value}</p>
-      <p class="muted" style="margin:2px 0 0; font-size:10px;">${label}</p>
-    </div>
-  `;
 }
 
 const RISK_SOURCE_PILL = {
@@ -3462,13 +3460,17 @@ const RISK_SOURCE_PILL = {
 // fetched on click — this dataset is small (a handful of risks at most)
 // and it means the action buttons work immediately via the existing
 // content-level .risk-action-btn delegation, no extra wiring needed per
-// row. data-source drives the filter pills above (see wireRiskSummaryRegion).
-function riskSummaryRow(r) {
+// row. data-source/data-level drive the two filter pill rows above (see
+// wireRiskSummaryRegion) — level is the bucket it's grouped under
+// (High/Medium/Managed), passed in from riskSummarySection rather than
+// read off severity, since Managed items keep whatever severity they were
+// given (often Low) but belong in the Managed filter, not a "Low" one.
+function riskSummaryRow(r, level) {
   const detail = r.detail || '';
   const preview = detail.length > 90 ? detail.slice(0, 90) + '…' : detail;
   const sourceMeta = RISK_SOURCE_PILL[r.source] || { icon: '', label: r.source };
   return `
-    <div class="risk-summary-row" data-source="${r.source}" style="padding:8px 0; border-bottom:1px solid var(--line); cursor:pointer;">
+    <div class="risk-summary-row" data-source="${r.source}" data-level="${level}" style="padding:8px 0; border-bottom:1px solid var(--line); cursor:pointer;">
       <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
         <b style="font-size:13px;">${r.risk_name}</b>
         <span class="risk-pill risk-pill-severity ${(r.severity || 'Medium').toLowerCase()}">${r.severity || 'Medium'}</span>
@@ -3486,7 +3488,22 @@ function riskSummaryRow(r) {
 
 function riskSummarySection(icon, label, level, rows) {
   if (!rows.length) return '';
-  return `<div class="risk-section-header ${level}">${icon} ${label} (${rows.length})</div>${rows.map(riskSummaryRow).join('')}`;
+  return `<div class="risk-section-header ${level}">${icon} ${label} (${rows.length})</div>${rows.map((r) => riskSummaryRow(r, level)).join('')}`;
+}
+
+// One row of pills for one filter axis — the count IS the pill label now,
+// not a separate disconnected number above the pills (that's what the old
+// static "numbers at top" were, with no way to act on them). "All" always
+// sits first and starts active.
+function riskFilterAxis(axisLabel, axis, options) {
+  const allCount = options.reduce((sum, o) => sum + o.count, 0);
+  return `
+    <p class="muted" style="margin:14px 0 4px;">${axisLabel}</p>
+    <div style="display:flex; gap:6px; flex-wrap:wrap;">
+      <button type="button" class="risk-filter-pill active" data-filter-axis="${axis}" data-filter-value="all">All (${allCount})</button>
+      ${options.map((o) => `<button type="button" class="risk-filter-pill" data-filter-axis="${axis}" data-filter-value="${o.value}">${o.icon ? o.icon + ' ' : ''}${o.label} (${o.count})</button>`).join('')}
+    </div>
+  `;
 }
 
 // The full card content, shared between the always-expanded state and
@@ -3494,25 +3511,25 @@ function riskSummarySection(icon, label, level, rows) {
 // content either way, just a different entry point to it.
 function renderRiskRollupContent(rollup) {
   const levelIcon = rollup.level === 'High' ? '🔴' : rollup.level === 'Medium' ? '🟠' : '🟢';
+  const bits = [];
+  if (rollup.newCount) bits.push(`${rollup.newCount} new`);
+  if (rollup.changedCount) bits.push(`${rollup.changedCount} changed`);
   return `
     <div class="card">
       <p class="muted" style="margin:0 0 6px;">Overall Risk</p>
       <div class="risk-overall-pill ${rollup.level}">${levelIcon} ${rollup.level}</div>
-      <div style="display:flex; flex-wrap:wrap; gap:4px; margin:14px 0 0; padding:10px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line);">
-        ${riskStat('Financial', rollup.counts.financial)}
-        ${riskStat('Business', rollup.counts.business)}
-        ${riskStat('Industry', rollup.counts.industry)}
-        ${riskStat('New', rollup.newCount)}
-        ${riskStat('Changed', rollup.changedCount)}
-        ${riskStat('Open', rollup.allActiveCount)}
-      </div>
-      <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:12px;">
-        <button type="button" class="risk-filter-pill active" data-filter-source="all">All</button>
-        <button type="button" class="risk-filter-pill" data-filter-source="financial">📊 Financial</button>
-        <button type="button" class="risk-filter-pill" data-filter-source="business">🧑 Business</button>
-        <button type="button" class="risk-filter-pill" data-filter-source="industry">🏭 Industry</button>
-      </div>
-      <div id="risk-summary-sections">
+      ${bits.length ? `<p class="muted plain" style="margin:8px 0 0; font-size:12px;">${bits.join(' · ')} this cycle</p>` : ''}
+      ${riskFilterAxis('Priority', 'level', [
+        { value: 'High', icon: '🔴', label: 'High', count: rollup.buckets.High.length },
+        { value: 'Medium', icon: '🟠', label: 'Medium', count: rollup.buckets.Medium.length },
+        { value: 'Managed', icon: '🟢', label: 'Managed', count: rollup.managed.length },
+      ])}
+      ${riskFilterAxis('Source', 'source', [
+        { value: 'financial', icon: '📊', label: 'Financial', count: rollup.counts.financial },
+        { value: 'business', icon: '🧑', label: 'Business', count: rollup.counts.business },
+        { value: 'industry', icon: '🏭', label: 'Industry', count: rollup.counts.industry },
+      ])}
+      <div id="risk-summary-sections" style="margin-top:10px;">
         ${riskSummarySection('🔴', 'High priority', 'High', rollup.buckets.High)}
         ${riskSummarySection('🟠', 'Medium priority', 'Medium', rollup.buckets.Medium)}
         ${riskSummarySection('🟢', 'Managed', 'Managed', rollup.managed)}
@@ -3573,27 +3590,41 @@ function wireRiskSummaryRegion() {
     };
   });
 
-  // Source filter pills — instant show/hide via data-source, not a
-  // re-render (this dataset is small and already fully in the DOM). A
-  // section header hides itself if every row under it got filtered out,
-  // so filtering to "Business" doesn't leave an empty "High priority"
-  // heading sitting above nothing.
+  // Two independent filter axes (Priority via data-level, Source via
+  // data-source) that COMBINE — picking "High" and "Business" shows only
+  // High-priority Business risks, not either/or. Instant show/hide, not a
+  // re-render (this dataset is small and already fully in the DOM). Each
+  // axis's pills only toggle "active" against siblings on the SAME axis
+  // (the data-filter-axis scoped query below), so picking a priority
+  // doesn't reset the source selection or vice versa. A section header
+  // hides itself if every row under it got filtered out, so filtering to
+  // "Business" doesn't leave an empty "High priority" heading sitting
+  // above nothing.
+  let activeLevel = 'all';
+  let activeSource = 'all';
+  const applyRiskFilters = () => {
+    summaryEl.querySelectorAll('.risk-summary-row').forEach((row) => {
+      const matchesLevel = activeLevel === 'all' || row.dataset.level === activeLevel;
+      const matchesSource = activeSource === 'all' || row.dataset.source === activeSource;
+      row.style.display = (matchesLevel && matchesSource) ? '' : 'none';
+    });
+    summaryEl.querySelectorAll('.risk-section-header').forEach((header) => {
+      let sib = header.nextElementSibling;
+      let anyVisible = false;
+      while (sib && sib.classList.contains('risk-summary-row')) {
+        if (sib.style.display !== 'none') anyVisible = true;
+        sib = sib.nextElementSibling;
+      }
+      header.style.display = anyVisible ? '' : 'none';
+    });
+  };
   summaryEl.querySelectorAll('.risk-filter-pill').forEach((pill) => {
     pill.onclick = () => {
-      summaryEl.querySelectorAll('.risk-filter-pill').forEach((p) => p.classList.toggle('active', p === pill));
-      const filter = pill.dataset.filterSource;
-      summaryEl.querySelectorAll('.risk-summary-row').forEach((row) => {
-        row.style.display = (filter === 'all' || row.dataset.source === filter) ? '' : 'none';
-      });
-      summaryEl.querySelectorAll('.risk-section-header').forEach((header) => {
-        let sib = header.nextElementSibling;
-        let anyVisible = false;
-        while (sib && sib.classList.contains('risk-summary-row')) {
-          if (sib.style.display !== 'none') anyVisible = true;
-          sib = sib.nextElementSibling;
-        }
-        header.style.display = anyVisible ? '' : 'none';
-      });
+      const axis = pill.dataset.filterAxis;
+      const value = pill.dataset.filterValue;
+      summaryEl.querySelectorAll(`.risk-filter-pill[data-filter-axis="${axis}"]`).forEach((p) => p.classList.toggle('active', p === pill));
+      if (axis === 'level') activeLevel = value; else activeSource = value;
+      applyRiskFilters();
     };
   });
 }
