@@ -189,7 +189,12 @@ async function computeNewChanged(supabase, { clientId, periodEnd, category, ques
 //
 // Either way, deletes only THIS question's existing row before inserting
 // — re-saving/editing one question must not touch any of its sibling
-// questions' rows in the same category.
+// questions' rows in the same category. Also clears any pre-flattening
+// legacy row for this same category with question_id IS NULL — those
+// predate this schema (a single row spoke for the whole category, back
+// when there was one anchor question) and would otherwise sit alongside
+// a fresh per-question answer as an orphaned duplicate forever, since
+// nothing else ever revisits them.
 async function submitQuestionAnswer(supabase, { clientId, periodEnd, category, question, answer, notes }) {
   const riskPresent = answer === question.risk_if_yes;
   const newStatus = riskPresent ? 'Identified' : 'Managed';
@@ -201,7 +206,8 @@ async function submitQuestionAnswer(supabase, { clientId, periodEnd, category, q
   const { error: delError } = await supabase
     .from('risk_items').delete()
     .eq('client_id', clientId).eq('period_end', periodEnd)
-    .eq('source', 'business').eq('question_id', question.id);
+    .eq('source', 'business').eq('category', category)
+    .or(`question_id.eq.${question.id},question_id.is.null`);
   if (delError) throw delError;
 
   const today = new Date().toISOString().slice(0, 10);

@@ -3377,34 +3377,95 @@ function computeRiskRollup(financial, business, industry) {
   const activeIndustry = industry.filter((r) => RISK_ACTIVE_STATUSES.has(r.status));
   const allActive = [...activeFinancial, ...activeBusiness, ...activeIndustry];
 
-  const buckets = { High: [], Medium: [], Low: [] };
+  // Severity is only ever 'High'/'Medium' on a genuinely active item in
+  // practice — 'Low' only shows up on business's "no risk" rows, which are
+  // always Managed, never active. A "Low priority, still open" bucket would
+  // sit empty forever, so the third bucket is Managed/Not applicable
+  // instead — "what's actually fine" is at least as useful to see at a
+  // glance as an always-empty bucket.
+  const buckets = { High: [], Medium: [] };
   allActive.forEach((r) => { (buckets[r.severity] || buckets.Medium).push(r); });
+  const managed = [...financial, ...businessLatest, ...industry].filter((r) => r.status === 'Managed' || r.status === 'Not applicable');
 
   // is_new/is_changed only means something for sources that get re-synced
   // over time (financial every analysis run, business every review cycle)
   // — industry is generated once and never revisited, so "new this cycle"
   // doesn't apply to it; it gets its own "needs review" count instead,
   // since every industry item starts at Unknown until confirmed/dismissed.
-  const newOrChangedCount = [...activeFinancial, ...activeBusiness].filter((r) => r.is_new || r.is_changed).length;
+  const newCount = [...activeFinancial, ...activeBusiness].filter((r) => r.is_new).length;
+  const changedCount = [...activeFinancial, ...activeBusiness].filter((r) => r.is_changed).length;
   const industryNeedsReview = activeIndustry.filter((r) => r.status === 'Unknown').length;
 
   const level = buckets.High.length ? 'High' : buckets.Medium.length ? 'Medium' : 'Low';
-  const isQuiet = level === 'Low' && newOrChangedCount === 0 && industryNeedsReview === 0;
+  const isQuiet = level === 'Low' && newCount === 0 && changedCount === 0 && industryNeedsReview === 0;
 
-  return { buckets, allActiveCount: allActive.length, newOrChangedCount, industryNeedsReview, level, isQuiet };
+  return {
+    buckets, managed,
+    counts: { financial: activeFinancial.length, business: activeBusiness.length, industry: activeIndustry.length },
+    allActiveCount: allActive.length, newCount, changedCount, industryNeedsReview,
+    level, isQuiet,
+  };
 }
 
-function riskBucketCard(label, dotColor, rows) {
-  const names = rows.slice(0, 3).map((r) => r.risk_name);
-  const more = rows.length - names.length;
+function riskStat(label, value) {
   return `
-    <div style="background:var(--paper); border-radius:8px; padding:10px 12px; flex:1 1 140px; min-width:0;">
+    <div style="text-align:center; flex:1 1 64px; min-width:0;">
+      <p style="margin:0; font-family:var(--font-display); font-size:19px;">${value}</p>
+      <p class="muted" style="margin:2px 0 0; font-size:10px;">${label}</p>
+    </div>
+  `;
+}
+
+// One clickable line per risk in the summary — name, severity dot, a
+// truncated one-line preview. Click anywhere on the row (except an action
+// button) to expand the SAME riskItemRow() detail used in the full
+// source-grouped lists below (recommendation, notes, Confirm/Investigate/
+// etc.) right in place, so seeing "the stuff" behind a summary line never
+// requires scrolling to hunt for it elsewhere on the page. The full detail
+// is rendered into the DOM up front (just hidden), not fetched on click —
+// this dataset is small (a handful of risks at most) and it means the
+// action buttons work immediately via the existing content-level
+// .risk-action-btn delegation, no extra wiring needed per row.
+function riskSummaryRow(r, dotColor) {
+  const detail = r.detail || '';
+  const preview = detail.length > 90 ? detail.slice(0, 90) + '…' : detail;
+  return `
+    <div class="risk-summary-row" style="padding:7px 0; border-bottom:1px solid var(--line); cursor:pointer;">
       <div style="display:flex; align-items:baseline; gap:6px;">
         <span class="flag-dot" style="background:${dotColor};"></span>
-        <b>${rows.length}</b>
-        <span class="muted" style="margin:0;">${label}</span>
+        <b style="font-size:13px;">${r.risk_name}</b>
+        <span class="muted plain risk-summary-chevron" style="font-size:11px; margin-left:auto;">▾</span>
       </div>
-      ${names.length ? `<p class="muted plain" style="margin:6px 0 0; font-size:12px;">${names.join(', ')}${more > 0 ? `, +${more} more` : ''}</p>` : ''}
+      ${preview ? `<p class="muted plain" style="margin:2px 0 0 16px; font-size:12px;">${preview}</p>` : ''}
+      <div class="risk-summary-expand" style="display:none; margin:8px 0 0 16px;">${riskItemRow(r)}</div>
+    </div>
+  `;
+}
+
+function riskSummarySection(icon, label, rows, dotColor) {
+  if (!rows.length) return '';
+  return `<p class="muted" style="margin:12px 0 4px;">${icon} ${label}</p>${rows.map((r) => riskSummaryRow(r, dotColor)).join('')}`;
+}
+
+// The full card content, shared between the always-expanded state and
+// what's revealed when the quiet collapsed state is clicked open — same
+// content either way, just a different entry point to it.
+function renderRiskRollupContent(rollup) {
+  return `
+    <div class="card">
+      <p class="kpi-value ${rollup.level === 'High' ? 'bad' : ''}" style="margin:0;">Overall Risk: ${rollup.level}</p>
+      <div style="display:flex; flex-wrap:wrap; gap:4px; margin:12px 0 0; padding:10px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line);">
+        ${riskStat('Financial', rollup.counts.financial)}
+        ${riskStat('Business', rollup.counts.business)}
+        ${riskStat('Industry', rollup.counts.industry)}
+        ${riskStat('New', rollup.newCount)}
+        ${riskStat('Changed', rollup.changedCount)}
+        ${riskStat('Open', rollup.allActiveCount)}
+      </div>
+      ${riskSummarySection('🔴', 'High priority', rollup.buckets.High, 'var(--rust)')}
+      ${riskSummarySection('🟠', 'Medium priority', rollup.buckets.Medium, 'var(--brass)')}
+      ${riskSummarySection('🟢', 'Managed', rollup.managed, 'var(--sage)')}
+      <button type="button" class="action" id="risk-review-btn" style="margin-top:14px;">Review risks</button>
     </div>
   `;
 }
@@ -3417,39 +3478,52 @@ function renderRiskRollupBanner(rollup) {
         <span class="cash-item-label">Risk: Low — no significant new risks</span>
         <span class="chevron">▾</span>
       </div>
-      <div id="risk-rollup-detail" class="card" style="display:none; margin-top:8px;">
-        <div style="display:flex; gap:10px; flex-wrap:wrap;">
-          ${riskBucketCard('High', 'var(--rust)', rollup.buckets.High)}
-          ${riskBucketCard('Medium', 'var(--brass)', rollup.buckets.Medium)}
-          ${riskBucketCard('Low', 'var(--sage)', rollup.buckets.Low)}
-        </div>
-      </div>
+      <div id="risk-rollup-detail" style="display:none; margin-top:8px;">${renderRiskRollupContent(rollup)}</div>
     `;
   }
-  const bits = [];
-  if (rollup.newOrChangedCount) bits.push(`${rollup.newOrChangedCount} new or changed this cycle`);
-  if (rollup.industryNeedsReview) bits.push(`${rollup.industryNeedsReview} industry item${rollup.industryNeedsReview === 1 ? '' : 's'} awaiting review`);
-  return `
-    <div class="card">
-      <div style="display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;">
-        <p class="kpi-value ${rollup.level === 'High' ? 'bad' : ''}" style="margin:0;">Risk: ${rollup.level}</p>
-        ${bits.length ? `<span class="muted plain">${bits.join(' · ')}</span>` : ''}
-      </div>
-      <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
-        ${riskBucketCard('High priority', 'var(--rust)', rollup.buckets.High)}
-        ${riskBucketCard('Medium priority', 'var(--brass)', rollup.buckets.Medium)}
-        ${riskBucketCard('Low priority', 'var(--sage)', rollup.buckets.Low)}
-      </div>
-    </div>
-  `;
+  return renderRiskRollupContent(rollup);
 }
 
-function renderRiskSourceGroup(key, rows, extraHtml) {
-  const meta = RISK_SOURCE_META[key];
+// Wires the summary region — the collapse toggle (quiet state only), the
+// "Review risks" button (scrolls to the interactive due-for-review
+// section), and click-to-expand on every summary row. Called after both
+// the initial render and every refreshRiskLists() call, since
+// summary-region's innerHTML gets replaced wholesale each time.
+function wireRiskSummaryRegion() {
+  const summaryEl = document.getElementById('risk-summary-region');
+  if (!summaryEl) return;
+
+  const rollupToggle = document.getElementById('risk-rollup-toggle');
+  if (rollupToggle) {
+    const rollupDetail = document.getElementById('risk-rollup-detail');
+    rollupToggle.onclick = () => {
+      const willOpen = rollupDetail.style.display === 'none';
+      rollupDetail.style.display = willOpen ? 'block' : 'none';
+      rollupToggle.querySelector('.chevron').textContent = willOpen ? '▴' : '▾';
+    };
+  }
+
+  const reviewBtn = document.getElementById('risk-review-btn');
+  if (reviewBtn) {
+    reviewBtn.onclick = () => {
+      document.getElementById('risk-business-review-region')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+  }
+
+  summaryEl.querySelectorAll('.risk-summary-row').forEach((row) => {
+    row.onclick = (e) => {
+      if (e.target.closest('.risk-action-btn')) return; // let the action button's own handler run, don't also toggle the row
+      const expandEl = row.querySelector('.risk-summary-expand');
+      const chevron = row.querySelector('.risk-summary-chevron');
+      const willOpen = expandEl.style.display === 'none';
+      expandEl.style.display = willOpen ? 'block' : 'none';
+      chevron.textContent = willOpen ? '▴' : '▾';
+    };
+  });
+}
+
+function renderRiskItemsCard(rows) {
   return `
-    <p class="muted">${meta.label}</p>
-    <p class="muted plain" style="margin:0 0 8px;">${meta.hint}</p>
-    ${extraHtml || ''}
     <div class="card">
       ${rows.length ? rows.map(riskItemRow).join('') : `<p class="muted plain" style="margin:0;">Nothing on file yet.</p>`}
     </div>
@@ -3548,6 +3622,12 @@ function wireBusinessQuestion(q, category) {
       buttonsEl.style.display = 'flex';
       buttonsEl.querySelectorAll('.biz-q-btn').forEach((b) => { b.disabled = false; });
     };
+    // Keeps the summary and the read-only Business list (further down the
+    // page) in sync with what was just answered, without touching this
+    // card or any other still-open question elsewhere in the section —
+    // see refreshRiskLists(). This used to only happen on the next full
+    // tab reload, which read as "nothing changed."
+    refreshRiskLists();
   };
 
   buttonsEl.querySelectorAll('.biz-q-btn').forEach((btn) => {
@@ -3642,6 +3722,31 @@ function wireAddQuestionForm(category) {
   };
 }
 
+// Re-fetches and re-renders the summary + all three read-only lists —
+// everything EXCEPT the interactive "due for review" business questions
+// (risk-business-review-region), which is deliberately left untouched so
+// answering one question, confirming an industry item, etc. never wipes
+// out progress on other questions still open elsewhere in that section.
+// Called after every business question save and every review action,
+// instead of the old renderMain() full-tab reload — that's what used to
+// leave the summary/lists looking like "nothing changed" until you left
+// the tab and came back.
+async function refreshRiskLists() {
+  const data = await callRead('get_risk_items', currentClientId, currentPeriodEnd);
+  const rollup = computeRiskRollup(data.financial || [], data.business || [], data.industry || []);
+
+  const summaryEl = document.getElementById('risk-summary-region');
+  if (summaryEl) summaryEl.innerHTML = renderRiskRollupBanner(rollup);
+  const financialEl = document.getElementById('risk-financial-region');
+  if (financialEl) financialEl.innerHTML = renderRiskItemsCard(data.financial || []);
+  const businessListEl = document.getElementById('risk-business-list-region');
+  if (businessListEl) businessListEl.innerHTML = renderRiskItemsCard(data.business || []);
+  const industryEl = document.getElementById('risk-industry-region');
+  if (industryEl) industryEl.innerHTML = renderRiskItemsCard(data.industry || []);
+
+  wireRiskSummaryRegion();
+}
+
 async function renderRiskAnalyse(content) {
   const myToken = renderToken;
   if (!currentPeriodEnd) {
@@ -3660,26 +3765,21 @@ async function renderRiskAnalyse(content) {
 
   content.innerHTML = `
     <p class="section-title">Risk Review</p>
-    ${renderRiskRollupBanner(rollup)}
-    ${renderRiskSourceGroup('financial', data.financial || [])}
-    ${renderRiskSourceGroup('business', data.business || [], reviewHtml)}
-    ${renderRiskSourceGroup('industry', data.industry || [])}
+    <div id="risk-summary-region">${renderRiskRollupBanner(rollup)}</div>
+    <p class="muted">${RISK_SOURCE_META.financial.label}</p>
+    <p class="muted plain" style="margin:0 0 8px;">${RISK_SOURCE_META.financial.hint}</p>
+    <div id="risk-financial-region">${renderRiskItemsCard(data.financial || [])}</div>
+    <p class="muted">${RISK_SOURCE_META.business.label}</p>
+    <p class="muted plain" style="margin:0 0 8px;">${RISK_SOURCE_META.business.hint}</p>
+    <div id="risk-business-review-region">${reviewHtml}</div>
+    <div id="risk-business-list-region">${renderRiskItemsCard(data.business || [])}</div>
+    <p class="muted">${RISK_SOURCE_META.industry.label}</p>
+    <p class="muted plain" style="margin:0 0 8px;">${RISK_SOURCE_META.industry.hint}</p>
+    <div id="risk-industry-region">${renderRiskItemsCard(data.industry || [])}</div>
   `;
 
-  const rollupToggle = document.getElementById('risk-rollup-toggle');
-  if (rollupToggle) {
-    const rollupDetail = document.getElementById('risk-rollup-detail');
-    rollupToggle.onclick = () => {
-      const willOpen = rollupDetail.style.display === 'none';
-      rollupDetail.style.display = willOpen ? 'block' : 'none';
-      rollupToggle.querySelector('.chevron').textContent = willOpen ? '▴' : '▾';
-    };
-  }
+  wireRiskSummaryRegion();
 
-  // Deliberately NOT calling renderMain() anywhere in this wiring — that
-  // would replace content.innerHTML wholesale and wipe out whatever's been
-  // answered so far in these cards. The rollup banner's counts and the
-  // read-only history list catch up next time this tab naturally re-renders.
   categoriesToReview.forEach((c) => {
     c.questions.forEach((q) => wireBusinessQuestion(q, c.category));
     wireAddQuestionForm(c.category);
@@ -3706,7 +3806,7 @@ async function renderRiskAnalyse(content) {
       });
       const result = await res.json();
       if (result.error) throw new Error(result.error);
-      renderMain(); // refresh so the new status/cleared New-Changed badges and the rollup banner's bucket counts reflect it immediately
+      await refreshRiskLists();
     } catch (err) {
       buttonsInRow.forEach((b) => { b.disabled = false; });
       btn.textContent = original;
