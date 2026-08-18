@@ -3719,6 +3719,34 @@ function renderRiskItemsCard(rows) {
   `;
 }
 
+// A clickable header (same chevron-toggle pattern as the cash reconciliation
+// panels) that collapses/expands everything under it — for Financial and
+// Industry that's just the read-only list, for Business it's the
+// interactive due-for-review area AND the read-only list together, since
+// "collapse the Business section" means the whole thing, not half of it.
+// Starts expanded (current behavior stays the default); collapsing is
+// something the accountant opts into per section, not something sprung on
+// them, since the due-for-review prompts are time-sensitive.
+function riskSectionHeader(id, icon, label, hint) {
+  return `
+    <div class="cash-item cash-item-clickable" id="risk-section-toggle-${id}">
+      <span class="cash-item-icon">${icon}</span>
+      <span class="cash-item-label">${label} <span class="sub">${hint}</span></span>
+      <span class="chevron">▴</span>
+    </div>
+  `;
+}
+function wireRiskSectionToggle(id) {
+  const toggle = document.getElementById(`risk-section-toggle-${id}`);
+  const body = document.getElementById(`risk-section-body-${id}`);
+  if (!toggle || !body) return;
+  toggle.onclick = () => {
+    const willOpen = body.style.display === 'none';
+    body.style.display = willOpen ? 'block' : 'none';
+    toggle.querySelector('.chevron').textContent = willOpen ? '▴' : '▾';
+  };
+}
+
 // One category's questions, all shown together, flat — no anchor gating
 // whether the others appear. People shows Q1, Q2, Q3 all at once, each
 // independently answerable in any order, each getting its own AI write-up
@@ -3946,8 +3974,25 @@ async function renderRiskAnalyse(content) {
   if (myToken !== renderToken) return;
 
   const categoriesToReview = data.categoriesToReview || [];
+  // Due for review can be up to all 8 categories stacked at once (People,
+  // Customers, Suppliers, Operations, Cash & Funding, Legal, Insurance,
+  // Technology) — a picker shows just one at a time instead of all of them
+  // down the page; the rest stay in the DOM (just hidden), not re-fetched,
+  // so switching between them is instant.
+  const categoryPickerHtml = categoriesToReview.length > 1
+    ? `
+      <div class="form-field" style="max-width:280px;">
+        <label>Category (${categoriesToReview.length} due for review)</label>
+        <select id="biz-category-picker" style="padding:8px 10px; border:1px solid var(--line); border-radius:6px; font-family:var(--font-body); background:var(--paper-raised); color:var(--ink); font-size:13px;">
+          ${categoriesToReview.map((c) => `<option value="${escAttr(c.category)}">${businessCategoryLabel(c.category)} (${c.questions.length})</option>`).join('')}
+        </select>
+      </div>
+    `
+    : (categoriesToReview.length === 1
+      ? `<p class="muted plain" style="margin:0 0 8px;">1 category due for review this cycle:</p>`
+      : '');
   const reviewHtml = categoriesToReview.length
-    ? `<p class="muted plain" style="margin:0 0 8px;">${categoriesToReview.length} categor${categoriesToReview.length === 1 ? 'y' : 'ies'} due for review this cycle:</p>${categoriesToReview.map(renderBusinessReviewCategory).join('')}`
+    ? categoryPickerHtml + categoriesToReview.map(renderBusinessReviewCategory).join('')
     : '';
 
   const rollup = computeRiskRollup(data.financial || [], data.business || [], data.industry || []);
@@ -3955,19 +4000,35 @@ async function renderRiskAnalyse(content) {
   content.innerHTML = `
     <p class="section-title">Risk Review</p>
     <div id="risk-summary-region">${renderRiskRollupBanner(rollup)}</div>
-    <p class="muted">${RISK_SOURCE_META.financial.label}</p>
-    <p class="muted plain" style="margin:0 0 8px;">${RISK_SOURCE_META.financial.hint}</p>
-    <div id="risk-financial-region">${renderRiskItemsCard(data.financial || [])}</div>
-    <p class="muted">${RISK_SOURCE_META.business.label}</p>
-    <p class="muted plain" style="margin:0 0 8px;">${RISK_SOURCE_META.business.hint}</p>
-    <div id="risk-business-review-region">${reviewHtml}</div>
-    <div id="risk-business-list-region">${renderRiskItemsCard(data.business || [])}</div>
-    <p class="muted">${RISK_SOURCE_META.industry.label}</p>
-    <p class="muted plain" style="margin:0 0 8px;">${RISK_SOURCE_META.industry.hint}</p>
-    <div id="risk-industry-region">${renderRiskItemsCard(data.industry || [])}</div>
+    ${riskSectionHeader('financial', '📊', RISK_SOURCE_META.financial.label, RISK_SOURCE_META.financial.hint)}
+    <div id="risk-section-body-financial" style="margin-top:8px;">
+      <div id="risk-financial-region">${renderRiskItemsCard(data.financial || [])}</div>
+    </div>
+    ${riskSectionHeader('business', '🧑', RISK_SOURCE_META.business.label, RISK_SOURCE_META.business.hint)}
+    <div id="risk-section-body-business" style="margin-top:8px;">
+      <div id="risk-business-review-region">${reviewHtml}</div>
+      <div id="risk-business-list-region">${renderRiskItemsCard(data.business || [])}</div>
+    </div>
+    ${riskSectionHeader('industry', '🏭', RISK_SOURCE_META.industry.label, RISK_SOURCE_META.industry.hint)}
+    <div id="risk-section-body-industry" style="margin-top:8px;">
+      <div id="risk-industry-region">${renderRiskItemsCard(data.industry || [])}</div>
+    </div>
   `;
 
   wireRiskSummaryRegion(rollup);
+  ['financial', 'business', 'industry'].forEach(wireRiskSectionToggle);
+
+  const categoryPicker = document.getElementById('biz-category-picker');
+  if (categoryPicker) {
+    const showOnlyCategory = (category) => {
+      categoriesToReview.forEach((c) => {
+        const card = document.getElementById(`biz-cat-${c.category}`);
+        if (card) card.style.display = (c.category === category) ? 'block' : 'none';
+      });
+    };
+    showOnlyCategory(categoriesToReview[0].category);
+    categoryPicker.onchange = () => showOnlyCategory(categoryPicker.value);
+  }
 
   categoriesToReview.forEach((c) => {
     c.questions.forEach((q) => wireBusinessQuestion(q, c.category));
