@@ -3491,23 +3491,20 @@ function riskSummarySection(icon, label, level, rows) {
   return `<div class="risk-section-header ${level}">${icon} ${label} (${rows.length})</div>${rows.map((r) => riskSummaryRow(r, level)).join('')}`;
 }
 
-// One dropdown for one filter axis — a row of pills got long with two
-// axes side by side, a <select> says the same thing in one line. Each
-// <option>'s count is faceted, not fixed at render time — it recomputes
-// live as the OTHER axis's selection changes (see updateRiskFilterCounts
-// in wireRiskSummaryRegion), so "Industry" under Type of Risk shows
-// however many industry risks match whatever Priority is currently
-// selected, not a fixed number frozen at render time.
-const RISK_FILTER_SELECT_STYLE = 'padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:12px; font-family:var(--font-mono); background:var(--paper-raised); color:var(--ink); width:100%;';
+// One row of pills for one filter axis. The count in each pill is faceted
+// — it recomputes live as the OTHER axis's selection changes (see
+// updateRiskFilterCounts in wireRiskSummaryRegion), so "Industry" under
+// Type of Risk shows however many industry risks match whatever Priority
+// is currently selected, not a fixed number frozen at render time. The
+// count sits in its own span so it can be updated in place without
+// touching the icon/label text. "All" always sits first and starts active.
 function riskFilterAxis(axisLabel, axis, options) {
   const allCount = options.reduce((sum, o) => sum + o.count, 0);
   return `
-    <div style="flex:1 1 160px; min-width:0;">
-      <p class="muted" style="margin:0 0 4px;">${axisLabel}</p>
-      <select class="risk-filter-select" data-filter-axis="${axis}" style="${RISK_FILTER_SELECT_STYLE}">
-        <option value="all" data-prefix="All">All (${allCount})</option>
-        ${options.map((o) => `<option value="${o.value}" data-prefix="${o.icon ? o.icon + ' ' : ''}${o.label}">${o.icon ? o.icon + ' ' : ''}${o.label} (${o.count})</option>`).join('')}
-      </select>
+    <p class="muted" style="margin:14px 0 4px;">${axisLabel}</p>
+    <div style="display:flex; gap:6px; flex-wrap:wrap;">
+      <button type="button" class="risk-filter-pill active" data-filter-axis="${axis}" data-filter-value="all">All <span class="risk-filter-count">(${allCount})</span></button>
+      ${options.map((o) => `<button type="button" class="risk-filter-pill" data-filter-axis="${axis}" data-filter-value="${o.value}">${o.icon ? o.icon + ' ' : ''}${o.label} <span class="risk-filter-count">(${o.count})</span></button>`).join('')}
     </div>
   `;
 }
@@ -3543,18 +3540,16 @@ function renderRiskRollupContent(rollup) {
         <button type="button" class="mini-link" style="margin-left:0;" id="risk-ai-summary-btn">✨ Generate AI summary</button>
         <div id="risk-ai-summary-content" style="display:none; margin-top:6px;"></div>
       </div>
-      <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:14px;">
-        ${riskFilterAxis('Priority', 'level', [
-          { value: 'High', icon: '🔴', label: 'High', count: rollup.buckets.High.length },
-          { value: 'Medium', icon: '🟠', label: 'Medium', count: rollup.buckets.Medium.length },
-          { value: 'Managed', icon: '🟢', label: 'Managed', count: rollup.managed.length },
-        ])}
-        ${riskFilterAxis('Type of Risk', 'source', [
-          { value: 'financial', icon: '📊', label: 'Financial', count: rollup.counts.financial },
-          { value: 'business', icon: '🧑', label: 'Business', count: rollup.counts.business },
-          { value: 'industry', icon: '🏭', label: 'Industry', count: rollup.counts.industry },
-        ])}
-      </div>
+      ${riskFilterAxis('Priority', 'level', [
+        { value: 'High', icon: '🔴', label: 'High', count: rollup.buckets.High.length },
+        { value: 'Medium', icon: '🟠', label: 'Medium', count: rollup.buckets.Medium.length },
+        { value: 'Managed', icon: '🟢', label: 'Managed', count: rollup.managed.length },
+      ])}
+      ${riskFilterAxis('Type of Risk', 'source', [
+        { value: 'financial', icon: '📊', label: 'Financial', count: rollup.counts.financial },
+        { value: 'business', icon: '🧑', label: 'Business', count: rollup.counts.business },
+        { value: 'industry', icon: '🏭', label: 'Industry', count: rollup.counts.industry },
+      ])}
       <div id="risk-summary-sections" style="margin-top:10px;">
         ${riskSummarySection('🔴', 'High priority', 'High', rollup.buckets.High)}
         ${riskSummarySection('🟠', 'Medium priority', 'Medium', rollup.buckets.Medium)}
@@ -3673,24 +3668,20 @@ function wireRiskSummaryRegion(rollup) {
   let activeSource = 'all';
   const rows = () => [...summaryEl.querySelectorAll('.risk-summary-row')];
   const updateRiskFilterCounts = () => {
-    const levelSelect = summaryEl.querySelector('select[data-filter-axis="level"]');
-    if (levelSelect) {
-      [...levelSelect.options].forEach((opt) => {
-        const count = rows().filter((row) =>
-          (opt.value === 'all' || row.dataset.level === opt.value) && (activeSource === 'all' || row.dataset.source === activeSource)
-        ).length;
-        opt.textContent = `${opt.dataset.prefix} (${count})`;
-      });
-    }
-    const sourceSelect = summaryEl.querySelector('select[data-filter-axis="source"]');
-    if (sourceSelect) {
-      [...sourceSelect.options].forEach((opt) => {
-        const count = rows().filter((row) =>
-          (opt.value === 'all' || row.dataset.source === opt.value) && (activeLevel === 'all' || row.dataset.level === activeLevel)
-        ).length;
-        opt.textContent = `${opt.dataset.prefix} (${count})`;
-      });
-    }
+    summaryEl.querySelectorAll('.risk-filter-pill[data-filter-axis="level"]').forEach((pill) => {
+      const value = pill.dataset.filterValue;
+      const count = rows().filter((row) =>
+        (value === 'all' || row.dataset.level === value) && (activeSource === 'all' || row.dataset.source === activeSource)
+      ).length;
+      pill.querySelector('.risk-filter-count').textContent = `(${count})`;
+    });
+    summaryEl.querySelectorAll('.risk-filter-pill[data-filter-axis="source"]').forEach((pill) => {
+      const value = pill.dataset.filterValue;
+      const count = rows().filter((row) =>
+        (value === 'all' || row.dataset.source === value) && (activeLevel === 'all' || row.dataset.level === activeLevel)
+      ).length;
+      pill.querySelector('.risk-filter-count').textContent = `(${count})`;
+    });
   };
   const applyRiskFilters = () => {
     rows().forEach((row) => {
@@ -3709,10 +3700,12 @@ function wireRiskSummaryRegion(rollup) {
     });
     updateRiskFilterCounts();
   };
-  summaryEl.querySelectorAll('.risk-filter-select').forEach((select) => {
-    select.onchange = () => {
-      const axis = select.dataset.filterAxis;
-      if (axis === 'level') activeLevel = select.value; else activeSource = select.value;
+  summaryEl.querySelectorAll('.risk-filter-pill').forEach((pill) => {
+    pill.onclick = () => {
+      const axis = pill.dataset.filterAxis;
+      const value = pill.dataset.filterValue;
+      summaryEl.querySelectorAll(`.risk-filter-pill[data-filter-axis="${axis}"]`).forEach((p) => p.classList.toggle('active', p === pill));
+      if (axis === 'level') activeLevel = value; else activeSource = value;
       applyRiskFilters();
     };
   });
