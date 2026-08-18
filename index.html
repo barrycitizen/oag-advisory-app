@@ -3335,7 +3335,15 @@ function isQuietNoRiskRow(r) {
   return r.source === 'business' && !r.recommendation;
 }
 
-function riskItemRow(r) {
+function riskItemRow(r, opts = {}) {
+  // Off by default: the same risk_items row gets rendered twice on the
+  // page (once here, once hidden inside the summary's click-to-expand
+  // panel — see riskSummaryRow) and the row id/edit button only make
+  // sense — and only need to be unique — in ONE of those places at a
+  // time. Only renderBusinessHistoryGrouped passes editable:true, since
+  // that's the one read-only list an accountant would actually click
+  // "Edit answer" from.
+  const editable = opts.editable === true;
   if (isQuietNoRiskRow(r)) {
     // Includes WHICH question this answered (r.detail holds the literal
     // question text for the no-risk branch, see submitQuestionAnswer) —
@@ -3344,12 +3352,13 @@ function riskItemRow(r) {
     // reviewed, no risk identified" repeated with no way to tell them
     // apart or know whether every question's actually been covered.
     return `
-      <div class="flag-row-wrap">
+      <div class="flag-row-wrap"${editable ? ` id="risk-row-${r.id}"` : ''}>
         <div class="flag-row" style="align-items:flex-start;">
           <span class="flag-dot sage" style="margin-top:5px;"></span>
           <div style="flex:1; min-width:0;">
             <span class="muted plain" style="margin:0;">No risk${r.last_reviewed_date ? ` <span style="font-size:11px;">(${formatShortDate(r.last_reviewed_date)})</span>` : ''}</span>
             ${r.detail ? `<p class="muted plain" style="margin:2px 0 0; font-size:12px;">${r.detail}</p>` : ''}
+            ${editable && r.question_id ? `<button type="button" class="mini-link" style="margin-top:4px;" data-edit-risk-row-id="${r.id}" data-edit-question-id="${r.question_id}" data-edit-category="${escAttr(r.category || '')}">Edit answer</button>` : ''}
           </div>
         </div>
       </div>
@@ -3749,7 +3758,7 @@ function renderBusinessHistoryGrouped(rows) {
     </div>
     ${categories.map((cat) => `
       <div class="card" id="biz-history-${escAttr(cat)}" style="display:none;">
-        ${byCategory[cat].map(riskItemRow).join('')}
+        ${byCategory[cat].map((r) => riskItemRow(r, { editable: true })).join('')}
       </div>
     `).join('')}
   `;
@@ -3763,6 +3772,36 @@ function wireBusinessHistoryPills() {
       const willOpen = body.style.display === 'none';
       body.style.display = willOpen ? 'block' : 'none';
       pill.classList.toggle('active', willOpen);
+    };
+  });
+}
+
+// Lets an accountant reopen an already-answered question straight from the
+// read-only history — needed because a "no risk identified" row otherwise
+// has no way back to it: it only resurfaces in the due-for-review section
+// once it goes stale or the answer indicates an open risk (see
+// getCategoriesForReview). Reuses the exact same shell + wiring as the
+// live due-for-review flow (renderBusinessQuestionShell / wireBusinessQuestion)
+// so answering again — including AI synthesis if the new answer indicates
+// risk — behaves identically either way. questionsById comes from
+// get_risk_items' allQuestions (every active question, not just ones due
+// this cycle), since the row itself only carries risk_if_yes implicitly.
+function wireRiskAnswerEdit(questionsById) {
+  document.querySelectorAll('[data-edit-risk-row-id]').forEach((btn) => {
+    btn.onclick = () => {
+      const q = questionsById[btn.dataset.editQuestionId];
+      const category = btn.dataset.editCategory;
+      const rowId = btn.dataset.editRiskRowId;
+      const rowEl = document.getElementById(`risk-row-${rowId}`);
+      if (!q || !rowEl) { alert('Could not find this question — try reloading.'); return; }
+      // Keyed by the risk_items row id, not q.id — this same question may
+      // simultaneously have a shell already on the page in the
+      // due-for-review section (if it's also due this cycle), and a
+      // shared key would make wireBusinessQuestion bind to whichever one
+      // happens to come first in the DOM instead of this one.
+      const domKey = `edit-${rowId}`;
+      rowEl.outerHTML = renderBusinessQuestionShell(q, { domKey });
+      wireBusinessQuestion(q, category, { domKey });
     };
   });
 }
@@ -3801,22 +3840,31 @@ function wireRiskSectionToggle(id) {
 // when answered in its risk-indicating direction. Kept as its own card per
 // category so leaving mid-review doesn't lose progress on questions
 // already answered.
-function renderBusinessQuestionShell(q) {
+// domKey defaults to the question's own id, which is fine as long as this
+// question is only ever rendered as a shell in ONE place at a time. That
+// breaks the moment a question is both due for review (rendered here via
+// renderBusinessReviewCategory) AND being re-opened from the read-only
+// history's "Edit answer" (see wireRiskAnswerEdit) — same q.id, two shells
+// on the page, colliding ids. wireRiskAnswerEdit passes a distinct domKey
+// (based on the risk_items row id, not the question id) to keep its shell
+// independently addressable.
+function renderBusinessQuestionShell(q, opts = {}) {
+  const key = opts.domKey || q.id;
   return `
-    <div id="biz-q-${q.id}" style="margin-top:10px; padding-top:10px; border-top:1px solid var(--line);">
+    <div id="biz-q-${key}" style="margin-top:10px; padding-top:10px; border-top:1px solid var(--line);">
       <div style="display:flex; align-items:baseline; justify-content:space-between; gap:8px;">
         <p class="muted plain" style="margin:0;">${q.question_text}</p>
-        <button type="button" class="mini-link" style="margin-left:0; flex-shrink:0;" id="biz-q-delete-${q.id}">Delete</button>
+        <button type="button" class="mini-link" style="margin-left:0; flex-shrink:0;" id="biz-q-delete-${key}">Delete</button>
       </div>
-      <div id="biz-q-buttons-${q.id}" style="display:flex; gap:8px; margin-top:6px;">
+      <div id="biz-q-buttons-${key}" style="display:flex; gap:8px; margin-top:6px;">
         <button type="button" class="action secondary biz-q-btn" data-value="true">Yes</button>
         <button type="button" class="action secondary biz-q-btn" data-value="false">No</button>
       </div>
-      <div id="biz-q-notes-field-${q.id}" style="display:none; margin-top:8px;">
-        <textarea id="biz-q-notes-${q.id}" rows="2" placeholder="Notes…"></textarea>
-        <button type="button" class="action" id="biz-q-save-${q.id}" style="margin-top:8px;">Save</button>
+      <div id="biz-q-notes-field-${key}" style="display:none; margin-top:8px;">
+        <textarea id="biz-q-notes-${key}" rows="2" placeholder="Notes…"></textarea>
+        <button type="button" class="action" id="biz-q-save-${key}" style="margin-top:8px;">Save</button>
       </div>
-      <div id="biz-q-result-${q.id}" style="display:none; margin-top:8px;"></div>
+      <div id="biz-q-result-${key}" style="display:none; margin-top:8px;"></div>
     </div>
   `;
 }
@@ -3849,13 +3897,14 @@ function renderBusinessReviewCategory(c) {
 // Edit link. Standalone (not nested in renderRiskAnalyse) so a freshly
 // added question (see wireAddQuestionForm) can be wired the same way
 // without re-rendering the whole tab.
-function wireBusinessQuestion(q, category) {
-  const buttonsEl = document.getElementById(`biz-q-buttons-${q.id}`);
-  const notesFieldEl = document.getElementById(`biz-q-notes-field-${q.id}`);
-  const notesInput = document.getElementById(`biz-q-notes-${q.id}`);
-  const saveBtn = document.getElementById(`biz-q-save-${q.id}`);
-  const resultEl = document.getElementById(`biz-q-result-${q.id}`);
-  const deleteBtn = document.getElementById(`biz-q-delete-${q.id}`);
+function wireBusinessQuestion(q, category, opts = {}) {
+  const key = opts.domKey || q.id;
+  const buttonsEl = document.getElementById(`biz-q-buttons-${key}`);
+  const notesFieldEl = document.getElementById(`biz-q-notes-field-${key}`);
+  const notesInput = document.getElementById(`biz-q-notes-${key}`);
+  const saveBtn = document.getElementById(`biz-q-save-${key}`);
+  const resultEl = document.getElementById(`biz-q-result-${key}`);
+  const deleteBtn = document.getElementById(`biz-q-delete-${key}`);
 
   const submitAnswer = async (answer, notes) => {
     const res = await fetch('/.netlify/functions/manual-entry', {
@@ -3875,9 +3924,9 @@ function wireBusinessQuestion(q, category) {
     buttonsEl.style.display = 'none';
     notesFieldEl.style.display = 'none';
     resultEl.style.display = 'block';
-    resultEl.innerHTML = riskItemRow(item)
-      + `<button type="button" class="mini-link" style="margin-top:6px;" id="biz-q-edit-${q.id}">Edit this answer</button>`;
-    document.getElementById(`biz-q-edit-${q.id}`).onclick = () => {
+    resultEl.innerHTML = riskItemRow(item, { editable: false })
+      + `<button type="button" class="mini-link" style="margin-top:6px;" id="biz-q-edit-${key}">Edit this answer</button>`;
+    document.getElementById(`biz-q-edit-${key}`).onclick = () => {
       // Notes (if any were typed) were only ever hidden, never cleared —
       // still there if this question goes back through the risk-present
       // branch. Re-saving re-runs submitQuestionAnswer, which deletes only
@@ -3940,7 +3989,7 @@ function wireBusinessQuestion(q, category) {
       });
       const result = await res.json();
       if (result.error) throw new Error(result.error);
-      document.getElementById(`biz-q-${q.id}`).remove();
+      document.getElementById(`biz-q-${key}`).remove();
     } catch (err) {
       deleteBtn.disabled = false;
       alert('Error: ' + err.message);
@@ -4005,7 +4054,13 @@ async function refreshRiskLists() {
   const financialEl = document.getElementById('risk-financial-region');
   if (financialEl) financialEl.innerHTML = renderRiskItemsCard(data.financial || []);
   const businessListEl = document.getElementById('risk-business-list-region');
-  if (businessListEl) { businessListEl.innerHTML = renderBusinessHistoryGrouped(data.business || []); wireBusinessHistoryPills(); }
+  if (businessListEl) {
+    businessListEl.innerHTML = renderBusinessHistoryGrouped(data.business || []);
+    wireBusinessHistoryPills();
+    const questionsById = {};
+    (data.allQuestions || []).forEach((q) => { questionsById[q.id] = q; });
+    wireRiskAnswerEdit(questionsById);
+  }
   const industryEl = document.getElementById('risk-industry-region');
   if (industryEl) industryEl.innerHTML = renderRiskItemsCard(data.industry || []);
 
@@ -4065,6 +4120,11 @@ async function renderRiskAnalyse(content) {
 
   wireRiskSummaryRegion(rollup);
   wireBusinessHistoryPills();
+  {
+    const questionsById = {};
+    (data.allQuestions || []).forEach((q) => { questionsById[q.id] = q; });
+    wireRiskAnswerEdit(questionsById);
+  }
   ['financial', 'business', 'industry'].forEach(wireRiskSectionToggle);
 
   // Only the first category's card starts open (matches what used to be

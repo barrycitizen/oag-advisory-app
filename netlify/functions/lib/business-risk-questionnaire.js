@@ -122,15 +122,20 @@ async function seedQuestions(supabase) {
 // A category qualifies if ANY of its questions has never been asked, is
 // stale (>12mo since last reviewed), or is a currently open risk (Watch/
 // Identified) worth a status check regardless of age.
-async function getCategoriesForReview(supabase, clientId) {
+async function getAllActiveQuestions(supabase) {
   const { data: questions, error } = await supabase
     .from('risk_questions')
     .select('id, category, question_text, risk_if_yes')
     .eq('active', true).order('category').order('sort_order');
   if (error) throw error;
+  return questions || [];
+}
+
+async function getCategoriesForReview(supabase, clientId) {
+  const questions = await getAllActiveQuestions(supabase);
 
   const byCategory = {};
-  (questions || []).forEach((q) => { (byCategory[q.category] = byCategory[q.category] || []).push(q); });
+  questions.forEach((q) => { (byCategory[q.category] = byCategory[q.category] || []).push(q); });
 
   const { data: allRows } = await supabase
     .from('risk_items')
@@ -281,6 +286,7 @@ async function deleteQuestion(supabase, { questionId }) {
 module.exports = {
   seedQuestions,
   getCategoriesForReview,
+  getAllActiveQuestions,
   submitQuestionAnswer,
   addQuestion,
   deleteQuestion,

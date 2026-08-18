@@ -7,7 +7,7 @@
 
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const { getCategoriesForReview } = require('./lib/business-risk-questionnaire');
+const { getCategoriesForReview, getAllActiveQuestions } = require('./lib/business-risk-questionnaire');
 
 exports.handler = async (event) => {
   try {
@@ -369,14 +369,23 @@ exports.handler = async (event) => {
       // list (see business-risk-questionnaire.js) — no separate
       // per-category follow-up fetch needed now that there's no anchor/
       // follow-up split.
+      // allQuestions is every active question regardless of due-for-review
+      // status — the frontend needs each question's risk_if_yes to let an
+      // accountant re-open and edit an already-answered question (e.g. a
+      // "no risk identified" row) that isn't currently due, since due-for-
+      // review only carries questions that need attention this cycle.
       let categoriesToReview = [];
+      let allQuestions = [];
       try {
-        categoriesToReview = await getCategoriesForReview(supabase, client_id);
+        [categoriesToReview, allQuestions] = await Promise.all([
+          getCategoriesForReview(supabase, client_id),
+          getAllActiveQuestions(supabase),
+        ]);
       } catch (err) {
         console.error('getCategoriesForReview failed:', err.message);
       }
 
-      return { statusCode: 200, body: JSON.stringify({ financial: financial || [], industry: industry || [], business: business || [], categoriesToReview }) };
+      return { statusCode: 200, body: JSON.stringify({ financial: financial || [], industry: industry || [], business: business || [], categoriesToReview, allQuestions }) };
     }
 
     if (action === 'get_report_data') {
