@@ -3491,17 +3491,20 @@ function riskSummarySection(icon, label, level, rows) {
   return `<div class="risk-section-header ${level}">${icon} ${label} (${rows.length})</div>${rows.map((r) => riskSummaryRow(r, level)).join('')}`;
 }
 
-// One row of pills for one filter axis — the count IS the pill label now,
-// not a separate disconnected number above the pills (that's what the old
-// static "numbers at top" were, with no way to act on them). "All" always
-// sits first and starts active.
+// One row of pills for one filter axis. The count in each pill is faceted
+// — it recomputes live as the OTHER axis's selection changes (see
+// updateRiskFilterCounts in wireRiskSummaryRegion), so "Industry" under
+// Type of Risk shows however many industry risks match whatever Priority
+// is currently selected, not a fixed number frozen at render time. The
+// count sits in its own span so it can be updated in place without
+// touching the icon/label text. "All" always sits first and starts active.
 function riskFilterAxis(axisLabel, axis, options) {
   const allCount = options.reduce((sum, o) => sum + o.count, 0);
   return `
     <p class="muted" style="margin:14px 0 4px;">${axisLabel}</p>
     <div style="display:flex; gap:6px; flex-wrap:wrap;">
-      <button type="button" class="risk-filter-pill active" data-filter-axis="${axis}" data-filter-value="all">All (${allCount})</button>
-      ${options.map((o) => `<button type="button" class="risk-filter-pill" data-filter-axis="${axis}" data-filter-value="${o.value}">${o.icon ? o.icon + ' ' : ''}${o.label} (${o.count})</button>`).join('')}
+      <button type="button" class="risk-filter-pill active" data-filter-axis="${axis}" data-filter-value="all">All <span class="risk-filter-count">(${allCount})</span></button>
+      ${options.map((o) => `<button type="button" class="risk-filter-pill" data-filter-axis="${axis}" data-filter-value="${o.value}">${o.icon ? o.icon + ' ' : ''}${o.label} <span class="risk-filter-count">(${o.count})</span></button>`).join('')}
     </div>
   `;
 }
@@ -3519,12 +3522,16 @@ function renderRiskRollupContent(rollup) {
       <p class="muted" style="margin:0 0 6px;">Overall Risk</p>
       <div class="risk-overall-pill ${rollup.level}">${levelIcon} ${rollup.level}</div>
       ${bits.length ? `<p class="muted plain" style="margin:8px 0 0; font-size:12px;">${bits.join(' · ')} this cycle</p>` : ''}
+      <div style="margin-top:10px;">
+        <button type="button" class="mini-link" style="margin-left:0;" id="risk-ai-summary-btn">✨ Generate AI summary</button>
+        <div id="risk-ai-summary-content" style="display:none; margin-top:6px;"></div>
+      </div>
       ${riskFilterAxis('Priority', 'level', [
         { value: 'High', icon: '🔴', label: 'High', count: rollup.buckets.High.length },
         { value: 'Medium', icon: '🟠', label: 'Medium', count: rollup.buckets.Medium.length },
         { value: 'Managed', icon: '🟢', label: 'Managed', count: rollup.managed.length },
       ])}
-      ${riskFilterAxis('Source', 'source', [
+      ${riskFilterAxis('Type of Risk', 'source', [
         { value: 'financial', icon: '📊', label: 'Financial', count: rollup.counts.financial },
         { value: 'business', icon: '🧑', label: 'Business', count: rollup.counts.business },
         { value: 'industry', icon: '🏭', label: 'Industry', count: rollup.counts.industry },
@@ -3558,7 +3565,7 @@ function renderRiskRollupBanner(rollup) {
 // section), and click-to-expand on every summary row. Called after both
 // the initial render and every refreshRiskLists() call, since
 // summary-region's innerHTML gets replaced wholesale each time.
-function wireRiskSummaryRegion() {
+function wireRiskSummaryRegion(rollup) {
   const summaryEl = document.getElementById('risk-summary-region');
   if (!summaryEl) return;
 
@@ -3579,6 +3586,40 @@ function wireRiskSummaryRegion() {
     };
   }
 
+  // AI narrative over the top risks — deliberately on-demand (a click), not
+  // generated automatically on every page load, same reasoning as
+  // Financial Performance's "Run analysis" being a button rather than
+  // running on every visit: an AI call per page view would be wasteful
+  // when nothing's necessarily changed. Not persisted anywhere — there's
+  // no natural home for it in the schema, and it goes stale the moment any
+  // risk changes anyway, so regenerating fresh on request is simpler than
+  // caching something that needs invalidating constantly.
+  const aiSummaryBtn = document.getElementById('risk-ai-summary-btn');
+  if (aiSummaryBtn && rollup) {
+    aiSummaryBtn.onclick = async () => {
+      aiSummaryBtn.disabled = true;
+      aiSummaryBtn.textContent = 'Generating…';
+      try {
+        const risks = [...rollup.buckets.High, ...rollup.buckets.Medium]
+          .map((r) => ({ risk_name: r.risk_name, severity: r.severity, source: r.source, category: r.category, detail: r.detail }));
+        const res = await fetch('/.netlify/functions/risk-summary', {
+          method: 'POST',
+          body: JSON.stringify({ risks, managedCount: rollup.managed.length }),
+        });
+        const result = await res.json();
+        if (result.error) throw new Error(result.error);
+        const contentEl = document.getElementById('risk-ai-summary-content');
+        contentEl.style.display = 'block';
+        contentEl.innerHTML = `<p class="muted plain" style="margin:0; font-style:italic;">${result.summary}</p>`;
+        aiSummaryBtn.style.display = 'none';
+      } catch (err) {
+        aiSummaryBtn.disabled = false;
+        aiSummaryBtn.textContent = '✨ Generate AI summary';
+        alert('Error: ' + err.message);
+      }
+    };
+  }
+
   summaryEl.querySelectorAll('.risk-summary-row').forEach((row) => {
     row.onclick = (e) => {
       if (e.target.closest('.risk-action-btn')) return; // let the action button's own handler run, don't also toggle the row
@@ -3590,20 +3631,46 @@ function wireRiskSummaryRegion() {
     };
   });
 
-  // Two independent filter axes (Priority via data-level, Source via
+  // Two independent filter axes (Priority via data-level, Type of Risk via
   // data-source) that COMBINE — picking "High" and "Business" shows only
   // High-priority Business risks, not either/or. Instant show/hide, not a
   // re-render (this dataset is small and already fully in the DOM). Each
   // axis's pills only toggle "active" against siblings on the SAME axis
   // (the data-filter-axis scoped query below), so picking a priority
-  // doesn't reset the source selection or vice versa. A section header
-  // hides itself if every row under it got filtered out, so filtering to
-  // "Business" doesn't leave an empty "High priority" heading sitting
-  // above nothing.
+  // doesn't reset the type-of-risk selection or vice versa. A section
+  // header hides itself if every row under it got filtered out, so
+  // filtering to "Business" doesn't leave an empty "High priority" heading
+  // sitting above nothing.
+  //
+  // Each pill's own count is FACETED, not fixed at render time — it always
+  // reflects how many rows would match if you picked it TOGETHER with
+  // whatever's currently active on the other axis, recomputed after every
+  // filter change. "Industry" under Type of Risk showing (4) when Priority
+  // = Medium means 4 industry risks are Medium, not "4 industry risks
+  // total" — the two numbers are different questions, and this always
+  // answers the one that matches what's actually about to happen if you
+  // click it.
   let activeLevel = 'all';
   let activeSource = 'all';
+  const rows = () => [...summaryEl.querySelectorAll('.risk-summary-row')];
+  const updateRiskFilterCounts = () => {
+    summaryEl.querySelectorAll('.risk-filter-pill[data-filter-axis="level"]').forEach((pill) => {
+      const value = pill.dataset.filterValue;
+      const count = rows().filter((row) =>
+        (value === 'all' || row.dataset.level === value) && (activeSource === 'all' || row.dataset.source === activeSource)
+      ).length;
+      pill.querySelector('.risk-filter-count').textContent = `(${count})`;
+    });
+    summaryEl.querySelectorAll('.risk-filter-pill[data-filter-axis="source"]').forEach((pill) => {
+      const value = pill.dataset.filterValue;
+      const count = rows().filter((row) =>
+        (value === 'all' || row.dataset.source === value) && (activeLevel === 'all' || row.dataset.level === activeLevel)
+      ).length;
+      pill.querySelector('.risk-filter-count').textContent = `(${count})`;
+    });
+  };
   const applyRiskFilters = () => {
-    summaryEl.querySelectorAll('.risk-summary-row').forEach((row) => {
+    rows().forEach((row) => {
       const matchesLevel = activeLevel === 'all' || row.dataset.level === activeLevel;
       const matchesSource = activeSource === 'all' || row.dataset.source === activeSource;
       row.style.display = (matchesLevel && matchesSource) ? '' : 'none';
@@ -3617,6 +3684,7 @@ function wireRiskSummaryRegion() {
       }
       header.style.display = anyVisible ? '' : 'none';
     });
+    updateRiskFilterCounts();
   };
   summaryEl.querySelectorAll('.risk-filter-pill').forEach((pill) => {
     pill.onclick = () => {
@@ -3851,7 +3919,7 @@ async function refreshRiskLists() {
   const industryEl = document.getElementById('risk-industry-region');
   if (industryEl) industryEl.innerHTML = renderRiskItemsCard(data.industry || []);
 
-  wireRiskSummaryRegion();
+  wireRiskSummaryRegion(rollup);
 }
 
 async function renderRiskAnalyse(content) {
@@ -3885,7 +3953,7 @@ async function renderRiskAnalyse(content) {
     <div id="risk-industry-region">${renderRiskItemsCard(data.industry || [])}</div>
   `;
 
-  wireRiskSummaryRegion();
+  wireRiskSummaryRegion(rollup);
 
   categoriesToReview.forEach((c) => {
     c.questions.forEach((q) => wireBusinessQuestion(q, c.category));
