@@ -3337,11 +3337,20 @@ function isQuietNoRiskRow(r) {
 
 function riskItemRow(r) {
   if (isQuietNoRiskRow(r)) {
+    // Includes WHICH question this answered (r.detail holds the literal
+    // question text for the no-risk branch, see submitQuestionAnswer) —
+    // a category can have 2-3 separate questions each land here, and
+    // without the question text every line just reads as "Category —
+    // reviewed, no risk identified" repeated with no way to tell them
+    // apart or know whether every question's actually been covered.
     return `
       <div class="flag-row-wrap">
-        <div class="flag-row">
-          <span class="flag-dot sage"></span>
-          <span class="muted plain" style="margin:0;">${businessCategoryLabel(r.category)} — reviewed, no risk identified${r.last_reviewed_date ? ` <span style="font-size:11px;">(${formatShortDate(r.last_reviewed_date)})</span>` : ''}</span>
+        <div class="flag-row" style="align-items:flex-start;">
+          <span class="flag-dot sage" style="margin-top:5px;"></span>
+          <div style="flex:1; min-width:0;">
+            <span class="muted plain" style="margin:0;">No risk${r.last_reviewed_date ? ` <span style="font-size:11px;">(${formatShortDate(r.last_reviewed_date)})</span>` : ''}</span>
+            ${r.detail ? `<p class="muted plain" style="margin:2px 0 0; font-size:12px;">${r.detail}</p>` : ''}
+          </div>
         </div>
       </div>
     `;
@@ -3719,6 +3728,45 @@ function renderRiskItemsCard(rows) {
   `;
 }
 
+// Business's read-only history, grouped by category instead of one flat
+// list — a category with 3 questions writes 3 separate rows (see
+// submitQuestionAnswer), so a flat list means "Cash & Funding" (or any
+// multi-question category) shows up 2-3 times in a row with nothing
+// visually distinguishing WHICH question each line is, which is exactly
+// what made "how do you know everything is complete" impossible to answer
+// from the old flat version. Grouped, each category is one small pill
+// showing how many items are filed under it — click to open just that
+// group, same multi-open pill pattern as the due-for-review picker above
+// it, not locked to one category at a time and not one big box per group.
+function renderBusinessHistoryGrouped(rows) {
+  if (!rows.length) return `<div class="card"><p class="muted plain" style="margin:0;">Nothing on file yet.</p></div>`;
+  const byCategory = {};
+  rows.forEach((r) => { (byCategory[r.category] = byCategory[r.category] || []).push(r); });
+  const categories = Object.keys(byCategory).sort((a, b) => businessCategoryLabel(a).localeCompare(businessCategoryLabel(b)));
+  return `
+    <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;">
+      ${categories.map((cat) => `<button type="button" class="risk-filter-pill" data-biz-history-pill="${escAttr(cat)}">${businessCategoryLabel(cat)} <span class="risk-filter-count">(${byCategory[cat].length})</span></button>`).join('')}
+    </div>
+    ${categories.map((cat) => `
+      <div class="card" id="biz-history-${escAttr(cat)}" style="display:none;">
+        ${byCategory[cat].map(riskItemRow).join('')}
+      </div>
+    `).join('')}
+  `;
+}
+function wireBusinessHistoryPills() {
+  document.querySelectorAll('[data-biz-history-pill]').forEach((pill) => {
+    pill.onclick = () => {
+      const cat = pill.dataset.bizHistoryPill;
+      const body = document.getElementById(`biz-history-${cat}`);
+      if (!body) return;
+      const willOpen = body.style.display === 'none';
+      body.style.display = willOpen ? 'block' : 'none';
+      pill.classList.toggle('active', willOpen);
+    };
+  });
+}
+
 // A clickable header (same chevron-toggle pattern as the cash reconciliation
 // panels) that collapses/expands everything under it — for Financial and
 // Industry that's just the read-only list, for Business it's the
@@ -3957,7 +4005,7 @@ async function refreshRiskLists() {
   const financialEl = document.getElementById('risk-financial-region');
   if (financialEl) financialEl.innerHTML = renderRiskItemsCard(data.financial || []);
   const businessListEl = document.getElementById('risk-business-list-region');
-  if (businessListEl) businessListEl.innerHTML = renderRiskItemsCard(data.business || []);
+  if (businessListEl) { businessListEl.innerHTML = renderBusinessHistoryGrouped(data.business || []); wireBusinessHistoryPills(); }
   const industryEl = document.getElementById('risk-industry-region');
   if (industryEl) industryEl.innerHTML = renderRiskItemsCard(data.industry || []);
 
@@ -3976,16 +4024,16 @@ async function renderRiskAnalyse(content) {
   const categoriesToReview = data.categoriesToReview || [];
   // Due for review can be up to all 8 categories stacked at once (People,
   // Customers, Suppliers, Operations, Cash & Funding, Legal, Insurance,
-  // Technology) — a picker shows just one at a time instead of all of them
-  // down the page; the rest stay in the DOM (just hidden), not re-fetched,
-  // so switching between them is instant.
+  // Technology) — small pills toggle each category's card independently
+  // (not a single-select — more than one can be open at once if you want
+  // to compare two side by side), rather than always showing all 8 or
+  // being locked to viewing exactly one. Cards stay in the DOM either way
+  // (just hidden when their pill isn't active), so toggling is instant.
   const categoryPickerHtml = categoriesToReview.length > 1
     ? `
-      <div class="form-field" style="max-width:280px;">
-        <label>Category (${categoriesToReview.length} due for review)</label>
-        <select id="biz-category-picker" style="padding:8px 10px; border:1px solid var(--line); border-radius:6px; font-family:var(--font-body); background:var(--paper-raised); color:var(--ink); font-size:13px;">
-          ${categoriesToReview.map((c) => `<option value="${escAttr(c.category)}">${businessCategoryLabel(c.category)} (${c.questions.length})</option>`).join('')}
-        </select>
+      <p class="muted" style="margin:0 0 6px;">${categoriesToReview.length} categories due for review — click to open</p>
+      <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;">
+        ${categoriesToReview.map((c, i) => `<button type="button" class="risk-filter-pill${i === 0 ? ' active' : ''}" data-biz-cat-pill="${escAttr(c.category)}">${businessCategoryLabel(c.category)} (${c.questions.length})</button>`).join('')}
       </div>
     `
     : (categoriesToReview.length === 1
@@ -4007,7 +4055,7 @@ async function renderRiskAnalyse(content) {
     ${riskSectionHeader('business', '🧑', RISK_SOURCE_META.business.label, RISK_SOURCE_META.business.hint)}
     <div id="risk-section-body-business" style="margin-top:8px;">
       <div id="risk-business-review-region">${reviewHtml}</div>
-      <div id="risk-business-list-region">${renderRiskItemsCard(data.business || [])}</div>
+      <div id="risk-business-list-region">${renderBusinessHistoryGrouped(data.business || [])}</div>
     </div>
     ${riskSectionHeader('industry', '🏭', RISK_SOURCE_META.industry.label, RISK_SOURCE_META.industry.hint)}
     <div id="risk-section-body-industry" style="margin-top:8px;">
@@ -4016,18 +4064,27 @@ async function renderRiskAnalyse(content) {
   `;
 
   wireRiskSummaryRegion(rollup);
+  wireBusinessHistoryPills();
   ['financial', 'business', 'industry'].forEach(wireRiskSectionToggle);
 
-  const categoryPicker = document.getElementById('biz-category-picker');
-  if (categoryPicker) {
-    const showOnlyCategory = (category) => {
-      categoriesToReview.forEach((c) => {
-        const card = document.getElementById(`biz-cat-${c.category}`);
-        if (card) card.style.display = (c.category === category) ? 'block' : 'none';
-      });
-    };
-    showOnlyCategory(categoriesToReview[0].category);
-    categoryPicker.onchange = () => showOnlyCategory(categoryPicker.value);
+  // Only the first category's card starts open (matches what used to be
+  // the single-select default) — click a pill to open/close ITS OWN card
+  // without affecting any others already open.
+  if (categoriesToReview.length) {
+    categoriesToReview.forEach((c, i) => {
+      const card = document.getElementById(`biz-cat-${c.category}`);
+      if (card) card.style.display = i === 0 ? 'block' : 'none';
+    });
+    document.querySelectorAll('[data-biz-cat-pill]').forEach((pill) => {
+      pill.onclick = () => {
+        const category = pill.dataset.bizCatPill;
+        const card = document.getElementById(`biz-cat-${category}`);
+        if (!card) return;
+        const willOpen = card.style.display === 'none';
+        card.style.display = willOpen ? 'block' : 'none';
+        pill.classList.toggle('active', willOpen);
+      };
+    });
   }
 
   categoriesToReview.forEach((c) => {
