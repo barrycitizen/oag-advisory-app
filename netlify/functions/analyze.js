@@ -130,13 +130,61 @@ function runFlags(fs, priorFs, ratios, priorRatios) {
   return flags;
 }
 
+// Risk pillar score — starts at 10, docked per open risk, weighted by
+// severity. Two sources, since risk_items isn't fully populated yet at
+// this point in the handler: financial's flags come straight from
+// runFlags() (in-memory, this period's fresh signals — risk_items'
+// financial rows haven't been written yet, see syncFinancialRiskItems
+// below), business/industry come from a risk_items query the caller
+// fetches up front. Only ACTIVE-status business/industry rows count —
+// Managed/Not applicable are resolved, they shouldn't keep dragging the
+// score down. -2 for a high-severity open risk, -1 for medium, floored at
+// 0 rather than allowed to go negative for a client with a long risk list.
+// Deliberately not saved anywhere new — same 0-10 range the other pillars
+// already use, read straight off risk_items/flags each time analysis runs
+// so it can't drift out of sync with what Risk Review is actually showing.
+const RISK_ACTIVE_STATUSES_FOR_SCORE = new Set(['Detected', 'Identified', 'Watch', 'Unknown']);
+
+// Mirrors index.html's dedupeBusinessToLatestPerCategory — a business
+// category answered in 2025 and reviewed again in 2026 leaves BOTH years'
+// rows on file as history (submitQuestionAnswer only clears the period
+// being saved), so counting every row without this would double-count a
+// risk that's since been re-reviewed and resolved. Industry doesn't need
+// it — those rows are written once and never re-generated per period.
+function dedupeBusinessToLatestPerCategory(rows) {
+  const latestPeriodByCategory = {};
+  rows.forEach((r) => {
+    if (!latestPeriodByCategory[r.category] || r.period_end > latestPeriodByCategory[r.category]) {
+      latestPeriodByCategory[r.category] = r.period_end;
+    }
+  });
+  return rows.filter((r) => r.period_end === latestPeriodByCategory[r.category]);
+}
+
+function scoreRiskPillar(flags, riskItems) {
+  const business = dedupeBusinessToLatestPerCategory((riskItems || []).filter((r) => r.source === 'business'));
+  const industry = (riskItems || []).filter((r) => r.source === 'industry');
+
+  let score = 10;
+  (flags || []).forEach((f) => {
+    score -= (f.severity || '').toLowerCase() === 'danger' ? 2 : 1;
+  });
+  [...business, ...industry]
+    .filter((r) => RISK_ACTIVE_STATUSES_FOR_SCORE.has(r.status))
+    .forEach((r) => {
+      score -= r.severity === 'High' ? 2 : r.severity === 'Medium' ? 1 : 0.5;
+    });
+  return Math.max(0, Math.round(score * 10) / 10);
+}
+
 // Simple 0-10 scoring off ratio thresholds — replace with your own bands over time.
-function scorePillar(pillar, ratios) {
+function scorePillar(pillar, ratios, riskContext) {
   const band = (val, good, ok) => (val == null ? null : val >= good ? 9 : val >= ok ? 6 : 3);
   switch (pillar) {
     case 'profitability': return band(ratios.gp_margin, 0.4, 0.25);
     case 'cash_flow': return band(ratios.current_ratio, 1.5, 1.0);
     case 'tax': return 8; // placeholder until BAS-variance logic is added
+    case 'risk': return scoreRiskPillar(riskContext?.flags, riskContext?.riskItems);
     default: return 6; // placeholder for pillars not yet ratio-driven
   }
 }
@@ -270,11 +318,16 @@ exports.handler = async (event) => {
     const { client_id, period_end } = JSON.parse(event.body || '{}');
     if (!client_id || !period_end) return { statusCode: 400, body: 'client_id and period_end required' };
 
-    const [{ data: fs }, { data: context }, { data: priorFsList }, kpiLibResult] = await Promise.all([
+    const [{ data: fs }, { data: context }, { data: priorFsList }, kpiLibResult, riskItemsResult] = await Promise.all([
       supabase.from('financial_snapshots').select('*').eq('client_id', client_id).eq('period_end', period_end).single(),
       supabase.from('client_context').select('*').eq('client_id', client_id).single(),
       supabase.from('financial_snapshots').select('*').eq('client_id', client_id).lt('period_end', period_end).order('period_end', { ascending: false }).limit(1),
       supabase.from('kpi_library').select('*').eq('active', true).order('sort_order'),
+      // Business/industry only — financial's risk_items rows haven't been
+      // written for THIS period yet (see syncFinancialRiskItems below), so
+      // scoreRiskPillar reads financial straight off the in-memory `flags`
+      // computed a few lines down instead of querying for it here.
+      supabase.from('risk_items').select('source, category, period_end, status, severity').eq('client_id', client_id).in('source', ['business', 'industry']),
     ]);
     if (!fs) throw new Error('No financial snapshot found — run xero-pull first');
 
@@ -282,8 +335,9 @@ exports.handler = async (event) => {
     const priorFs = priorFsList?.[0] || null;
     const priorRatios = priorFs ? computeRatios(priorFs) : null;
     const flags = runFlags(fs, priorFs, ratios, priorRatios);
+    const riskContext = { flags, riskItems: riskItemsResult?.data || [] };
     const activePillars = CADENCE_PILLARS[context?.cadence || 'quarterly'];
-    const scores = activePillars.map((p) => ({ pillar: p, score: scorePillar(p, ratios), active: true }));
+    const scores = activePillars.map((p) => ({ pillar: p, score: scorePillar(p, ratios, riskContext), active: true }));
     const healthScore = Math.round(
       (scores.reduce((sum, s) => sum + (s.score || 0), 0) / (10 * scores.length)) * 100
     );
