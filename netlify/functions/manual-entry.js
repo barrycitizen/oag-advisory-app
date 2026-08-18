@@ -3,7 +3,7 @@ const { randomUUID } = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const { generateIndustryRiskItems } = require('./lib/industry-risk-checklist');
-const { submitAnchorNoRisk, submitFollowUpAnswer } = require('./lib/business-risk-questionnaire');
+const { submitQuestionAnswer, addQuestion, deleteQuestion } = require('./lib/business-risk-questionnaire');
 const { applyReviewAction } = require('./lib/risk-review-actions');
 
 // fy_end is required (not just business_name) because the frontend derives every
@@ -145,21 +145,28 @@ async function saveContext(body) {
 // answered is its own call), not bundled into one category-wide save. See
 // lib/business-risk-questionnaire.js for the anchor/follow-up/resurfacing
 // logic; these just unpack the request body.
-async function saveBusinessAnchorNoRisk(body) {
-  const { client_id, period_end, anchor } = body;
-  if (!client_id || !period_end || !anchor) throw new Error('client_id, period_end and anchor required');
-  return submitAnchorNoRisk(supabase, { clientId: client_id, periodEnd: period_end, anchor });
+// Every question in a category is independent — this handles exactly one,
+// whether or not the answer indicates a risk. `question` carries its own
+// risk_if_yes, since not all questions are phrased the same direction.
+async function saveBusinessQuestionAnswer(body) {
+  const { client_id, period_end, category, question, answer, notes } = body;
+  if (!client_id || !period_end || !category || !question) throw new Error('client_id, period_end, category and question required');
+  if (typeof answer !== 'boolean') throw new Error('answer (boolean) required');
+  return submitQuestionAnswer(supabase, {
+    clientId: client_id, periodEnd: period_end, category, question, answer, notes: notes || '',
+  });
 }
 
-async function saveBusinessFollowUpAnswer(body) {
-  const { client_id, period_end, anchor, question_id, question_text, answer_text } = body;
-  if (!client_id || !period_end || !anchor || !question_id || !question_text) {
-    throw new Error('client_id, period_end, anchor, question_id and question_text required');
-  }
-  return submitFollowUpAnswer(supabase, {
-    clientId: client_id, periodEnd: period_end, anchor,
-    questionId: question_id, questionText: question_text, answerText: answer_text || '',
-  });
+async function saveAddBusinessQuestion(body) {
+  const { category, question_text, risk_if_yes } = body;
+  if (!category || !question_text) throw new Error('category and question_text required');
+  return addQuestion(supabase, { category, questionText: question_text, riskIfYes: risk_if_yes !== false });
+}
+
+async function saveDeleteBusinessQuestion(body) {
+  const { question_id } = body;
+  if (!question_id) throw new Error('question_id required');
+  return deleteQuestion(supabase, { questionId: question_id });
 }
 
 // Risk Review actions (Confirm / Investigate / Not applicable / No longer
@@ -340,8 +347,9 @@ exports.handler = async (event) => {
       : body.type === 'add_client' ? await addClient(body)
       : body.type === 'delete_period' ? await deletePeriod(body)
       : body.type === 'context' ? await saveContext(body)
-      : body.type === 'business_risk_anchor_no_risk' ? await saveBusinessAnchorNoRisk(body)
-      : body.type === 'business_risk_followup' ? await saveBusinessFollowUpAnswer(body)
+      : body.type === 'business_risk_question_answer' ? await saveBusinessQuestionAnswer(body)
+      : body.type === 'business_risk_question_add' ? await saveAddBusinessQuestion(body)
+      : body.type === 'business_risk_question_delete' ? await saveDeleteBusinessQuestion(body)
       : body.type === 'risk_review_action' ? await saveRiskReviewAction(body)
       : body.type === 'goal_items' ? await saveGoalItems(body)
       : body.type === 'pulse' ? await savePulse(body)

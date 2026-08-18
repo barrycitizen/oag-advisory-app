@@ -3298,8 +3298,8 @@ const RISK_REVIEW_ACTIONS = [
 ];
 function capitalizeWord(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 
-// A "no risk identified" row from the anchor's no-risk branch (see
-// submitCategoryResponse) never gets a recommendation — a real risk always
+// A "no risk identified" row from a question's no-risk branch (see
+// submitQuestionAnswer) never gets a recommendation — a real risk always
 // does, even after a review action later marks it Managed/resolved (the
 // action only touches status, never recommendation). That's the reliable
 // way to tell "never was a risk" apart from "was a risk, now resolved"
@@ -3456,23 +3456,190 @@ function renderRiskSourceGroup(key, rows, extraHtml) {
   `;
 }
 
-// One category's anchor question, plus a spot for its follow-ups to
-// appear one at a time as each is answered (see renderFollowUpStep in the
-// wiring below) — kept as its own card per category so leaving mid-review
-// doesn't lose progress on categories already done.
-function renderBusinessReviewCategory(c) {
+// One category's questions, all shown together, flat — no anchor gating
+// whether the others appear. People shows Q1, Q2, Q3 all at once, each
+// independently answerable in any order, each getting its own AI write-up
+// when answered in its risk-indicating direction. Kept as its own card per
+// category so leaving mid-review doesn't lose progress on questions
+// already answered.
+function renderBusinessQuestionShell(q) {
   return `
-    <div class="card" id="biz-cat-${c.id}" data-category="${escAttr(c.category)}" data-risk-if-yes="${c.risk_if_yes}">
-      <p class="muted">${capitalizeWord(c.category)} — due for review</p>
-      <p class="muted plain" style="margin:0 0 10px;">${c.question_text}</p>
-      <div class="biz-anchor-buttons" style="display:flex; gap:8px;">
-        <button type="button" class="action secondary biz-anchor-btn" data-anchor-id="${c.id}" data-value="true">Yes</button>
-        <button type="button" class="action secondary biz-anchor-btn" data-anchor-id="${c.id}" data-value="false">No</button>
+    <div id="biz-q-${q.id}" style="margin-top:10px; padding-top:10px; border-top:1px solid var(--line);">
+      <div style="display:flex; align-items:baseline; justify-content:space-between; gap:8px;">
+        <p class="muted plain" style="margin:0;">${q.question_text}</p>
+        <button type="button" class="mini-link" style="margin-left:0; flex-shrink:0;" id="biz-q-delete-${q.id}">Delete</button>
       </div>
-      <div id="biz-anchor-result-${c.id}" style="margin-top:8px;"></div>
-      <div id="biz-fu-sequence-${c.id}"></div>
+      <div id="biz-q-buttons-${q.id}" style="display:flex; gap:8px; margin-top:6px;">
+        <button type="button" class="action secondary biz-q-btn" data-value="true">Yes</button>
+        <button type="button" class="action secondary biz-q-btn" data-value="false">No</button>
+      </div>
+      <div id="biz-q-notes-field-${q.id}" style="display:none; margin-top:8px;">
+        <textarea id="biz-q-notes-${q.id}" rows="2" placeholder="Notes…"></textarea>
+        <button type="button" class="action" id="biz-q-save-${q.id}" style="margin-top:8px;">Save</button>
+      </div>
+      <div id="biz-q-result-${q.id}" style="display:none; margin-top:8px;"></div>
     </div>
   `;
+}
+
+function renderBusinessReviewCategory(c) {
+  const selectStyle = 'padding:8px 10px; border:1px solid var(--line); border-radius:6px; font-family:var(--font-body); background:var(--paper-raised); color:var(--ink); font-size:13px;';
+  return `
+    <div class="card" id="biz-cat-${escAttr(c.category)}">
+      <p class="muted">${capitalizeWord(c.category)}</p>
+      <div id="biz-questions-${escAttr(c.category)}">${c.questions.map(renderBusinessQuestionShell).join('')}</div>
+      <div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--line);">
+        <button type="button" class="mini-link" style="margin-left:0;" id="biz-addq-toggle-${escAttr(c.category)}">+ Add a question</button>
+        <div id="biz-addq-form-${escAttr(c.category)}" style="display:none; margin-top:8px;">
+          <div class="form-field"><label>New question</label><textarea id="biz-addq-text-${escAttr(c.category)}" rows="2" placeholder="e.g. Do you have a written succession plan?"></textarea></div>
+          <div class="form-field"><label>Does answering "Yes" indicate a risk?</label>
+            <select id="biz-addq-direction-${escAttr(c.category)}" style="${selectStyle}">
+              <option value="true" selected>Yes = risk</option>
+              <option value="false">Yes = no risk</option>
+            </select>
+          </div>
+          <button type="button" class="action" id="biz-addq-save-${escAttr(c.category)}">Add question</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// Wires one question's Yes/No -> (auto-save if that answer means no risk,
+// else show a notes box + Save that triggers AI synthesis) -> result +
+// Edit link. Standalone (not nested in renderRiskAnalyse) so a freshly
+// added question (see wireAddQuestionForm) can be wired the same way
+// without re-rendering the whole tab.
+function wireBusinessQuestion(q, category) {
+  const buttonsEl = document.getElementById(`biz-q-buttons-${q.id}`);
+  const notesFieldEl = document.getElementById(`biz-q-notes-field-${q.id}`);
+  const notesInput = document.getElementById(`biz-q-notes-${q.id}`);
+  const saveBtn = document.getElementById(`biz-q-save-${q.id}`);
+  const resultEl = document.getElementById(`biz-q-result-${q.id}`);
+  const deleteBtn = document.getElementById(`biz-q-delete-${q.id}`);
+
+  const submitAnswer = async (answer, notes) => {
+    const res = await fetch('/.netlify/functions/manual-entry', {
+      method: 'POST',
+      body: JSON.stringify({
+        type: 'business_risk_question_answer', client_id: currentClientId, period_end: currentPeriodEnd,
+        category, question: { id: q.id, question_text: q.question_text, risk_if_yes: q.risk_if_yes },
+        answer, notes,
+      }),
+    });
+    const result = await res.json();
+    if (result.error) throw new Error(result.error);
+    return result.saved;
+  };
+
+  const showResult = (item) => {
+    buttonsEl.style.display = 'none';
+    notesFieldEl.style.display = 'none';
+    resultEl.style.display = 'block';
+    resultEl.innerHTML = riskItemRow(item)
+      + `<button type="button" class="mini-link" style="margin-top:6px;" id="biz-q-edit-${q.id}">Edit this answer</button>`;
+    document.getElementById(`biz-q-edit-${q.id}`).onclick = () => {
+      // Notes (if any were typed) were only ever hidden, never cleared —
+      // still there if this question goes back through the risk-present
+      // branch. Re-saving re-runs submitQuestionAnswer, which deletes only
+      // THIS question's existing row before inserting the new one —
+      // sibling questions in the same category are untouched.
+      resultEl.style.display = 'none';
+      buttonsEl.style.display = 'flex';
+      buttonsEl.querySelectorAll('.biz-q-btn').forEach((b) => { b.disabled = false; });
+    };
+  };
+
+  buttonsEl.querySelectorAll('.biz-q-btn').forEach((btn) => {
+    btn.onclick = async () => {
+      const answer = btn.dataset.value === 'true';
+      const riskPresent = answer === q.risk_if_yes;
+      notesFieldEl.style.display = 'none'; // reset in case notes was left open from a prior click on the other button
+
+      if (!riskPresent) {
+        buttonsEl.querySelectorAll('.biz-q-btn').forEach((b) => { b.disabled = true; });
+        try {
+          const saved = await submitAnswer(answer, '');
+          showResult(saved.item);
+        } catch (err) {
+          buttonsEl.querySelectorAll('.biz-q-btn').forEach((b) => { b.disabled = false; });
+          alert('Error: ' + err.message);
+        }
+        return;
+      }
+
+      buttonsEl.querySelectorAll('.biz-q-btn').forEach((b) => b.classList.toggle('secondary', b !== btn));
+      notesFieldEl.style.display = 'block';
+      saveBtn.onclick = async () => {
+        saveBtn.disabled = true;
+        saveBtn.textContent = 'Saving…';
+        try {
+          const saved = await submitAnswer(answer, notesInput.value.trim());
+          showResult(saved.item);
+        } catch (err) {
+          saveBtn.disabled = false;
+          saveBtn.textContent = 'Save';
+          alert('Error: ' + err.message);
+        }
+      };
+    };
+  });
+
+  deleteBtn.onclick = async () => {
+    if (!confirm(`Delete "${q.question_text}"? It won't be asked again — any past answers stay on file.`)) return;
+    deleteBtn.disabled = true;
+    try {
+      const res = await fetch('/.netlify/functions/manual-entry', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'business_risk_question_delete', question_id: q.id }),
+      });
+      const result = await res.json();
+      if (result.error) throw new Error(result.error);
+      document.getElementById(`biz-q-${q.id}`).remove();
+    } catch (err) {
+      deleteBtn.disabled = false;
+      alert('Error: ' + err.message);
+    }
+  };
+}
+
+function wireAddQuestionForm(category) {
+  const safeCategory = escAttr(category);
+  const toggleBtn = document.getElementById(`biz-addq-toggle-${safeCategory}`);
+  const formEl = document.getElementById(`biz-addq-form-${safeCategory}`);
+  const textInput = document.getElementById(`biz-addq-text-${safeCategory}`);
+  const directionSelect = document.getElementById(`biz-addq-direction-${safeCategory}`);
+  const saveBtn = document.getElementById(`biz-addq-save-${safeCategory}`);
+  const questionsListEl = document.getElementById(`biz-questions-${safeCategory}`);
+
+  toggleBtn.onclick = () => {
+    formEl.style.display = formEl.style.display === 'none' ? 'block' : 'none';
+  };
+
+  saveBtn.onclick = async () => {
+    const text = textInput.value.trim();
+    if (!text) return;
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Adding…';
+    try {
+      const res = await fetch('/.netlify/functions/manual-entry', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'business_risk_question_add', category, question_text: text, risk_if_yes: directionSelect.value === 'true' }),
+      });
+      const result = await res.json();
+      if (result.error) throw new Error(result.error);
+      const newQ = result.saved;
+      questionsListEl.insertAdjacentHTML('beforeend', renderBusinessQuestionShell(newQ));
+      wireBusinessQuestion(newQ, category);
+      textInput.value = '';
+      formEl.style.display = 'none';
+    } catch (err) {
+      alert('Error: ' + err.message);
+    } finally {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Add question';
+    }
+  };
 }
 
 async function renderRiskAnalyse(content) {
@@ -3509,122 +3676,13 @@ async function renderRiskAnalyse(content) {
     };
   }
 
+  // Deliberately NOT calling renderMain() anywhere in this wiring — that
+  // would replace content.innerHTML wholesale and wipe out whatever's been
+  // answered so far in these cards. The rollup banner's counts and the
+  // read-only history list catch up next time this tab naturally re-renders.
   categoriesToReview.forEach((c) => {
-    const catCard = document.getElementById(`biz-cat-${c.id}`);
-    const anchorResultEl = document.getElementById(`biz-anchor-result-${c.id}`);
-    const sequenceEl = document.getElementById(`biz-fu-sequence-${c.id}`);
-
-    const postBiz = async (type, extra) => {
-      const res = await fetch('/.netlify/functions/manual-entry', {
-        method: 'POST',
-        body: JSON.stringify({
-          type, client_id: currentClientId, period_end: currentPeriodEnd,
-          anchor: { category: c.category, question_text: c.question_text, risk_if_yes: c.risk_if_yes },
-          ...extra,
-        }),
-      });
-      const result = await res.json();
-      if (result.error) throw new Error(result.error);
-      // Shows what was actually written right here, in the card the
-      // accountant just answered in — a bare "Saved." with the AI's
-      // write-up sitting unseen further down the page is why this used to
-      // feel like nothing had happened beyond recording yes/no.
-      return result.saved;
-    };
-
-    // Renders follow-up question `index` as its own step (text box + its
-    // own Save, its own AI result, its own Edit link) — appended only once
-    // the prior step has actually been answered, so the accountant works
-    // through People's 2 questions (or Legal's 2, etc.) one at a time, each
-    // getting its own write-up, rather than filling in a whole form at once.
-    function renderFollowUpStep(index) {
-      const f = c.followUps[index];
-      const stepId = `biz-fu-${c.id}-${index}`;
-      sequenceEl.insertAdjacentHTML('beforeend', `
-        <div id="${stepId}" style="margin-top:10px; padding-top:10px; border-top:1px solid var(--line);">
-          <div class="form-field" id="${stepId}-field" style="margin-bottom:0;">
-            <label>${f.question_text}</label>
-            <textarea id="${stepId}-input" rows="2" placeholder="Notes…"></textarea>
-          </div>
-          <button type="button" class="action" id="${stepId}-save" style="margin-top:8px;">Save</button>
-          <div id="${stepId}-result" style="display:none; margin-top:8px;"></div>
-        </div>
-      `);
-      const fieldEl = document.getElementById(`${stepId}-field`);
-      const textarea = document.getElementById(`${stepId}-input`);
-      const saveBtn = document.getElementById(`${stepId}-save`);
-      const resultEl = document.getElementById(`${stepId}-result`);
-
-      saveBtn.onclick = async () => {
-        saveBtn.disabled = true;
-        saveBtn.textContent = 'Saving…';
-        try {
-          const saved = await postBiz('business_risk_followup', {
-            question_id: f.id, question_text: f.question_text, answer_text: textarea.value.trim(),
-          });
-          fieldEl.style.display = 'none';
-          saveBtn.style.display = 'none';
-          resultEl.style.display = 'block';
-          resultEl.innerHTML = riskItemRow(saved.item)
-            + `<button type="button" class="mini-link" style="margin-top:6px;" id="${stepId}-edit">Edit this answer</button>`;
-          document.getElementById(`${stepId}-edit`).onclick = () => {
-            // The textarea was only ever hidden, never cleared, so
-            // whatever was last typed is still there to revise. Re-saving
-            // re-runs submitFollowUpAnswer, which deletes this exact
-            // question's existing row before inserting the new one —
-            // sibling follow-up questions' rows are untouched.
-            resultEl.style.display = 'none';
-            fieldEl.style.display = 'block';
-            saveBtn.style.display = 'inline-block';
-            saveBtn.disabled = false;
-            saveBtn.textContent = 'Save';
-          };
-          // Reveal the next question only the first time this one's
-          // completed — re-saving via Edit shouldn't re-append a duplicate
-          // step for whatever comes after it.
-          if (index + 1 < c.followUps.length && !document.getElementById(`biz-fu-${c.id}-${index + 1}`)) {
-            renderFollowUpStep(index + 1);
-          }
-        } catch (err) {
-          saveBtn.disabled = false;
-          saveBtn.textContent = 'Save';
-          alert('Error: ' + err.message);
-        }
-      };
-    }
-
-    catCard.querySelectorAll('.biz-anchor-btn').forEach((btn) => {
-      btn.onclick = async () => {
-        const anchorAnswer = btn.dataset.value === 'true';
-        catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => b.classList.toggle('secondary', b !== btn));
-        const riskPresent = anchorAnswer === c.risk_if_yes;
-        sequenceEl.innerHTML = '';
-        anchorResultEl.innerHTML = '';
-
-        if (!riskPresent) {
-          catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => { b.disabled = true; });
-          try {
-            const saved = await postBiz('business_risk_anchor_no_risk', {});
-            anchorResultEl.innerHTML = riskItemRow(saved.item)
-              + `<button type="button" class="mini-link" style="margin-top:6px;" id="biz-anchor-edit-${c.id}">Edit this answer</button>`;
-            document.getElementById(`biz-anchor-edit-${c.id}`).onclick = () => {
-              anchorResultEl.innerHTML = '';
-              catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => { b.disabled = false; });
-            };
-          } catch (err) {
-            catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => { b.disabled = false; });
-            alert('Error: ' + err.message);
-          }
-        } else if (c.followUps.length) {
-          renderFollowUpStep(0);
-        }
-        // Deliberately NOT calling renderMain() anywhere in this flow —
-        // that would replace content.innerHTML wholesale and wipe out
-        // whatever's been answered so far in this card. The rollup
-        // banner's counts and the read-only history list catch up next
-        // time this tab naturally re-renders.
-      };
-    });
+    c.questions.forEach((q) => wireBusinessQuestion(q, c.category));
+    wireAddQuestionForm(c.category);
   });
 
   // Review actions (Confirm/Investigate/Not applicable/No longer a risk) —

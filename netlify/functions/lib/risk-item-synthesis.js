@@ -2,38 +2,40 @@
 //
 // Risk Item Synthesis
 // ------------------------------------------------------------------
-// Turns a raw anchor + follow-up Q&A from the business questionnaire into
-// an actual risk write-up: what the risk is, why it matters, and what to
-// do about it. Same pattern as the industry checklist AI call (see
-// industry-risk-checklist.js).
+// Turns one question+answer from the business questionnaire into an
+// actual risk write-up: what the risk is, why it matters, and what to do
+// about it. Same pattern as the industry checklist AI call (see
+// industry-risk-checklist.js). Every question in a category is
+// independent and flat (no anchor/follow-up hierarchy — see
+// business-risk-questionnaire.js), so this only ever synthesizes one
+// question's answer at a time.
 //
-// Fixes: submitCategoryResponse() used to store the literal question text
-// as "detail" — answering "yes" just echoed the question back rather than
-// producing an answer. This generates real content instead.
+// Fixes: this used to store the literal question text as "detail" —
+// answering "yes" just echoed the question back rather than producing an
+// answer. This generates real content instead.
 //
 // Run migration_risk_items_v4.sql first (adds risk_items.recommendation).
 
 const MODEL = 'claude-sonnet-4-6'; // matches the model used elsewhere (analyze.js, suggest-goal.js, industry-risk-checklist.js)
 
-const SYSTEM_PROMPT = `You turn a small business adviser's risk questionnaire answers into a
-concise risk write-up.
+const SYSTEM_PROMPT = `You turn one answer from a small business adviser's risk questionnaire
+into a concise risk write-up.
 
-You'll be given: a risk category, the anchor question that was answered
-"yes" (risk present), and any follow-up question/answer pairs with the
-accountant's notes.
+You'll be given: a risk category, the specific question that was answered
+in a way that indicates a risk is present, and the accountant's notes.
 
 Write:
 - risk_name: short label, 2-5 words (e.g. "Key-person dependency")
 - detail: 1-2 sentences on what the actual risk is and why it matters for
-  this business, grounded in what was actually said in the answers — do
+  this business, grounded in what was actually said in the answer — do
   not invent specifics that weren't provided
 - recommendation: 1 concrete, actionable next step the adviser could
   suggest to the client
 - severity: "High", "Medium", or "Low" based on how exposed this makes
   the business, given what was said
 
-If the answers given are too thin to say anything specific, keep detail
-and recommendation general to the category rather than fabricating
+If the answer given is too thin to say anything specific, keep detail and
+recommendation general to the question/category rather than fabricating
 details.
 
 Respond with ONLY a JSON object, no markdown fences, no preamble:
@@ -44,12 +46,8 @@ Respond with ONLY a JSON object, no markdown fences, no preamble:
 // This is a foreground, user-initiated save (clicking Save on the
 // questionnaire), so a failure here should surface to the accountant
 // (they'd want to retry), not be silently swallowed.
-async function synthesizeRiskItem({ category, anchorQuestion, followUpQA }) {
-  const qaText = followUpQA.length
-    ? followUpQA.map((qa) => `Q: ${qa.questionText}\nA: ${qa.answerText || '(no detail given)'}`).join('\n\n')
-    : '(no follow-up detail given)';
-
-  const userMessage = `Category: ${category}\nAnchor question (answered "risk present"): ${anchorQuestion}\n\n${qaText}`;
+async function synthesizeRiskItem({ category, questionText, answerText }) {
+  const userMessage = `Category: ${category}\nQuestion (answered "risk present"): ${questionText}\nAnswer: ${answerText || '(no detail given)'}`;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',

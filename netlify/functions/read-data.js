@@ -7,7 +7,7 @@
 
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const { getCategoriesForReview, getFollowUpQuestions } = require('./lib/business-risk-questionnaire');
+const { getCategoriesForReview } = require('./lib/business-risk-questionnaire');
 
 exports.handler = async (event) => {
   try {
@@ -346,10 +346,11 @@ exports.handler = async (event) => {
     // Risk Review domain — rolls up all sources sharing risk_items. Financial
     // is period-scoped (re-synced every analyze.js run, see
     // lib/financial-risk-sync.js) so it's filtered to the period being viewed;
-    // industry is generated once per client (see lib/industry-risk-checklist.js)
-    // and doesn't change per period, so it's fetched for the client regardless
-    // of which period is selected. Business (questionnaire-driven) isn't built
-    // yet — comes back empty until that source exists.
+    // business and industry both don't change per period (business questions
+    // are answered once and resurface adaptively, see
+    // business-risk-questionnaire.js; industry is generated once per client),
+    // so both are fetched for the client regardless of which period is
+    // selected.
     if (action === 'get_risk_items') {
       const [{ data: financial }, { data: industry }, { data: business }] = await Promise.all([
         period_end
@@ -362,22 +363,20 @@ exports.handler = async (event) => {
       // Isolated from the block above on purpose — until migration_risk_items_v3.sql
       // (risk_questions) is run, this throws, and it must not take down
       // financial/industry/business (which already work) along with it.
-      let categoriesWithFollowUps = [];
+      // Client-level, not period-scoped — resurfacing depends on when a
+      // category was last reviewed at all, not the period being viewed.
+      // Each returned category already carries its full flat question
+      // list (see business-risk-questionnaire.js) — no separate
+      // per-category follow-up fetch needed now that there's no anchor/
+      // follow-up split.
+      let categoriesToReview = [];
       try {
-        // Client-level, not period-scoped — resurfacing depends on when a
-        // category was last reviewed at all, not the period being viewed.
-        const categoriesToReview = await getCategoriesForReview(supabase, client_id);
-        // Follow-ups are fetched up front (only ~1-2 per category) so the
-        // frontend can show them the instant a risk-indicating answer is
-        // given, without a round trip per anchor.
-        categoriesWithFollowUps = await Promise.all(
-          categoriesToReview.map(async (anchor) => ({ ...anchor, followUps: await getFollowUpQuestions(supabase, anchor.id) }))
-        );
+        categoriesToReview = await getCategoriesForReview(supabase, client_id);
       } catch (err) {
         console.error('getCategoriesForReview failed:', err.message);
       }
 
-      return { statusCode: 200, body: JSON.stringify({ financial: financial || [], industry: industry || [], business: business || [], categoriesToReview: categoriesWithFollowUps }) };
+      return { statusCode: 200, body: JSON.stringify({ financial: financial || [], industry: industry || [], business: business || [], categoriesToReview }) };
     }
 
     if (action === 'get_report_data') {
