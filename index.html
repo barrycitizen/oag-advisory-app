@@ -3616,10 +3616,15 @@ function renderRiskRollupContent(rollup) {
         <button type="button" class="mini-link" style="margin-left:0;" id="risk-ai-summary-btn">✨ Generate AI summary</button>
         <div id="risk-ai-summary-content" style="display:none; margin-top:6px;"></div>
       </div>
+      <!-- Priority is High/Medium only — it used to also offer a "Managed"
+           option as a catch-all third bucket, but that's exactly what the
+           Status axis's Managed + Not applicable pills already cover, only
+           more precisely (Status keeps them separate). Having "Managed" as
+           an option under two different axis labels was confusing, not
+           useful — picking either used to filter to the exact same rows. -->
       ${riskFilterAxis('Priority', 'level', [
         { value: 'High', icon: '🔴', label: 'High', count: rollup.buckets.High.length },
         { value: 'Medium', icon: '🟠', label: 'Medium', count: rollup.buckets.Medium.length },
-        { value: 'Managed', icon: '🟢', label: 'Managed', count: rollup.managed.length },
       ])}
       ${riskFilterAxis('Type of Risk', 'source', [
         { value: 'financial', icon: '📊', label: 'Financial', count: rollup.counts.financial },
@@ -3746,11 +3751,20 @@ function wireRiskSummaryRegion(rollup) {
   // axis names match their .risk-summary-row data-* attribute 1:1
   // (data-level/data-source/data-status), so row.dataset[axis] reads
   // straight through with no per-axis special-casing.
+  //
+  // Each axis holds a SET of selected values, not a single one — click
+  // "High" and "Medium" together under Priority to see both without
+  // Managed, click one again to drop just that one back out. An empty set
+  // means no filter on that axis (equivalent to "All"), which is also what
+  // clicking "All" itself resets it to. Values within an axis OR together
+  // (High or Medium); axes AND together (Priority AND Type AND Status),
+  // same combining behavior as before, just no longer capped at one
+  // selection per axis.
   const AXES = ['level', 'source', 'status'];
-  const activeFilters = { level: 'all', source: 'all', status: 'all' };
+  const activeFilters = { level: new Set(), source: new Set(), status: new Set() };
   const rows = () => [...summaryEl.querySelectorAll('.risk-summary-row')];
-  const rowMatchesOtherAxes = (row, exceptAxis) =>
-    AXES.every((axis) => axis === exceptAxis || activeFilters[axis] === 'all' || row.dataset[axis] === activeFilters[axis]);
+  const axisMatches = (row, axis) => activeFilters[axis].size === 0 || activeFilters[axis].has(row.dataset[axis]);
+  const rowMatchesOtherAxes = (row, exceptAxis) => AXES.every((axis) => axis === exceptAxis || axisMatches(row, axis));
   const updateRiskFilterCounts = () => {
     AXES.forEach((axis) => {
       summaryEl.querySelectorAll(`.risk-filter-pill[data-filter-axis="${axis}"]`).forEach((pill) => {
@@ -3764,7 +3778,7 @@ function wireRiskSummaryRegion(rollup) {
   };
   const applyRiskFilters = () => {
     rows().forEach((row) => {
-      const matches = AXES.every((axis) => activeFilters[axis] === 'all' || row.dataset[axis] === activeFilters[axis]);
+      const matches = AXES.every((axis) => axisMatches(row, axis));
       row.style.display = matches ? '' : 'none';
     });
     summaryEl.querySelectorAll('.risk-section-header').forEach((header) => {
@@ -3782,8 +3796,20 @@ function wireRiskSummaryRegion(rollup) {
     pill.onclick = () => {
       const axis = pill.dataset.filterAxis;
       const value = pill.dataset.filterValue;
-      summaryEl.querySelectorAll(`.risk-filter-pill[data-filter-axis="${axis}"]`).forEach((p) => p.classList.toggle('active', p === pill));
-      activeFilters[axis] = value;
+      if (value === 'all') {
+        activeFilters[axis].clear();
+      } else if (activeFilters[axis].has(value)) {
+        activeFilters[axis].delete(value);
+      } else {
+        activeFilters[axis].add(value);
+      }
+      // "All" is active exactly when nothing specific is selected on this
+      // axis — not just on its own click, but also as the natural result
+      // of toggling the last specific pill back off.
+      summaryEl.querySelectorAll(`.risk-filter-pill[data-filter-axis="${axis}"]`).forEach((p) => {
+        const v = p.dataset.filterValue;
+        p.classList.toggle('active', v === 'all' ? activeFilters[axis].size === 0 : activeFilters[axis].has(v));
+      });
       applyRiskFilters();
     };
   });
