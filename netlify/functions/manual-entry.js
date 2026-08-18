@@ -3,7 +3,7 @@ const { randomUUID } = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const { generateIndustryRiskItems } = require('./lib/industry-risk-checklist');
-const { submitQuestionAnswer, addQuestion, deleteQuestion } = require('./lib/business-risk-questionnaire');
+const { submitQuestionAnswer, addQuestion, deleteQuestion, unanswerQuestion } = require('./lib/business-risk-questionnaire');
 const { applyReviewAction } = require('./lib/risk-review-actions');
 
 // fy_end is required (not just business_name) because the frontend derives every
@@ -167,6 +167,12 @@ async function saveDeleteBusinessQuestion(body) {
   const { question_id } = body;
   if (!question_id) throw new Error('question_id required');
   return deleteQuestion(supabase, { questionId: question_id });
+}
+
+async function saveUnanswerBusinessQuestion(body) {
+  const { client_id, risk_item_id } = body;
+  if (!client_id || !risk_item_id) throw new Error('client_id and risk_item_id required');
+  return unanswerQuestion(supabase, { clientId: client_id, riskItemId: risk_item_id });
 }
 
 // Risk Review actions (Confirm / Investigate / Not applicable / No longer
@@ -350,6 +356,7 @@ exports.handler = async (event) => {
       : body.type === 'business_risk_question_answer' ? await saveBusinessQuestionAnswer(body)
       : body.type === 'business_risk_question_add' ? await saveAddBusinessQuestion(body)
       : body.type === 'business_risk_question_delete' ? await saveDeleteBusinessQuestion(body)
+      : body.type === 'business_risk_question_unanswer' ? await saveUnanswerBusinessQuestion(body)
       : body.type === 'risk_review_action' ? await saveRiskReviewAction(body)
       : body.type === 'goal_items' ? await saveGoalItems(body)
       : body.type === 'pulse' ? await savePulse(body)

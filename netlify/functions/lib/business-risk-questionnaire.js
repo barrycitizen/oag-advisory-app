@@ -283,6 +283,20 @@ async function deleteQuestion(supabase, { questionId }) {
   return { deleted: true };
 }
 
+// Clears an answer outright (as opposed to submitQuestionAnswer, which
+// replaces it with a new one) — a hard delete of just that one risk_items
+// row, scoped by client_id as an ownership check. Once gone, the question
+// has no row at all for latestByQuestion to find, so getCategoriesForReview's
+// `!latest` branch makes it due for review again next time that's computed
+// — same as a question that's never been asked. Any rows from OTHER
+// periods for the same question are untouched, so multi-period history
+// stays intact.
+async function unanswerQuestion(supabase, { clientId, riskItemId }) {
+  const { error } = await supabase.from('risk_items').delete().eq('id', riskItemId).eq('client_id', clientId);
+  if (error) throw error;
+  return { deleted: true };
+}
+
 module.exports = {
   seedQuestions,
   getCategoriesForReview,
@@ -290,5 +304,6 @@ module.exports = {
   submitQuestionAnswer,
   addQuestion,
   deleteQuestion,
+  unanswerQuestion,
   QUESTION_BANK,
 };

@@ -3358,7 +3358,10 @@ function riskItemRow(r, opts = {}) {
           <div style="flex:1; min-width:0;">
             <span class="muted plain" style="margin:0;">No risk${r.last_reviewed_date ? ` <span style="font-size:11px;">(${formatShortDate(r.last_reviewed_date)})</span>` : ''}</span>
             ${r.detail ? `<p class="muted plain" style="margin:2px 0 0; font-size:12px;">${r.detail}</p>` : ''}
-            ${editable && r.question_id ? `<button type="button" class="mini-link" style="margin-top:4px;" data-edit-risk-row-id="${r.id}" data-edit-question-id="${r.question_id}" data-edit-category="${escAttr(r.category || '')}">Edit answer</button>` : ''}
+            ${editable && r.question_id ? `
+              <button type="button" class="mini-link" style="margin-top:4px;" data-edit-risk-row-id="${r.id}" data-edit-question-id="${r.question_id}" data-edit-category="${escAttr(r.category || '')}">Edit answer</button>
+              <button type="button" class="mini-link" style="margin-top:4px;" data-unanswer-risk-row-id="${r.id}">Unanswer</button>
+            ` : ''}
           </div>
         </div>
       </div>
@@ -3806,6 +3809,37 @@ function wireRiskAnswerEdit(questionsById) {
   });
 }
 
+// Clears an answer outright instead of replacing it — for when a past
+// "no risk" answer was a mistake, not just out of date. The question then
+// has no risk_items row at all, so getCategoriesForReview treats it as
+// never-asked and it becomes due for review again — but not until the
+// Risk tab is next reloaded (this deliberately doesn't try to build a
+// due-for-review card for it live, since that category might not
+// currently have one on the page, and constructing one on the fly risks
+// disturbing other in-progress answers already open elsewhere in that
+// section).
+function wireRiskAnswerUnanswer() {
+  document.querySelectorAll('[data-unanswer-risk-row-id]').forEach((btn) => {
+    btn.onclick = async () => {
+      if (!confirm('Clear this answer? The question goes back to unanswered and will need to be asked again.')) return;
+      const rowId = btn.dataset.unanswerRiskRowId;
+      btn.disabled = true;
+      try {
+        const res = await fetch('/.netlify/functions/manual-entry', {
+          method: 'POST',
+          body: JSON.stringify({ type: 'business_risk_question_unanswer', client_id: currentClientId, risk_item_id: rowId }),
+        });
+        const result = await res.json();
+        if (result.error) throw new Error(result.error);
+        refreshRiskLists();
+      } catch (err) {
+        btn.disabled = false;
+        alert('Error: ' + err.message);
+      }
+    };
+  });
+}
+
 // A clickable header (same chevron-toggle pattern as the cash reconciliation
 // panels) that collapses/expands everything under it — for Financial and
 // Industry that's just the read-only list, for Business it's the
@@ -4060,6 +4094,7 @@ async function refreshRiskLists() {
     const questionsById = {};
     (data.allQuestions || []).forEach((q) => { questionsById[q.id] = q; });
     wireRiskAnswerEdit(questionsById);
+    wireRiskAnswerUnanswer();
   }
   const industryEl = document.getElementById('risk-industry-region');
   if (industryEl) industryEl.innerHTML = renderRiskItemsCard(data.industry || []);
@@ -4124,6 +4159,7 @@ async function renderRiskAnalyse(content) {
     const questionsById = {};
     (data.allQuestions || []).forEach((q) => { questionsById[q.id] = q; });
     wireRiskAnswerEdit(questionsById);
+    wireRiskAnswerUnanswer();
   }
   ['financial', 'business', 'industry'].forEach(wireRiskSectionToggle);
 
