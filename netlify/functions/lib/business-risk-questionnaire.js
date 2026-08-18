@@ -161,6 +161,21 @@ function capitalize(s) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
+// Display label for the "no risk identified" row's risk_name (stored in
+// the DB, see submitQuestionAnswer below) — kept distinct from the
+// financial CATEGORY colliding with the unrelated "Financial" source
+// label the Risk Review summary uses for auto-detected ratio flags (see
+// index.html's Type of Risk filter). Same map as index.html's
+// BUSINESS_CATEGORY_LABEL — duplicated rather than shared, matching this
+// codebase's per-file independence convention.
+const BUSINESS_CATEGORY_LABEL = {
+  people: 'People', customers: 'Customers', suppliers: 'Suppliers', operations: 'Operations',
+  financial: 'Cash & Funding', legal: 'Legal', insurance: 'Insurance', technology: 'Technology',
+};
+function businessCategoryLabel(category) {
+  return BUSINESS_CATEGORY_LABEL[category] || capitalize(category);
+}
+
 // is_new/is_changed vs the most recent PRIOR review of this EXACT
 // question (identified by question_id — excluding this exact period, so
 // re-submitting the same period to fix a mistake doesn't compare against
@@ -215,7 +230,7 @@ async function submitQuestionAnswer(supabase, { clientId, periodEnd, category, q
   if (!riskPresent) {
     const row = {
       client_id: clientId, period_end: periodEnd, source: 'business', question_id: question.id,
-      category, risk_name: `${capitalize(category)} — no risk identified`,
+      category, risk_name: `${businessCategoryLabel(category)} — no risk identified`,
       detail: question.question_text, status: 'Managed', severity: 'Low', last_reviewed_date: today,
       is_new: isNew, is_changed: isChanged,
     };
