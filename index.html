@@ -3560,7 +3560,24 @@ async function renderRiskAnalyse(content) {
         followUpsBlock.style.display = 'none';
         catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => { b.disabled = true; });
         savedMsg.style.display = 'block';
-        savedMsg.innerHTML = result.saved.items.map(riskItemRow).join('');
+        savedMsg.innerHTML = result.saved.items.map(riskItemRow).join('')
+          + `<button type="button" class="mini-link" style="margin-top:8px;" id="biz-edit-${c.id}">Edit this answer</button>`;
+        document.getElementById(`biz-edit-${c.id}`).onclick = () => {
+          // Re-opens the form exactly as it was left — the anchor/follow-up
+          // inputs were only ever hidden (display:none), never cleared, so
+          // whatever was last typed is still sitting in them. Answering and
+          // saving again re-runs submitCategoryResponse, which already
+          // deletes this category's existing rows for this period before
+          // inserting the new ones, so re-saving replaces rather than
+          // duplicates.
+          savedMsg.style.display = 'none';
+          savedMsg.innerHTML = '';
+          catCard.querySelectorAll('.biz-anchor-btn').forEach((b) => { b.disabled = false; });
+          if (anchorAnswer !== null) followUpsBlock.style.display = (anchorAnswer === c.risk_if_yes) && c.followUps.length ? 'block' : 'none';
+          saveBtn.style.display = 'block';
+          saveBtn.disabled = false;
+          saveBtn.textContent = 'Save';
+        };
         // Deliberately NOT calling renderMain() here — that would replace
         // content.innerHTML wholesale and wipe out the preview just shown
         // above it. The rollup banner's counts and the read-only history
