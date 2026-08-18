@@ -145,6 +145,33 @@ input[type="file"] { border: none; padding: 4px 0; background: transparent; }
 .confidence-badge.green { background: var(--sage-bg); color: var(--sage); }
 .confidence-badge.yellow { background: #F5EDD9; color: var(--brass); }
 .confidence-badge.red { background: var(--rust-bg); color: var(--rust); }
+
+/* Risk Review pills — three distinct visual registers so severity/status/
+   source read as different KINDS of fact at a glance, not one undifferentiated
+   row of same-looking tags: severity is filled+bold (it's the urgency verdict),
+   status is outlined (it's a workflow stage, not a verdict), source is a
+   neutral icon tag (it's just a category, not good/bad/either). */
+.risk-pill { display: inline-flex; align-items: center; gap: 3px; padding: 2px 9px; border-radius: 10px; font-size: 10px; font-weight: 600; letter-spacing: 0.02em; white-space: nowrap; font-family: var(--font-body); }
+.risk-pill-severity.high { background: var(--rust); color: #fff; }
+.risk-pill-severity.medium { background: var(--brass); color: #fff; }
+.risk-pill-severity.low { background: var(--sage); color: #fff; }
+.risk-pill-status { border: 1px solid var(--line); background: var(--paper); color: var(--ink-soft); font-weight: 500; }
+.risk-pill-source { background: var(--paper); border: 1px solid var(--line); color: var(--ink-soft); font-weight: 500; }
+.risk-pill-flag { background: var(--brass-soft); color: #fff; font-weight: 500; }
+
+.risk-overall-pill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 18px; border-radius: 10px; font-family: var(--font-display); font-size: 20px; }
+.risk-overall-pill.High { background: var(--rust-bg); color: var(--rust); }
+.risk-overall-pill.Medium { background: #F5EDD9; color: var(--brass); }
+.risk-overall-pill.Low { background: var(--sage-bg); color: var(--sage); }
+
+.risk-section-header { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 6px; margin: 16px 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
+.risk-section-header.High { background: var(--rust-bg); color: var(--rust); }
+.risk-section-header.Medium { background: #F5EDD9; color: var(--brass); }
+.risk-section-header.Managed { background: var(--sage-bg); color: var(--sage); }
+
+.risk-filter-pill { padding: 5px 12px; border-radius: 14px; border: 1px solid var(--line); background: var(--paper); color: var(--ink-soft); font-size: 12px; cursor: pointer; font-family: var(--font-body); }
+.risk-filter-pill.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.risk-filter-pill:hover:not(.active) { border-color: var(--brass-soft); }
 .kpi-card .kpi-value { font-size: 19px; }
 .kpi-card .kpi-value.unavailable { color: var(--ink-soft); font-size: 15px; }
 .kpi-value.good { color: var(--sage); }
@@ -3416,45 +3443,62 @@ function riskStat(label, value) {
   `;
 }
 
-// One clickable line per risk in the summary — name, severity dot, a
-// truncated one-line preview. Click anywhere on the row (except an action
-// button) to expand the SAME riskItemRow() detail used in the full
-// source-grouped lists below (recommendation, notes, Confirm/Investigate/
-// etc.) right in place, so seeing "the stuff" behind a summary line never
-// requires scrolling to hunt for it elsewhere on the page. The full detail
-// is rendered into the DOM up front (just hidden), not fetched on click —
-// this dataset is small (a handful of risks at most) and it means the
-// action buttons work immediately via the existing content-level
-// .risk-action-btn delegation, no extra wiring needed per row.
-function riskSummaryRow(r, dotColor) {
+const RISK_SOURCE_PILL = {
+  financial: { icon: '📊', label: 'Financial' },
+  business: { icon: '🧑', label: 'Business' },
+  industry: { icon: '🏭', label: 'Industry' },
+};
+
+// One clickable line per risk in the summary — name, then three pills in
+// three different visual registers so they read as different KINDS of
+// fact, not one row of same-looking tags: severity is filled (the urgency
+// verdict), status is outlined (a workflow stage, not a verdict), source
+// is a neutral icon tag (just a category). Click anywhere on the row
+// (except an action button) to expand the SAME riskItemRow() detail used
+// in the full source-grouped lists below (recommendation, notes, Confirm/
+// Investigate/etc.) right in place — seeing "the stuff" behind a summary
+// line never requires scrolling to hunt for it elsewhere on the page. The
+// full detail is rendered into the DOM up front (just hidden), not
+// fetched on click — this dataset is small (a handful of risks at most)
+// and it means the action buttons work immediately via the existing
+// content-level .risk-action-btn delegation, no extra wiring needed per
+// row. data-source drives the filter pills above (see wireRiskSummaryRegion).
+function riskSummaryRow(r) {
   const detail = r.detail || '';
   const preview = detail.length > 90 ? detail.slice(0, 90) + '…' : detail;
+  const sourceMeta = RISK_SOURCE_PILL[r.source] || { icon: '', label: r.source };
   return `
-    <div class="risk-summary-row" style="padding:7px 0; border-bottom:1px solid var(--line); cursor:pointer;">
-      <div style="display:flex; align-items:baseline; gap:6px;">
-        <span class="flag-dot" style="background:${dotColor};"></span>
+    <div class="risk-summary-row" data-source="${r.source}" style="padding:8px 0; border-bottom:1px solid var(--line); cursor:pointer;">
+      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
         <b style="font-size:13px;">${r.risk_name}</b>
+        <span class="risk-pill risk-pill-severity ${(r.severity || 'Medium').toLowerCase()}">${r.severity || 'Medium'}</span>
+        <span class="risk-pill risk-pill-status">${r.status}</span>
+        <span class="risk-pill risk-pill-source">${sourceMeta.icon} ${sourceMeta.label}</span>
+        ${r.is_new ? '<span class="risk-pill risk-pill-flag">New</span>' : ''}
+        ${r.is_changed ? '<span class="risk-pill risk-pill-flag">Changed</span>' : ''}
         <span class="muted plain risk-summary-chevron" style="font-size:11px; margin-left:auto;">▾</span>
       </div>
-      ${preview ? `<p class="muted plain" style="margin:2px 0 0 16px; font-size:12px;">${preview}</p>` : ''}
-      <div class="risk-summary-expand" style="display:none; margin:8px 0 0 16px;">${riskItemRow(r)}</div>
+      ${preview ? `<p class="muted plain" style="margin:4px 0 0;">${preview}</p>` : ''}
+      <div class="risk-summary-expand" style="display:none; margin:8px 0 0;">${riskItemRow(r)}</div>
     </div>
   `;
 }
 
-function riskSummarySection(icon, label, rows, dotColor) {
+function riskSummarySection(icon, label, level, rows) {
   if (!rows.length) return '';
-  return `<p class="muted" style="margin:12px 0 4px;">${icon} ${label}</p>${rows.map((r) => riskSummaryRow(r, dotColor)).join('')}`;
+  return `<div class="risk-section-header ${level}">${icon} ${label} (${rows.length})</div>${rows.map(riskSummaryRow).join('')}`;
 }
 
 // The full card content, shared between the always-expanded state and
 // what's revealed when the quiet collapsed state is clicked open — same
 // content either way, just a different entry point to it.
 function renderRiskRollupContent(rollup) {
+  const levelIcon = rollup.level === 'High' ? '🔴' : rollup.level === 'Medium' ? '🟠' : '🟢';
   return `
     <div class="card">
-      <p class="kpi-value ${rollup.level === 'High' ? 'bad' : ''}" style="margin:0;">Overall Risk: ${rollup.level}</p>
-      <div style="display:flex; flex-wrap:wrap; gap:4px; margin:12px 0 0; padding:10px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line);">
+      <p class="muted" style="margin:0 0 6px;">Overall Risk</p>
+      <div class="risk-overall-pill ${rollup.level}">${levelIcon} ${rollup.level}</div>
+      <div style="display:flex; flex-wrap:wrap; gap:4px; margin:14px 0 0; padding:10px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line);">
         ${riskStat('Financial', rollup.counts.financial)}
         ${riskStat('Business', rollup.counts.business)}
         ${riskStat('Industry', rollup.counts.industry)}
@@ -3462,9 +3506,17 @@ function renderRiskRollupContent(rollup) {
         ${riskStat('Changed', rollup.changedCount)}
         ${riskStat('Open', rollup.allActiveCount)}
       </div>
-      ${riskSummarySection('🔴', 'High priority', rollup.buckets.High, 'var(--rust)')}
-      ${riskSummarySection('🟠', 'Medium priority', rollup.buckets.Medium, 'var(--brass)')}
-      ${riskSummarySection('🟢', 'Managed', rollup.managed, 'var(--sage)')}
+      <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:12px;">
+        <button type="button" class="risk-filter-pill active" data-filter-source="all">All</button>
+        <button type="button" class="risk-filter-pill" data-filter-source="financial">📊 Financial</button>
+        <button type="button" class="risk-filter-pill" data-filter-source="business">🧑 Business</button>
+        <button type="button" class="risk-filter-pill" data-filter-source="industry">🏭 Industry</button>
+      </div>
+      <div id="risk-summary-sections">
+        ${riskSummarySection('🔴', 'High priority', 'High', rollup.buckets.High)}
+        ${riskSummarySection('🟠', 'Medium priority', 'Medium', rollup.buckets.Medium)}
+        ${riskSummarySection('🟢', 'Managed', 'Managed', rollup.managed)}
+      </div>
       <button type="button" class="action" id="risk-review-btn" style="margin-top:14px;">Review risks</button>
     </div>
   `;
@@ -3518,6 +3570,30 @@ function wireRiskSummaryRegion() {
       const willOpen = expandEl.style.display === 'none';
       expandEl.style.display = willOpen ? 'block' : 'none';
       chevron.textContent = willOpen ? '▴' : '▾';
+    };
+  });
+
+  // Source filter pills — instant show/hide via data-source, not a
+  // re-render (this dataset is small and already fully in the DOM). A
+  // section header hides itself if every row under it got filtered out,
+  // so filtering to "Business" doesn't leave an empty "High priority"
+  // heading sitting above nothing.
+  summaryEl.querySelectorAll('.risk-filter-pill').forEach((pill) => {
+    pill.onclick = () => {
+      summaryEl.querySelectorAll('.risk-filter-pill').forEach((p) => p.classList.toggle('active', p === pill));
+      const filter = pill.dataset.filterSource;
+      summaryEl.querySelectorAll('.risk-summary-row').forEach((row) => {
+        row.style.display = (filter === 'all' || row.dataset.source === filter) ? '' : 'none';
+      });
+      summaryEl.querySelectorAll('.risk-section-header').forEach((header) => {
+        let sib = header.nextElementSibling;
+        let anyVisible = false;
+        while (sib && sib.classList.contains('risk-summary-row')) {
+          if (sib.style.display !== 'none') anyVisible = true;
+          sib = sib.nextElementSibling;
+        }
+        header.style.display = anyVisible ? '' : 'none';
+      });
     };
   });
 }
