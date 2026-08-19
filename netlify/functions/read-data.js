@@ -8,10 +8,11 @@
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const { getCategoriesForReview, getAllActiveQuestions } = require('./lib/business-risk-questionnaire');
+const { getOrGenerateMultiple } = require('./lib/valuation-multiple');
 
 exports.handler = async (event) => {
   try {
-    const { action, client_id, period_end } = JSON.parse(event.body || '{}');
+    const { action, client_id, period_end, view_cadence, periods_count } = JSON.parse(event.body || '{}');
 
     if (action === 'list_clients') {
       const { data, error } = await supabase.from('client_context').select('client_id, business_description, industry, cadence, profile_extra');
@@ -68,12 +69,13 @@ exports.handler = async (event) => {
         const { data: hsList } = await supabase.from('health_scores').select('period_end').eq('client_id', client_id).order('period_end', { ascending: false }).limit(1);
         targetPeriod = hsList?.[0]?.period_end || null;
       }
-      if (!targetPeriod) return { statusCode: 200, body: JSON.stringify({ diagnosis: null, getBetter: [], opportunities: [], taxPlanning: [], risks: [] }) };
+      if (!targetPeriod) return { statusCode: 200, body: JSON.stringify({ diagnosis: null, getBetter: [], opportunities: [], taxPlanning: [], risks: [], growthTrajectoryCommentary: null }) };
 
-      const [{ data: diag }, { data: recs }, { data: riskFlags }] = await Promise.all([
+      const [{ data: diag }, { data: recs }, { data: riskFlags }, { data: growthDiag }] = await Promise.all([
         supabase.from('diagnostics').select('*').eq('client_id', client_id).eq('period_end', targetPeriod).eq('pillar', 'overall').limit(1).maybeSingle(),
         supabase.from('recommendations').select('*').eq('client_id', client_id).eq('period_end', targetPeriod),
         supabase.from('flags').select('*').eq('client_id', client_id).eq('period_end', targetPeriod).not('risk_category', 'is', null),
+        supabase.from('diagnostics').select('cause_text').eq('client_id', client_id).eq('period_end', targetPeriod).eq('pillar', 'growth_trajectory').limit(1).maybeSingle(),
       ]);
       return {
         statusCode: 200,
@@ -83,6 +85,7 @@ exports.handler = async (event) => {
           opportunities: (recs || []).filter((r) => r.type === 'growth'),
           taxPlanning: (recs || []).filter((r) => r.type === 'tax_planning'),
           risks: riskFlags || [],
+          growthTrajectoryCommentary: growthDiag?.cause_text || null,
           period_end: targetPeriod,
         }),
       };
@@ -341,6 +344,121 @@ exports.handler = async (event) => {
       }));
 
       return { statusCode: 200, body: JSON.stringify({ periods, kpis }) };
+    }
+
+    // Growth trajectory chart's own dedicated action — deliberately NOT
+    // folded into get_kpi_history above. That action's `kpis` array mixes
+    // flow ratios (safe to aggregate by summing numerator/denominator) with
+    // stock ratios like current_ratio/debt_to_equity (aggregating those by
+    // summing across periods would be wrong — you'd want the last balance in
+    // the bucket, not a sum of four quarters' worth of the same balance).
+    // Revenue and net profit are both flow measures, so summing across a
+    // cadence rollup is the ONLY case here that's safe to build generically
+    // — keeping it a separate action means get_kpi_history (and Pace-to-goal,
+    // which reads its `kpis` array) is completely unaffected by any of this.
+    if (action === 'get_growth_trajectory') {
+      const PERIODS_PER_YEAR = { quarterly: 4, half_yearly: 2, annual: 1 };
+
+      const { data: context } = await supabase.from('client_context').select('cadence').eq('client_id', client_id).single();
+      const nativeCadence = PERIODS_PER_YEAR[context?.cadence] ? context.cadence : 'quarterly';
+      // Can't view finer than what was actually entered — clamp up to
+      // native rather than pretend quarterly detail exists for an
+      // annual-cadence client.
+      const viewCadence = (view_cadence && PERIODS_PER_YEAR[view_cadence] && PERIODS_PER_YEAR[view_cadence] <= PERIODS_PER_YEAR[nativeCadence])
+        ? view_cadence : nativeCadence;
+      const bucketSize = PERIODS_PER_YEAR[nativeCadence] / PERIODS_PER_YEAR[viewCadence];
+
+      const requestedCount = Math.min(Math.max(parseInt(periods_count, 10) || 6, 2), 20);
+      const nativePeriodsNeeded = requestedCount * bucketSize;
+
+      const { data: snapshots, error: snapErr } = await supabase
+        .from('financial_snapshots')
+        .select('period_end, revenue, net_profit, interest_expense, depreciation_amortisation')
+        .eq('client_id', client_id)
+        .lte('period_end', period_end || '9999-12-31')
+        .order('period_end', { ascending: false })
+        .limit(nativePeriodsNeeded);
+      if (snapErr) throw snapErr;
+      if (!snapshots || !snapshots.length) return { statusCode: 200, body: JSON.stringify({ periods: [], revenue: [], netProfit: [], interestExpense: [], depreciationAmortisation: [], nativeCadence, viewCadence }) };
+
+      const chronological = [...snapshots].reverse();
+
+      // Bucket into groups of `bucketSize` consecutive native periods, from
+      // the OLDEST end forward — an incomplete trailing group (fewer than
+      // bucketSize periods, e.g. a quarterly client only 2 quarters into
+      // their current year) is dropped rather than shown as a partial
+      // "year" that would understate the true annual figure. Same
+      // null-over-guess convention this app already follows elsewhere.
+      const buckets = [];
+      for (let i = 0; i + bucketSize <= chronological.length; i += bucketSize) {
+        buckets.push(chronological.slice(i, i + bucketSize));
+      }
+      const sumField = (bucket, field) => {
+        let total = 0;
+        for (const snap of bucket) {
+          const v = snap[field];
+          if (v === null || v === undefined) return null;
+          total += Number(v);
+        }
+        return total;
+      };
+
+      const periods = buckets.map((b) => b[b.length - 1].period_end);
+      const revenue = buckets.map((b) => sumField(b, 'revenue'));
+      const netProfit = buckets.map((b) => sumField(b, 'net_profit'));
+      // interest_expense/depreciation_amortisation: both flow (P&L expense)
+      // measures like revenue/net_profit, so summing across a rollup is the
+      // same safe operation — feeds the valuation card's multi-year average
+      // EBITDA, not just the trajectory chart.
+      const interestExpense = buckets.map((b) => sumField(b, 'interest_expense'));
+      const depreciationAmortisation = buckets.map((b) => sumField(b, 'depreciation_amortisation'));
+
+      return { statusCode: 200, body: JSON.stringify({ periods, revenue, netProfit, interestExpense, depreciationAmortisation, nativeCadence, viewCadence }) };
+    }
+
+    if (action === 'get_valuation_history') {
+      const { data: valuations, error: valErr } = await supabase
+        .from('business_valuations')
+        .select('*')
+        .eq('client_id', client_id)
+        .order('period_end');
+      if (valErr) throw valErr;
+
+      // Always try to surface a recommended multiple when the client has an
+      // industry on file — not just pre-save. Cheap to do every time thanks
+      // to the industry_valuation_multiple_cache: a repeat lookup for the
+      // same industry is a cache read, not a fresh AI call, so there's no
+      // real cost to keeping "Recommended" populated even on a period
+      // that's already been saved.
+      let suggestedMultiple = null;
+      const { data: context } = await supabase.from('client_context').select('industry, business_description').eq('client_id', client_id).single();
+      if (context?.industry) {
+        try {
+          suggestedMultiple = await getOrGenerateMultiple(supabase, context.industry, context.business_description);
+        } catch (err) {
+          console.error('Valuation multiple generation failed:', err.message);
+        }
+      }
+
+      return { statusCode: 200, body: JSON.stringify({ valuations: valuations || [], suggestedMultiple }) };
+    }
+
+    if (action === 'get_owner_wealth') {
+      // Run independently (Promise.all, and the wealth-snapshots error is
+      // swallowed rather than thrown) so a missing/erroring
+      // owner_wealth_snapshots table — e.g. before its migration has been
+      // run — can never take down the business-equity cross-reference,
+      // which reads a completely separate table. Same "degrade gracefully,
+      // optional table" convention already used for kpi_library elsewhere.
+      const [ownerWealthResult, valuationsResult] = await Promise.all([
+        supabase.from('owner_wealth_snapshots').select('*').eq('client_id', client_id).order('period_end'),
+        supabase.from('business_valuations').select('period_end, valuation_amount').eq('client_id', client_id).order('period_end', { ascending: false }).limit(1),
+      ]);
+      if (ownerWealthResult.error) console.error('owner_wealth_snapshots read failed:', ownerWealthResult.error.message);
+      const snapshots = ownerWealthResult.data;
+      const valuations = valuationsResult.data;
+
+      return { statusCode: 200, body: JSON.stringify({ snapshots: snapshots || [], latestValuation: valuations?.[0] || null }) };
     }
 
     // Risk Review domain — rolls up all sources sharing risk_items. Financial

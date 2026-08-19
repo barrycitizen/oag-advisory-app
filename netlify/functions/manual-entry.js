@@ -124,6 +124,95 @@ async function saveFinancials(body) {
   return row;
 }
 
+// Business valuation (Growth domain) — upserts one row per client/period,
+// same shape as saveFinancials: server computes the derived field
+// (valuation_amount) rather than trusting a client-sent total. See
+// netlify/functions/lib/valuation-multiple.js for how ai_suggested_multiple
+// gets suggested in the first place.
+async function saveValuation(body) {
+  const { client_id, period_end, ebitda, ai_suggested_multiple, multiple_used } = body;
+  if (!client_id || !period_end) throw new Error('client_id and period_end required');
+  if (ebitda == null || multiple_used == null) throw new Error('ebitda and multiple_used required');
+
+  const row = {
+    client_id, period_end,
+    ebitda: Number(ebitda),
+    ai_suggested_multiple: ai_suggested_multiple != null ? Number(ai_suggested_multiple) : null,
+    multiple_used: Number(multiple_used),
+    valuation_amount: Number(ebitda) * Number(multiple_used),
+    updated_at: new Date().toISOString(),
+  };
+  const { error } = await supabase.from('business_valuations').upsert(row, { onConflict: 'client_id,period_end' });
+  if (error) throw error;
+  return row;
+}
+
+// Owner Wealth domain — personal net worth tiles, upserted one row per
+// client/year. No server-computed derived field this time (unlike
+// saveValuation's valuation_amount) — just the raw tiles; the net worth
+// total is computed client-side from these (see computeNetWorthTotal,
+// index.html) since it needs no data this function doesn't already have.
+// Each bucket is now a list of named items (e.g. multiple super funds,
+// multiple properties) rather than one lump-sum number — mirrors
+// financial_snapshots.cash_recon_adjustments' shape. The plain numeric
+// columns (super_balance etc.) are kept and still drive everything else
+// that reads this table (computeNetWorthTotal, the Retirement Outlook, the
+// trend chart) — they're just server-computed as the sum of each bucket's
+// items now, instead of trusted from a client-typed lump sum, same
+// "derived, not trusted" pattern saveValuation already uses for
+// valuation_amount.
+function cleanOwnerWealthItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter((it) => it && it.value !== '' && it.value != null && !isNaN(Number(it.value)))
+    .map((it) => ({ label: String(it.label || '').trim() || 'Item', value: Number(it.value) }));
+}
+function sumOwnerWealthItems(items) {
+  return items.reduce((sum, it) => sum + it.value, 0);
+}
+
+// User-named boxes beyond the fixed five — each picks asset or liability so
+// the client knows which way to net it, same as the built-in buckets do
+// implicitly (debt subtracts, everything else adds).
+function cleanOwnerCustomBuckets(buckets) {
+  if (!Array.isArray(buckets)) return [];
+  return buckets.map((b) => ({
+    id: String(b?.id || '').trim() || `custom-${Math.random().toString(36).slice(2, 10)}`,
+    label: String(b?.label || '').trim() || 'Untitled box',
+    type: b?.type === 'liability' ? 'liability' : 'asset',
+    items: cleanOwnerWealthItems(b?.items),
+  }));
+}
+
+async function saveOwnerWealth(body) {
+  const { client_id, period_end, super_items, investments_items, property_items, other_assets_items, debt_items, custom_buckets, notes } = body;
+  if (!client_id || !period_end) throw new Error('client_id and period_end required');
+
+  const superItems = cleanOwnerWealthItems(super_items);
+  const investmentsItems = cleanOwnerWealthItems(investments_items);
+  const propertyItems = cleanOwnerWealthItems(property_items);
+  const otherItems = cleanOwnerWealthItems(other_assets_items);
+  const debtItems = cleanOwnerWealthItems(debt_items);
+  const customBuckets = cleanOwnerCustomBuckets(custom_buckets);
+
+  // NULL for "no items entered" vs a real 0 — same null-vs-zero convention
+  // saveFinancials uses, so an unset bucket can honestly show as "not
+  // entered" rather than silently counting as zero net worth in that bucket.
+  const row = {
+    client_id, period_end,
+    super_items: superItems, super_balance: superItems.length ? sumOwnerWealthItems(superItems) : null,
+    investments_items: investmentsItems, investments: investmentsItems.length ? sumOwnerWealthItems(investmentsItems) : null,
+    property_items: propertyItems, property: propertyItems.length ? sumOwnerWealthItems(propertyItems) : null,
+    other_assets_items: otherItems, other_assets: otherItems.length ? sumOwnerWealthItems(otherItems) : null,
+    debt_items: debtItems, debt: debtItems.length ? sumOwnerWealthItems(debtItems) : null,
+    custom_buckets: customBuckets,
+    notes: notes || null, updated_at: new Date().toISOString(),
+  };
+  const { error } = await supabase.from('owner_wealth_snapshots').upsert(row, { onConflict: 'client_id,period_end' });
+  if (error) throw error;
+  return row;
+}
+
 async function saveContext(body) {
   const { client_id } = body;
   if (!client_id) throw new Error('client_id required');
@@ -366,6 +455,8 @@ exports.handler = async (event) => {
       : body.type === 'restore_goal_category' ? await restoreGoalCategory(body)
       : body.type === 'delete_goal_question' ? await deleteGoalQuestion(body)
       : body.type === 'edit_goal_question' ? await editGoalQuestion(body)
+      : body.type === 'save_valuation' ? await saveValuation(body)
+      : body.type === 'save_owner_wealth' ? await saveOwnerWealth(body)
       : null;
 
     if (!result) return { statusCode: 400, body: 'Unknown type' };

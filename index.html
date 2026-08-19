@@ -257,6 +257,12 @@ input[type="file"] { border: none; padding: 4px 0; background: transparent; }
 .cash-adj-label-input:focus { background: var(--paper); outline: 1px solid var(--brass-soft); }
 .cash-adj-remove { color: var(--rust); opacity: 0.55; font-size: 13px; flex-shrink: 0; }
 .cash-adj-remove:hover { opacity: 1; }
+/* Owner Wealth item rows — deliberately visibly boxed (unlike the borderless
+   .cash-adj-label-input above), so it's obvious at a glance these are
+   editable fields, not static text. */
+.ow-item-label { flex: 1; border: 1px solid var(--line); border-radius: 6px; background: var(--paper-raised); font-size: 13px; font-family: var(--font-body); color: var(--ink); padding: 6px 8px; }
+.ow-item-value { border: 1px solid var(--line); border-radius: 6px; background: var(--paper-raised); text-align: right; width: 110px; font-family: var(--font-mono); font-size: 13px; color: var(--ink); padding: 6px 8px; }
+.ow-item-label:focus, .ow-item-value:focus { outline: 1px solid var(--brass-soft); }
 .cash-residual-box { margin-top: 4px; padding: 10px 14px; border-radius: 8px; background: var(--sage-bg); display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
 .cash-residual-box.neg { background: var(--rust-bg); }
 .cash-residual-label { font-size: 12px; color: var(--ink-soft); }
@@ -268,6 +274,8 @@ input[type="file"] { border: none; padding: 4px 0; background: transparent; }
 .snapshot-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px 18px; }
 .snapshot-field { min-width: 0; }
 .snapshot-field .card-label { margin-bottom: 2px; }
+.ow-jump-tile { cursor: pointer; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--paper-raised); transition: background 0.15s, border-color 0.15s; }
+.ow-jump-tile:hover { background: var(--paper); border-color: var(--brass-soft); }
 .snapshot-value { font-family: var(--font-mono); font-size: 15px; margin: 0; color: var(--ink); }
 .snapshot-value.blank { color: var(--ink-soft); font-style: italic; font-size: 12px; }
 .snapshot-provenance { font-size: 11px; color: var(--ink-soft); margin: 10px 0 0; }
@@ -537,7 +545,7 @@ const DOMAINS = [
   { key: 'financial', label: 'Financial Performance' },
   { key: 'growth', label: 'Growth' },
   { key: 'risk', label: 'Risk' },
-  { key: 'owner', label: 'Owner' },
+  { key: 'owner', label: 'Owner Wealth' },
   { key: 'actions', label: 'Actions' },
 ];
 const WORKFLOW_LABELS = { profile: 'Profile', input: 'Input', analyse: 'Analyse', diagnose: 'Diagnose', meeting: 'Meeting', report: 'Report' };
@@ -553,6 +561,8 @@ const WIRED_WORKFLOWS = {
   financial: ['input', 'analyse', 'diagnose'],
   goals: ['profile', 'input'],
   risk: ['analyse'],
+  growth: ['analyse'],
+  owner: ['input', 'analyse'],
 };
 function isWorkflowVisible(tabKey, domain) {
   if (GLOBAL_WORKFLOWS.includes(tabKey)) return true;
@@ -906,6 +916,17 @@ async function renderMain() {
   if (currentDomain === 'risk') {
     if (currentWorkflow === 'analyse') return renderRiskAnalyse(content);
     return renderPlaceholder(content, `Risk — ${WORKFLOW_LABELS[currentWorkflow]} isn't wired up yet.`);
+  }
+
+  if (currentDomain === 'growth') {
+    if (currentWorkflow === 'analyse') return renderGrowthAnalyse(content);
+    return renderPlaceholder(content, `Growth — ${WORKFLOW_LABELS[currentWorkflow]} isn't wired up yet.`);
+  }
+
+  if (currentDomain === 'owner') {
+    if (currentWorkflow === 'input') return renderOwnerInput(content);
+    if (currentWorkflow === 'analyse') return renderOwnerAnalyse(content);
+    return renderPlaceholder(content, `Owner Wealth — ${WORKFLOW_LABELS[currentWorkflow]} isn't wired up yet.`);
   }
 
   const domainLabel = DOMAINS.find((d) => d.key === currentDomain)?.label || currentDomain;
@@ -1485,6 +1506,28 @@ function findKpiTarget(kpiKey) {
   return null;
 }
 
+// Same walk as findKpiTarget, but collects every distinct kpi_key with an
+// active target instead of stopping at one requested key — feeds the
+// Pace-to-goal card, which needs to show all of a client's KPI targets at
+// once, not just one.
+function findAllKpiTargets() {
+  if (!currentCtx?.owner_goals || !currentPeriodEnd) return [];
+  const goals = currentCtx.owner_goals;
+  const periods = goals.periods || {};
+  const allCats = [...GOAL_CATEGORIES, ...(goals.custom_categories || [])];
+  const candidatePeriods = Object.keys(periods).filter((p) => p <= currentPeriodEnd).sort().reverse();
+  const found = {};
+  for (const p of candidatePeriods) {
+    for (const cat of allCats) {
+      const items = (periods[p]?.cats?.[cat.key]?.items || []).filter((it) => !it.deleted);
+      items.filter((it) => !it.done && it.kpi_key && it.target != null).forEach((it) => {
+        if (!found[it.kpi_key]) found[it.kpi_key] = { ...it, category: cat.key, sourcePeriod: p };
+      });
+    }
+  }
+  return Object.values(found);
+}
+
 async function addKpiTargetGoal(kpi, target, category = 'business') {
   const fresh = await callRead('get_context', currentClientId);
   const current = fresh?.owner_goals?.periods?.[currentPeriodEnd]?.cats?.[category]?.items || [];
@@ -1883,6 +1926,7 @@ function renderCashFlowGlanceCard(kpi) {
 // app has stayed away from all session. This is one clean extension of a
 // number the app already trusts, not a full cash flow projection.
 let cashOutlookState = { unit: 'pct', revenue: 0, gp: 0, opex: 0, netProfit: 0, netProfitAbsolute: '' };
+let growthOutlookState = { unit: 'pct', revenue: 0, cogs: 0, wages: 0, opex: 0, netProfit: 0 };
 function computeCashOutlookResult(snapshot, conversion, unit, revenueChange, gpChange, opexChange, netProfitChange, netProfitAbsolute) {
   const { projectedProfit, buildup, provenance } = projectProfitScenario(snapshot, unit, revenueChange, gpChange, opexChange, netProfitChange, netProfitAbsolute);
   const projectedOCF = projectedProfit * conversion;
@@ -2097,6 +2141,367 @@ function projectProfitScenario(snapshot, unit, revenueChange, gpChange, opexChan
     buildup = `Revenue <b>${formatMoney(projectedRevenue)}</b> → gross profit <b>${formatMoney(projectedGP)}</b> − operating expenses <b>${formatMoney(projectedOpex)}</b> = projected profit <b>${formatMoney(projectedProfit)}</b>`;
   }
   return { projectedProfit, buildup, isBaseline, provenance };
+}
+
+// Growth's own version of the scenario buildup — Revenue and Cost of sales
+// are independent levers (not mutually exclusive alternatives) that combine
+// into gross profit, same as Wages is independent of Other opex. Net profit
+// change is the one shortcut lever left: fill that in and it skips the whole
+// Revenue/COGS/wages/opex chain, for "I know how much it'll move" instead of
+// "let me build it up from the parts." Deliberately a separate function (not
+// a param added to projectProfitScenario) so Cash Outlook and Tax Outlook's
+// existing calls can never be affected by this.
+function projectGrowthProfitScenario(snapshot, unit, revenueChange, cogsChange, wagesChange, opexChange, netProfitChange) {
+  const revenue = snapshot.revenue;
+  const netProfit = snapshot.net_profit;
+  const baselineCogs = snapshot.cogs;
+  const baselineGP = baselineCogs != null ? revenue - baselineCogs : null;
+  const baselineOpex = baselineGP != null ? baselineGP - netProfit : revenue - netProfit;
+  const baselineWages = snapshot.wages || 0;
+  const baselineOtherOpex = baselineOpex - baselineWages;
+  const delta = (val, baseline) => unit === 'dollar' ? val : baseline * (val / 100);
+
+  const isBaseline = !netProfitChange && !revenueChange && !cogsChange && !wagesChange && !opexChange;
+  const provenance = isBaseline
+    ? `Based on this period's actual net profit (${formatMoney(netProfit)}).`
+    : `Modeling a scenario, not this period's actual figures.`;
+
+  // projectedRevenue/projectedGP only come out non-null when the
+  // Revenue/COGS/wages/opex chain actually runs — the Net profit override
+  // below skips deriving a revenue figure entirely, and inventing one would
+  // mean showing a number nobody actually computed. Cash cost of growing
+  // (see computeCashCostOfGrowing) depends on these staying null unless real.
+  let projectedProfit, buildup, projectedRevenueOut = null, projectedGPOut = null;
+  if (netProfitChange) {
+    projectedProfit = netProfit + delta(netProfitChange, netProfit);
+    buildup = `Net profit ${formatMoney(netProfit)} → projected profit <b>${formatMoney(projectedProfit)}</b>`;
+  } else {
+    const projectedRevenue = revenue + delta(revenueChange, revenue);
+    const projectedCogs = baselineCogs != null ? baselineCogs + delta(cogsChange, baselineCogs) : null;
+    const projectedGP = projectedCogs != null ? projectedRevenue - projectedCogs : projectedRevenue; // no cogs recorded — treat revenue as GP
+    const projectedWages = baselineWages + delta(wagesChange, baselineWages);
+    const projectedOtherOpex = baselineOtherOpex + delta(opexChange, baselineOtherOpex);
+    projectedProfit = projectedGP - projectedWages - projectedOtherOpex;
+    buildup = projectedCogs != null
+      ? `Revenue <b>${formatMoney(projectedRevenue)}</b> − cost of sales <b>${formatMoney(projectedCogs)}</b> = gross profit <b>${formatMoney(projectedGP)}</b> − wages <b>${formatMoney(projectedWages)}</b> − other operating expenses <b>${formatMoney(projectedOtherOpex)}</b> = projected profit <b>${formatMoney(projectedProfit)}</b>`
+      : `Revenue <b>${formatMoney(projectedRevenue)}</b> → gross profit <b>${formatMoney(projectedGP)}</b> − wages <b>${formatMoney(projectedWages)}</b> − other operating expenses <b>${formatMoney(projectedOtherOpex)}</b> = projected profit <b>${formatMoney(projectedProfit)}</b>`;
+    projectedRevenueOut = projectedRevenue;
+    projectedGPOut = projectedGP;
+  }
+  return { projectedProfit, buildup, isBaseline, provenance, projectedRevenue: projectedRevenueOut, projectedGP: projectedGPOut };
+}
+
+// Applies the client's OWN debtor/creditor/inventory-days ratios (never
+// invented ones) to a modeled revenue increase to estimate the net extra
+// cash growth would tie up — standard working-capital treatment: extra
+// debtors + extra inventory, netted against extra creditors (supplier
+// financing reduces the cash burden, it doesn't add to it). Deliberately
+// gated on projectedRevenue being non-null — the Net profit override branch
+// of projectGrowthProfitScenario doesn't derive a real revenue figure to
+// work from, so this returns null there rather than guess one.
+function computeCashCostOfGrowing(snapshot, kpis, projectedRevenue, projectedGP) {
+  if (projectedRevenue == null || snapshot?.cogs == null) return null;
+  const kpi = (key) => kpis?.find((k) => k.key === key);
+  const debtorDays = kpi('debtor_days');
+  const creditorDays = kpi('creditor_days');
+  const inventoryDays = kpi('inventory_days');
+  if (!debtorDays || debtorDays.confidence === 'red' || debtorDays.value == null) return null;
+  if (!inventoryDays || inventoryDays.confidence === 'red' || inventoryDays.value == null) return null;
+
+  const extraRevenue = projectedRevenue - snapshot.revenue;
+  const extraDebtors = extraRevenue * (debtorDays.value / 365);
+  const extraCogs = (projectedRevenue - projectedGP) - snapshot.cogs;
+  const extraInventory = extraCogs * (inventoryDays.value / 365);
+  const extraCreditors = (creditorDays && creditorDays.confidence !== 'red' && creditorDays.value != null)
+    ? extraCogs * (creditorDays.value / 365) : 0;
+
+  const netCashTiedUp = extraDebtors + extraInventory - extraCreditors;
+  if (Math.abs(netCashTiedUp) < 1) return null; // no meaningful growth modeled
+  return netCashTiedUp;
+}
+
+function renderGrowthOutlookCard(snapshot) {
+  const revenue = snapshot?.revenue;
+  const netProfit = snapshot?.net_profit;
+  if (!revenue || netProfit == null) return '';
+  const selectStyle = 'padding:5px 8px; border:1px solid var(--line); border-radius:6px; font-size:12px; font-family:var(--font-mono); background:var(--paper-raised); color:var(--ink);';
+  const s = growthOutlookState;
+  const row = (id, label, value) => `<div class="ocf-row"><label>${label}</label><input type="number" id="${id}" value="${value}" placeholder="0" /></div>`;
+  const panelOpen = s.revenue !== 0 || s.cogs !== 0 || s.wages !== 0 || s.opex !== 0 || s.netProfit !== 0;
+  return `
+    <div class="kpi-card">
+      <div class="kpi-card-head"><p class="kpi-name">Growth outlook — model a scenario</p></div>
+      <div style="background:var(--sage-bg); border-radius:8px; padding:8px 12px; display:inline-block;">
+        <p class="kpi-value" id="growth-outlook-value" style="margin:0;">—</p>
+        <p class="card-label" style="margin:2px 0 0;">Projected net profit</p>
+      </div>
+      <p class="muted plain" id="growth-outlook-change" style="margin:6px 0 0;"></p>
+      <p class="muted plain" id="growth-outlook-cash-cost" style="margin:6px 0 0; display:none;"></p>
+      <p style="font-size:11px; color:var(--ink-soft); margin:6px 0 0;">
+        <span id="growth-outlook-provenance"></span>
+        <button type="button" id="growth-outlook-provenance-link" style="background:none; border:none; padding:0; margin-left:2px; color:var(--brass); font-size:11px; cursor:pointer; text-decoration:underline; font-family:inherit;">Adjust assumptions</button>
+      </p>
+
+      <div class="cash-item cash-item-clickable" id="growth-outlook-toggle">
+        <span class="cash-item-icon">🧮</span>
+        <span class="cash-item-label">Adjust assumptions</span>
+        <span class="chevron">${panelOpen ? '▴' : '▾'}</span>
+      </div>
+      <div class="ocf-adjust-panel" id="growth-outlook-panel" style="display:${panelOpen ? 'block' : 'none'};">
+        <div class="ocf-row"><label>Change amounts as</label><select id="growth-outlook-unit" style="${selectStyle}"><option value="pct" ${s.unit === 'pct' ? 'selected' : ''}>%</option><option value="dollar" ${s.unit === 'dollar' ? 'selected' : ''}>$</option></select></div>
+        ${row('growth-outlook-revenue', 'Revenue', s.revenue)}
+        ${row('growth-outlook-cogs', 'Cost of sales', s.cogs)}
+        ${row('growth-outlook-wages', 'Wages', s.wages)}
+        ${row('growth-outlook-opex', 'Other operating expenses', s.opex)}
+        ${row('growth-outlook-netprofit', 'Or move net profit directly (skips everything above)', s.netProfit)}
+        <p style="font-size:11px; color:var(--ink-soft); margin:6px 0 0;">Revenue, cost of sales, wages and other opex combine to build up projected profit — adjust any of them together. Net profit overrides all of them if you'd rather just model a bottom-line move directly.</p>
+        <p style="font-size:11px; color:var(--ink-soft); margin:6px 0 0;" id="growth-outlook-buildup"></p>
+      </div>
+      <p style="font-size:11px; color:var(--ink-soft); margin-top:8px; font-style:italic;">Rough estimate — gross profit is Revenue minus Cost of sales; Wages and Other opex only move if you enter a change for them.</p>
+    </div>
+  `;
+}
+
+const CADENCE_UNIT = { quarterly: 'quarters', half_yearly: 'half-years', annual: 'years' };
+
+// Simple two-point trend (oldest vs newest non-null value in the client's
+// KPI history) projected forward to a goal's target — no real regression,
+// deliberately, per the build spec's "v1" scope. Uses KPI_DIRECTION to know
+// whether the target's already been reached (can't just compare magnitudes —
+// a lower value is the win for some KPIs, higher for others).
+function computePaceToGoal(targetItem, kpiHistoryEntry) {
+  const values = kpiHistoryEntry?.values || [];
+  const points = values.map((v, i) => ({ v, i })).filter((p) => p.v != null);
+  if (points.length < 2) return { status: 'insufficient' };
+
+  const oldest = points[0];
+  const newest = points[points.length - 1];
+  const rate = (newest.v - oldest.v) / (newest.i - oldest.i);
+  const target = targetItem.target;
+  const direction = KPI_DIRECTION[targetItem.kpi_key];
+  const reached = direction === 'higher' ? newest.v >= target : direction === 'lower' ? newest.v <= target : Math.abs(newest.v - target) < 1e-9;
+  if (reached) return { status: 'reached', current: newest.v };
+
+  const distanceRemaining = target - newest.v;
+  if (rate === 0 || Math.sign(rate) !== Math.sign(distanceRemaining)) {
+    return { status: 'off-track', current: newest.v };
+  }
+  const periodsAway = Math.ceil(distanceRemaining / rate);
+  return { status: 'on-track', current: newest.v, periodsAway };
+}
+
+function renderPaceToGoalCard(targets, history) {
+  if (!targets.length) {
+    return `<div class="card"><p class="muted">Pace to goal</p><p class="muted plain" style="margin:0;">Set a target on a Goals item (with a linked KPI) to see pace-to-goal here.</p></div>`;
+  }
+  const unit = CADENCE_UNIT[currentCtx?.cadence] || 'periods';
+  const lines = targets.map((t) => {
+    const kpiEntry = (history?.kpis || []).find((k) => k.key === t.kpi_key);
+    const pace = computePaceToGoal(t, kpiEntry);
+    const format = kpiEntry?.format;
+    const targetLabel = `${kpiEntry?.name || t.kpi_key} target ${formatKpi(t.target, format)}`;
+    let statusText;
+    if (pace.status === 'insufficient') statusText = 'not enough history yet to project a trend.';
+    else if (pace.status === 'reached') statusText = `target reached — currently ${formatKpi(pace.current, format)}.`;
+    else if (pace.status === 'off-track') statusText = `trending the wrong way — not on track at the current rate (currently ${formatKpi(pace.current, format)}).`;
+    else statusText = `at the current trend, ~${pace.periodsAway} ${unit} away (currently ${formatKpi(pace.current, format)}).`;
+    return `<p class="muted plain" style="margin:0 0 6px;">${targetLabel} — ${statusText}</p>`;
+  }).join('');
+  return `<div class="card"><p class="muted">Pace to goal</p>${lines}</div>`;
+}
+
+// Small single-series line chart, plain inline SVG (no charting library
+// anywhere in this app — matches the cash-conversion donut/health wheel
+// convention). One series per call, not Revenue+NP on a shared axis — at
+// most clients' scale Net profit would be nearly invisible next to Revenue
+// on one y-scale (the #1 rule from this project's dataviz skill: never a
+// dual-axis chart). Straight polyline segments between adjacent non-null
+// points — a genuine gap (a period with no snapshot saved) would draw a
+// straight line across it rather than a visible break; acceptable for v1
+// since most clients have no gaps once a period's saved.
+// Value/date labels are deliberately plain HTML below the chart, NOT text
+// inside the SVG. SVG scales everything — text included — proportionally
+// to however wide its container ends up being; once these cards went
+// side-by-side, the shrunk render width shrank in-chart <text> right along
+// with it, undoing any font-size bump. Plain HTML text stays real CSS
+// pixels regardless of how narrow the column gets.
+function renderTrendLineChart(periods, values, color, width = 320, height = 70) {
+  const points = values.map((v, i) => ({ v, i })).filter((p) => p.v != null);
+  if (points.length < 2) return '<p class="muted plain" style="margin:0;">Not enough history yet.</p>';
+  const padX = 10, padY = 10;
+  const vals = points.map((p) => p.v);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const range = max - min || 1;
+  const xFor = (i) => padX + (i / (values.length - 1)) * (width - padX * 2);
+  const yFor = (v) => height - padY - ((v - min) / range) * (height - padY * 2);
+  const linePoints = points.map((p) => `${xFor(p.i)},${yFor(p.v)}`).join(' ');
+  const dots = points.map((p) => `<circle cx="${xFor(p.i)}" cy="${yFor(p.v)}" r="3.5" fill="${color}" />`).join('');
+  const svg = `
+    <svg viewBox="0 0 ${width} ${height}" style="width:100%; max-width:${width}px; height:auto; display:block;">
+      <polyline points="${linePoints}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+      ${dots}
+    </svg>
+  `;
+  const labels = periods.map((p, i) => `
+    <div style="text-align:center; min-width:56px;">
+      <div style="font-size:10px; color:var(--ink-soft); font-family:var(--font-mono);">${formatShortDate(p).replace(/^\d+ /, '')}</div>
+      <div style="font-size:13px; font-weight:600; color:var(--ink); font-family:var(--font-mono); white-space:nowrap;">${values[i] != null ? formatMoney(values[i]) : '—'}</div>
+    </div>
+  `).join('');
+  return `${svg}<div style="display:flex; flex-wrap:wrap; justify-content:center; gap:6px 10px; margin-top:4px;">${labels}</div>`;
+}
+
+const TRAJECTORY_PERIODS_PER_YEAR = { quarterly: 4, half_yearly: 2, annual: 1 };
+const CADENCE_LABEL_SHORT = { quarterly: 'Quarterly', half_yearly: 'Half-yearly', annual: 'Annual' };
+
+// Which view-cadence options make sense to offer — same or coarser than
+// what the client's own data was actually entered at. You can't view
+// quarterly detail for a client who only ever files annually; that data
+// doesn't exist to roll DOWN into.
+function availableTrajectoryCadences(nativeCadence) {
+  return ['quarterly', 'half_yearly', 'annual'].filter((c) => TRAJECTORY_PERIODS_PER_YEAR[c] <= TRAJECTORY_PERIODS_PER_YEAR[nativeCadence]);
+}
+
+// "Last N" alone doesn't say whether that's 4 quarters or 4 years — every
+// option is labelled with the actual unit for whichever cadence is
+// currently selected, and relabelled live when the cadence dropdown changes
+// (see wireTrajectoryCard in renderGrowthAnalyse).
+function trajectoryPeriodsCountOptionsHtml(cadence, selectedCount) {
+  const unit = CADENCE_UNIT[cadence] || 'periods';
+  return [4, 6, 8, 12].map((n) => `<option value="${n}" ${n === selectedCount ? 'selected' : ''}>Last ${n} ${unit}</option>`).join('');
+}
+
+// Static shell only — the chart region is filled in by loadTrajectory()
+// (wired in renderGrowthAnalyse) since view-cadence/period-count are
+// interactive and require a fresh fetch from get_growth_trajectory, not
+// just a re-render of already-loaded data.
+function renderGrowthTrajectoryCard(commentary) {
+  const nativeCadence = currentCtx?.cadence || 'quarterly';
+  const cadenceOptions = availableTrajectoryCadences(nativeCadence);
+  // Default to Annual, not the client's native cadence — 'annual' is always
+  // a valid option (it's the coarsest possible view, so it's never finer
+  // than what was entered), and a quarterly/half-yearly client's raw
+  // per-period noise is rarely what you want to see first. The dropdown is
+  // still there to drill into finer detail on demand.
+  const defaultCadence = 'annual';
+  const selectStyle = 'padding:5px 8px; border:1px solid var(--line); border-radius:6px; font-size:12px; font-family:var(--font-mono); background:var(--paper-raised); color:var(--ink);';
+  return `
+    <div class="card">
+      <p class="muted">Growth trajectory</p>
+      ${commentary ? `<p class="muted plain" style="font-size:12px; margin:6px 0 10px; padding:8px 10px; background:var(--sage-bg); border-radius:6px;">🤖 ${commentary}</p>` : ''}
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap;">
+        ${cadenceOptions.length > 1 ? `
+          <select id="trajectory-cadence" style="${selectStyle}">
+            ${cadenceOptions.map((c) => `<option value="${c}" ${c === defaultCadence ? 'selected' : ''}>${CADENCE_LABEL_SHORT[c]}</option>`).join('')}
+          </select>
+        ` : ''}
+        <select id="trajectory-periods-count" style="${selectStyle}">
+          ${trajectoryPeriodsCountOptionsHtml(defaultCadence, 6)}
+        </select>
+      </div>
+      <div id="trajectory-chart-region"><p class="muted plain" style="margin:0;">Loading…</p></div>
+    </div>
+  `;
+}
+
+function renderGrowthTrajectoryChartRegion(trajectory) {
+  const periods = trajectory?.periods || [];
+  if (periods.length < 2) {
+    return `<p class="muted plain" style="margin:0;">Not enough periods on file yet to show a trend — needs at least 2.</p>`;
+  }
+  return `
+    <p class="card-label" style="margin:0 0 4px;">Revenue</p>
+    ${renderTrendLineChart(periods, trajectory.revenue || [], 'var(--sage)')}
+    <p class="card-label" style="margin:10px 0 4px;">Net profit</p>
+    ${renderTrendLineChart(periods, trajectory.netProfit || [], 'var(--brass)')}
+  `;
+}
+
+function computeEbitda(snapshot) {
+  if (snapshot?.net_profit == null || snapshot?.interest_expense == null || snapshot?.depreciation_amortisation == null) return null;
+  return snapshot.net_profit + snapshot.interest_expense + snapshot.depreciation_amortisation;
+}
+
+// Standard valuation practice: average EBITDA over a few years rather than
+// whatever the current period happens to be — a single year can be
+// unusually good or bad and skew the multiple-of-EBITDA estimate either
+// way. `trajectory` is a get_growth_trajectory response fetched specifically
+// as { view_cadence: 'annual', periods_count: 3 } — annual only, per the
+// "valuation should only be annual" decision, regardless of the client's
+// own native cadence. Averages whichever of those years actually have
+// complete data rather than requiring all 3 (a year with one missing field
+// is excluded from the average, not zero-filled or allowed to break it).
+function computeAverageEbitda(trajectory) {
+  const periods = trajectory?.periods || [];
+  if (!periods.length) return null;
+  const yearly = periods.map((_, i) => {
+    const np = trajectory.netProfit?.[i];
+    const ie = trajectory.interestExpense?.[i];
+    const da = trajectory.depreciationAmortisation?.[i];
+    return (np != null && ie != null && da != null) ? np + ie + da : null;
+  }).filter((v) => v != null);
+  if (!yearly.length) return null;
+  return yearly.reduce((sum, v) => sum + v, 0) / yearly.length;
+}
+
+// Mirrors dedupeBusinessToLatestPerCategory (analyze.js) — one row per
+// calendar year (latest period_end within the year wins) rather than one
+// per category — a quarter-to-quarter valuation comparison isn't a
+// meaningful cadence for this figure.
+function dedupeValuationsToLatestPerYear(rows) {
+  const latestPeriodByYear = {};
+  (rows || []).forEach((r) => {
+    const year = r.period_end.slice(0, 4);
+    if (!latestPeriodByYear[year] || r.period_end > latestPeriodByYear[year]) latestPeriodByYear[year] = r.period_end;
+  });
+  return (rows || []).filter((r) => latestPeriodByYear[r.period_end.slice(0, 4)] === r.period_end);
+}
+
+// Saved history only (deliberately not the live/unsaved figure being
+// edited above it) — always one point per calendar year via the dedupe,
+// regardless of how often a valuation gets saved.
+function renderValuationHistoryChart(valuations) {
+  const deduped = dedupeValuationsToLatestPerYear(valuations || []).sort((a, b) => a.period_end.localeCompare(b.period_end));
+  if (deduped.length < 2) return '';
+  const periods = deduped.map((v) => v.period_end);
+  const amounts = deduped.map((v) => v.valuation_amount);
+  return `<p class="card-label" style="margin:10px 0 4px;">Valuation over time</p>${renderTrendLineChart(periods, amounts, 'var(--sage)')}`;
+}
+
+function renderValuationCard(snapshot, valuationData, avgEbitda) {
+  const currentEbitda = computeEbitda(snapshot);
+  // Prefer the multi-year average when it's available — falls back to this
+  // period alone only when there isn't enough history to average (e.g. the
+  // client's first period on file). Either way, a Custom EBITDA field below
+  // covers the case where NEITHER is computable — the card never dead-ends
+  // with no way forward now, unlike the old hard "can't estimate" stop.
+  const defaultEbitda = avgEbitda ?? currentEbitda;
+  const ebitdaLabel = avgEbitda != null
+    ? `EBITDA (avg, up to 3yr): ${formatMoney(avgEbitda)}`
+    : currentEbitda != null
+      ? `EBITDA (this period): ${formatMoney(currentEbitda)}`
+      : 'EBITDA not available — enter one below';
+  return `
+    <div class="kpi-card">
+      <div class="kpi-card-head"><p class="kpi-name">Business valuation — indicative estimate</p></div>
+      <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:4px 0;">
+        <div style="background:var(--sage-bg); border-radius:8px; padding:5px 10px;">
+          <p class="kpi-value" id="valuation-amount" style="margin:0; font-size:20px;">—</p>
+        </div>
+        <span class="muted plain" style="font-size:12px;">${ebitdaLabel}</span>
+      </div>
+      <p class="muted plain" id="valuation-recommended" style="font-size:12px; margin:2px 0 0;"></p>
+      <div class="ocf-row" style="margin-top:8px;"><label>Custom EBITDA (optional)</label><input type="number" id="valuation-ebitda-input" placeholder="e.g. 90000" /></div>
+      <div class="ocf-row"><label>Custom multiple (optional)</label><input type="number" step="0.1" id="valuation-multiple-input" placeholder="e.g. 3.5" /></div>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <button class="action" id="valuation-save-btn" type="button" style="font-size:12px; padding:6px 10px;">Save</button>
+        <span id="valuation-save-msg" style="font-size:12px; color:var(--ink-soft);"></span>
+      </div>
+      <p id="valuation-rationale" style="font-size:11px; color:var(--ink-soft); margin:4px 0 0;"></p>
+      ${renderValuationHistoryChart(valuationData?.valuations)}
+      <p style="font-size:10px; color:var(--ink-soft); margin-top:8px; font-style:italic;">Indicative estimate for internal/advisory discussion only — not a formal valuation. Adjust the EBITDA basis and multiple based on your own judgement.</p>
+    </div>
+  `;
 }
 
 function computeTaxOutlookResult(snapshot, cash, entityType, unit, revenueChange, gpChange, opexChange, netProfitChange, netProfitAbsolute, superContribution, equipmentPurchase, compareEntity, compareShares, compareOtherIncome) {
@@ -3230,8 +3635,7 @@ async function renderFinancialDiagnose(content) {
       ${data.getBetter.length ? data.getBetter.map((r, i) => recRow(r, i, 'getBetter')).join('') : '<p class="muted plain" style="margin:0;">Nothing recorded for this period yet.</p>'}
     </div>
     <div class="card">
-      <p class="muted">Opportunities — new/growth ideas</p>
-      ${data.opportunities.length ? data.opportunities.map((r, i) => recRow(r, i, 'opportunities')).join('') : '<p class="muted plain" style="margin:0;">Nothing recorded for this period yet.</p>'}
+      <p class="muted plain" style="margin:0;">Opportunities and profit ideas have moved to the Growth domain → <button class="mini-link" id="goto-growth-link" type="button">Growth → Analyse</button></p>
     </div>
     <div class="card">
       <p class="muted">Tax planning — worth reviewing with the client</p>
@@ -3288,6 +3692,17 @@ async function renderFinancialDiagnose(content) {
   // routes straight to the deterministic Tax Outlook card so the adviser can
   // plug the client's actual numbers into the same super/equipment/structure
   // levers and see a real, computed answer instead.
+  const gotoGrowthLink = document.getElementById('goto-growth-link');
+  if (gotoGrowthLink) {
+    gotoGrowthLink.onclick = async () => {
+      currentDomain = 'growth';
+      currentWorkflow = 'analyse';
+      renderWorkflowTabsActive();
+      renderSidebarDomains();
+      await renderMain();
+    };
+  }
+
   const taxPlanningModelLink = document.getElementById('tax-planning-model-link');
   if (taxPlanningModelLink) {
     taxPlanningModelLink.onclick = async () => {
@@ -3333,6 +3748,770 @@ async function renderFinancialDiagnose(content) {
     };
     taxQuestionBtn.onclick = askTaxQuestion;
     taxQuestionInput.onkeydown = (e) => { if (e.key === 'Enter') askTaxQuestion(); };
+  }
+}
+
+// ---- Growth: Analyse ----
+async function renderGrowthAnalyse(content) {
+  const myToken = renderToken;
+  if (!currentPeriodEnd) {
+    content.innerHTML = `<div class="card placeholder"><p class="muted">No data yet</p><p class="muted plain" style="margin:0;">Add a financial snapshot from Financial Performance → Input first, then run analysis on Financial Performance → Analyse.</p></div>`;
+    return;
+  }
+  const [data, kpiData, history, valuationData, ebitdaTrajectory] = await Promise.all([
+    callRead('get_diagnosis', currentClientId, currentPeriodEnd),
+    callRead('get_kpi_report', currentClientId, currentPeriodEnd),
+    callRead('get_kpi_history', currentClientId, currentPeriodEnd),
+    callRead('get_valuation_history', currentClientId, currentPeriodEnd),
+    // Fixed at annual/3-years regardless of the client's native cadence or
+    // whatever the (separately interactive) trajectory chart is currently
+    // showing — valuation should only ever be annual, per earlier decision.
+    fetch('/.netlify/functions/read-data', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'get_growth_trajectory', client_id: currentClientId, period_end: currentPeriodEnd, view_cadence: 'annual', periods_count: 3 }),
+    }).then((r) => r.json()),
+  ]);
+  if (myToken !== renderToken) return;
+  const snapshot = kpiData?.snapshot;
+  const targets = findAllKpiTargets();
+  const avgEbitda = computeAverageEbitda(ebitdaTrajectory);
+
+  const recRow = (r, i, group) => `
+    <div class="flag-row-wrap">
+      <div class="flag-row">
+        <span class="flag-dot sage"></span>
+        <span><b>${r.title}</b> — ${r.impact || ''} <span class="muted plain">(${r.difficulty || ''}${r.difficulty && r.timeframe ? ', ' : ''}${r.timeframe || ''})</span></span>
+        <button class="mini-link" data-turn-rec="${group}:${i}" type="button">→ turn into goal</button>
+      </div>
+    </div>
+  `;
+
+  content.innerHTML = `
+    ${renderGrowthOutlookCard(snapshot)}
+    ${renderPaceToGoalCard(targets, history)}
+    <div class="grid2">
+      ${renderGrowthTrajectoryCard(data?.growthTrajectoryCommentary)}
+      ${renderValuationCard(snapshot, valuationData, avgEbitda)}
+    </div>
+    <div class="card">
+      <p class="muted">Opportunities — new/growth ideas</p>
+      ${data.opportunities.length ? data.opportunities.map((r, i) => recRow(r, i, 'opportunities')).join('') : '<p class="muted plain" style="margin:0;">Nothing recorded for this period yet.</p>'}
+    </div>
+  `;
+
+  content.querySelectorAll('button[data-turn-rec]').forEach((btn) => {
+    btn.onclick = async () => {
+      const [group, idx] = btn.dataset.turnRec.split(':');
+      const r = data[group][Number(idx)];
+      const text = r.impact ? `${r.title} — ${r.impact}` : r.title;
+      btn.disabled = true;
+      btn.textContent = 'adding…';
+      try {
+        await addTextAsGoal(text);
+        btn.textContent = '✓ added to Goals → Business';
+      } catch (err) {
+        btn.textContent = 'error';
+        btn.disabled = false;
+        alert('Error: ' + err.message);
+      }
+    };
+  });
+
+  const growthOutlookUnit = document.getElementById('growth-outlook-unit');
+  if (growthOutlookUnit && snapshot?.revenue && snapshot?.net_profit != null) {
+    const valueEl = document.getElementById('growth-outlook-value');
+    const changeEl = document.getElementById('growth-outlook-change');
+    const provenanceEl = document.getElementById('growth-outlook-provenance');
+    const buildupEl = document.getElementById('growth-outlook-buildup');
+    const cashCostEl = document.getElementById('growth-outlook-cash-cost');
+    const revenueInput = document.getElementById('growth-outlook-revenue');
+    const cogsInput = document.getElementById('growth-outlook-cogs');
+    const wagesInput = document.getElementById('growth-outlook-wages');
+    const opexInput = document.getElementById('growth-outlook-opex');
+    const netProfitInput = document.getElementById('growth-outlook-netprofit');
+    const recalc = () => {
+      growthOutlookState = {
+        unit: growthOutlookUnit.value, revenue: Number(revenueInput.value || 0), cogs: Number(cogsInput.value || 0),
+        wages: Number(wagesInput.value || 0), opex: Number(opexInput.value || 0), netProfit: Number(netProfitInput.value || 0),
+      };
+      const scenario = projectGrowthProfitScenario(
+        snapshot, growthOutlookState.unit, growthOutlookState.revenue, growthOutlookState.cogs,
+        growthOutlookState.wages, growthOutlookState.opex, growthOutlookState.netProfit
+      );
+      valueEl.textContent = formatMoney(scenario.projectedProfit);
+      provenanceEl.textContent = scenario.provenance;
+      buildupEl.innerHTML = scenario.buildup;
+
+      // Always visible, independent of which lever produced it — "so what
+      // did this actually do to profit" shouldn't require opening the
+      // assumptions panel and reading the buildup line to work out.
+      const extraProfit = scenario.projectedProfit - snapshot.net_profit;
+      const changeSign = extraProfit >= 0 ? '+' : '−';
+      const changePct = snapshot.net_profit ? Math.abs((extraProfit / snapshot.net_profit) * 100) : null;
+      changeEl.textContent = `Current ${formatMoney(snapshot.net_profit)} → projected ${formatMoney(scenario.projectedProfit)} (${changeSign}${formatMoney(Math.abs(extraProfit))}${changePct != null ? ` / ${changeSign}${changePct.toFixed(0)}%` : ''})`;
+
+      const cashCost = computeCashCostOfGrowing(snapshot, kpiData?.kpis, scenario.projectedRevenue, scenario.projectedGP);
+      if (cashCost != null) {
+        // Framed against the EXTRA profit this scenario adds (not total
+        // profit) — a bare dollar figure doesn't tell you if it's trivial or
+        // most of the upside; the % does, and naming the usable-cash
+        // leftover explicitly is the actual point of this line: profit up
+        // by $X, but only $Y of that is real, spendable cash — the rest is
+        // sitting in debtors/stock. Sign flips the verb: a growth scenario
+        // ties cash up, a decline scenario frees it.
+        const magnitude = Math.abs(cashCost);
+        const verb = cashCost > 0 ? 'tied up in' : 'freed up from';
+        let pctText = '';
+        if (extraProfit > 0) {
+          const pct = Math.round((magnitude / extraProfit) * 100);
+          const usable = extraProfit - cashCost;
+          pctText = ` — ${pct}% of the extra profit this growth adds, leaving roughly ${formatMoney(usable)} (${100 - pct}%) as usable cash`;
+        }
+        cashCostEl.textContent = `Roughly ${formatMoney(magnitude)} would be ${verb} debtors/stock (net of supplier financing), not usable cash${pctText}.`;
+        cashCostEl.style.display = 'block';
+      } else {
+        cashCostEl.style.display = 'none';
+      }
+    };
+    growthOutlookUnit.onchange = recalc;
+    [revenueInput, cogsInput, wagesInput, opexInput, netProfitInput].forEach((el) => { el.oninput = recalc; });
+    recalc();
+
+    const toggle = document.getElementById('growth-outlook-toggle');
+    const panel = document.getElementById('growth-outlook-panel');
+    const openPanel = () => {
+      panel.style.display = 'block';
+      toggle.querySelector('.chevron').textContent = '▴';
+      panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    };
+    toggle.onclick = () => {
+      const willOpen = panel.style.display === 'none';
+      panel.style.display = willOpen ? 'block' : 'none';
+      toggle.querySelector('.chevron').textContent = willOpen ? '▴' : '▾';
+    };
+    document.getElementById('growth-outlook-provenance-link').onclick = openPanel;
+  }
+
+  const trajectoryRegion = document.getElementById('trajectory-chart-region');
+  if (trajectoryRegion) {
+    const cadenceSelect = document.getElementById('trajectory-cadence');
+    const countSelect = document.getElementById('trajectory-periods-count');
+    const loadTrajectory = async () => {
+      trajectoryRegion.innerHTML = '<p class="muted plain" style="margin:0;">Loading…</p>';
+      const res = await fetch('/.netlify/functions/read-data', {
+        method: 'POST',
+        body: JSON.stringify({
+          action: 'get_growth_trajectory', client_id: currentClientId, period_end: currentPeriodEnd,
+          view_cadence: cadenceSelect ? cadenceSelect.value : undefined,
+          periods_count: countSelect.value,
+        }),
+      });
+      const trajectory = await res.json();
+      trajectoryRegion.innerHTML = renderGrowthTrajectoryChartRegion(trajectory);
+    };
+    if (cadenceSelect) cadenceSelect.onchange = () => {
+      // Relabel "Last N" with the newly selected cadence's unit — the
+      // count itself doesn't change, just what it means (4 quarters vs
+      // 4 years), so keep the current selection rather than resetting it.
+      countSelect.innerHTML = trajectoryPeriodsCountOptionsHtml(cadenceSelect.value, Number(countSelect.value));
+      loadTrajectory();
+    };
+    countSelect.onchange = loadTrajectory;
+    loadTrajectory();
+  }
+
+  const multipleInput = document.getElementById('valuation-multiple-input');
+  if (multipleInput) {
+    const amountEl = document.getElementById('valuation-amount');
+    const recommendedEl = document.getElementById('valuation-recommended');
+    const rationaleEl = document.getElementById('valuation-rationale');
+    const ebitdaInput = document.getElementById('valuation-ebitda-input');
+    const saveBtn = document.getElementById('valuation-save-btn');
+    const saveMsg = document.getElementById('valuation-save-msg');
+    const currentEbitda = computeEbitda(snapshot);
+    const defaultEbitda = avgEbitda ?? currentEbitda;
+    const currentRow = (valuationData?.valuations || []).find((v) => v.period_end === currentPeriodEnd);
+    const suggested = valuationData?.suggestedMultiple;
+    // Prefer the FRESH recommendation (the backend now fetches one whenever
+    // an industry's on file, whether or not this period's already been
+    // saved) — falls back to whatever was recorded on the saved row only if
+    // a live suggestion isn't available right now (industry cleared since,
+    // or the AI call failed).
+    const recommendedMultiple = suggested?.suggested_multiple ?? currentRow?.ai_suggested_multiple ?? null;
+
+    recommendedEl.textContent = recommendedMultiple != null
+      ? `Recommended multiple: ${recommendedMultiple}x`
+      : 'No recommended multiple available — set an industry on this client\'s profile, or enter a custom one below.';
+    rationaleEl.textContent = suggested?.rationale ? `🤖 ${suggested.rationale}` : '';
+
+    // Only pre-fill a custom field when a DIFFERENT value was actually
+    // chosen before — if what's saved just matches the default (average
+    // EBITDA / recommended multiple), leave it blank so the default reads
+    // as the active basis rather than looking like a manual override that
+    // happens to agree.
+    ebitdaInput.value = (currentRow && currentRow.ebitda !== defaultEbitda) ? currentRow.ebitda : '';
+    multipleInput.value = (currentRow && currentRow.multiple_used !== recommendedMultiple) ? currentRow.multiple_used : '';
+
+    const effectiveEbitda = () => {
+      const custom = Number(ebitdaInput.value || 0);
+      return custom > 0 ? custom : (defaultEbitda || 0);
+    };
+    const effectiveMultiple = () => {
+      const custom = Number(multipleInput.value || 0);
+      return custom > 0 ? custom : (recommendedMultiple || 0);
+    };
+
+    const recalcValuation = () => {
+      const ebitdaVal = effectiveEbitda();
+      const multiple = effectiveMultiple();
+      amountEl.textContent = (ebitdaVal && multiple) ? formatMoney(ebitdaVal * multiple) : '—';
+    };
+    ebitdaInput.oninput = recalcValuation;
+    multipleInput.oninput = recalcValuation;
+    recalcValuation();
+
+    saveBtn.onclick = async () => {
+      const ebitdaVal = effectiveEbitda();
+      const multiple = effectiveMultiple();
+      if (!ebitdaVal || !multiple) { alert('Need both an EBITDA figure and a multiple — enter custom values if the defaults aren\'t available.'); return; }
+      saveBtn.disabled = true;
+      saveMsg.textContent = 'Saving…';
+      try {
+        const res = await fetch('/.netlify/functions/manual-entry', {
+          method: 'POST',
+          body: JSON.stringify({ type: 'save_valuation', client_id: currentClientId, period_end: currentPeriodEnd, ebitda: ebitdaVal, ai_suggested_multiple: recommendedMultiple, multiple_used: multiple }),
+        });
+        const data2 = await res.json();
+        if (data2.error) throw new Error(data2.error);
+        saveMsg.textContent = '✓ saved';
+      } catch (err) {
+        saveMsg.textContent = 'error';
+        alert('Error: ' + err.message);
+      } finally {
+        saveBtn.disabled = false;
+      }
+    };
+  }
+}
+
+// ---- Owner Wealth: Input & Analyse ----
+// Personal net worth — super/investments/property/other/debt as actual
+// numbers, distinct from the Goals domain's "Owner Goals" (intentions, not
+// figures). See owner-wealth-domain-build-spec.md. Deliberately no pillar
+// score wired for this — scorePillar's default:return 6 still covers
+// 'owner_wealth' (analyze.js), since what net worth number counts as "good"
+// depends on age/goals/circumstances this app doesn't know.
+
+// A custom box's own items sum to a plain magnitude — this folds that
+// magnitude into the net worth total using its asset/liability sign, so an
+// asset-type box adds and a liability-type box subtracts, same as the
+// built-in buckets do implicitly.
+function sumOwnerCustomBucketsNet(customBuckets) {
+  if (!Array.isArray(customBuckets) || !customBuckets.length) return 0;
+  return customBuckets.reduce((sum, b) => {
+    const bucketTotal = (b.items || []).reduce((s, it) => s + (Number(it.value) || 0), 0);
+    return sum + (b.type === 'liability' ? -bucketTotal : bucketTotal);
+  }, 0);
+}
+
+function computeNetWorthTotal(wealth) {
+  if (!wealth) return null;
+  const fields = ['super_balance', 'investments', 'property', 'other_assets', 'debt'];
+  const hasCustom = Array.isArray(wealth.custom_buckets) && wealth.custom_buckets.some((b) => (b.items || []).length);
+  if (fields.every((f) => wealth[f] == null) && !hasCustom) return null; // nothing entered yet
+  return (wealth.super_balance || 0) + (wealth.investments || 0) + (wealth.property || 0) + (wealth.other_assets || 0) - (wealth.debt || 0) + sumOwnerCustomBucketsNet(wealth.custom_buckets);
+}
+
+// Business equity is read live off business_valuations (Growth domain), not
+// stored on owner_wealth_snapshots — so the two figures can never drift out
+// of sync with each other. Hides cleanly if no Valuation's ever been saved.
+// Boxed like the other buckets for visual consistency, but deliberately
+// NOT summed into computeNetWorthTotal — it's an indicative estimate tied
+// to assumptions set in a different domain (Growth → Valuation's AI-
+// suggested or custom multiple), not a firm figure entered here. Folding it
+// into the headline total would mean that number silently shifts whenever
+// someone tweaks a valuation assumption elsewhere — kept visible but
+// explicitly separate instead.
+function renderBusinessEquityTile(latestValuation) {
+  if (!latestValuation) return '';
+  // Clickable — jumps to Growth → Valuation, where this figure is actually
+  // edited (it's read-only here by design, see the comment on
+  // computeNetWorthTotal's caller). Same "click a number, land where it's
+  // entered" pattern as the ow-jump-tile net worth tiles above.
+  // Unboxed here — the caller (renderOwnerAnalyse) always wraps this in its
+  // own bordered container alongside the trend chart, so this only needs to
+  // be the row content, not its own nested box.
+  return `
+    <div class="cash-item" id="ow-business-equity-jump" title="Click to edit in Growth → Valuation" style="cursor:pointer; padding:0;">
+      <span class="cash-item-label" style="font-size:13px;">Business equity <span class="sub">as of ${formatShortDate(latestValuation.period_end)} · not in total</span></span>
+      <span class="cash-item-amount" style="font-family:var(--font-mono); font-size:14px;">${formatMoney(latestValuation.valuation_amount)}</span>
+    </div>
+    <p style="font-size:10px; color:var(--ink-soft); margin:6px 0 0; font-style:italic;">Indicative estimate carried over from Growth → Valuation, not a formal valuation.</p>
+  `;
+}
+
+let ownerRetirementState = { years: 0, growthSuper: 0, growthInvestments: 0, growthProperty: 0, growthOther: 0, desiredIncome: 0, withdrawalRate: 4 };
+
+// Set by an Analyse tile jump right before switching to Input, so that one
+// render opens just the clicked bucket instead of every bucket at once —
+// consumed and cleared by the jump handler itself once it's done scrolling.
+// Left null for any other way of reaching Input, which opens everything.
+let ownerInputFocusBucket = null;
+
+// Each asset bucket compounds at its OWN rate rather than one blended rate
+// (chosen deliberately over the simpler option — property/super/investments
+// genuinely grow differently). Debt is held flat, not projected forward —
+// no repayment schedule was asked for, so it's just subtracted from the
+// compounded total rather than stacking another assumption on top. Custom
+// boxes get the same flat treatment as debt for the same reason — no growth
+// rate was ever collected for them, so pretending to model their growth
+// would be a fabricated assumption; they're just carried through at today's
+// value with their asset/liability sign applied.
+function projectOwnerRetirementOutlook(wealth, years, growthSuper, growthInvestments, growthProperty, growthOther, desiredIncome, withdrawalRate) {
+  const compound = (amount, ratePct) => (amount || 0) * Math.pow(1 + (ratePct / 100), years);
+  const projectedSuper = compound(wealth.super_balance, growthSuper);
+  const projectedInvestments = compound(wealth.investments, growthInvestments);
+  const projectedProperty = compound(wealth.property, growthProperty);
+  const projectedOther = compound(wealth.other_assets, growthOther);
+  const customNet = sumOwnerCustomBucketsNet(wealth.custom_buckets);
+  const projectedAssets = projectedSuper + projectedInvestments + projectedProperty + projectedOther;
+  const projectedNetWorth = projectedAssets - (wealth.debt || 0) + customNet;
+  const targetNestEgg = withdrawalRate > 0 ? desiredIncome / (withdrawalRate / 100) : null;
+  const gap = targetNestEgg != null ? projectedNetWorth - targetNestEgg : null;
+  const customLine = customNet !== 0 ? ` ${customNet >= 0 ? '+' : '−'} Custom boxes <b>${formatMoney(Math.abs(customNet))}</b>` : '';
+  const buildup = `Super <b>${formatMoney(projectedSuper)}</b> + Investments <b>${formatMoney(projectedInvestments)}</b> + Property <b>${formatMoney(projectedProperty)}</b> + Other <b>${formatMoney(projectedOther)}</b> − Debt <b>${formatMoney(wealth.debt || 0)}</b>${customLine} = projected net worth <b>${formatMoney(projectedNetWorth)}</b>`;
+  return { projectedNetWorth, targetNestEgg, gap, buildup };
+}
+
+function renderOwnerRetirementCard() {
+  const selectStyle = 'padding:5px 8px; border:1px solid var(--line); border-radius:6px; font-size:12px; font-family:var(--font-mono); background:var(--paper-raised); color:var(--ink);';
+  const s = ownerRetirementState;
+  const row = (id, label, value) => `<div class="ocf-row"><label>${label}</label><input type="number" id="${id}" value="${value}" placeholder="0" /></div>`;
+  const panelOpen = s.years !== 0 || s.growthSuper !== 0 || s.growthInvestments !== 0 || s.growthProperty !== 0 || s.growthOther !== 0 || s.desiredIncome !== 0 || s.withdrawalRate !== 4;
+  return `
+    <div class="kpi-card">
+      <div class="kpi-card-head"><p class="kpi-name">Retirement outlook — model a scenario</p></div>
+      <p class="muted plain" id="owner-retirement-headline" style="margin:6px 0 0;">Set assumptions below to see a projection.</p>
+      <p style="font-size:11px; color:var(--ink-soft); margin:6px 0 0;">
+        <button type="button" id="owner-retirement-provenance-link" style="background:none; border:none; padding:0; color:var(--brass); font-size:11px; cursor:pointer; text-decoration:underline; font-family:inherit;">Adjust assumptions</button>
+      </p>
+      <div class="cash-item cash-item-clickable" id="owner-retirement-toggle">
+        <span class="cash-item-icon">🧮</span>
+        <span class="cash-item-label">Adjust assumptions</span>
+        <span class="chevron">${panelOpen ? '▴' : '▾'}</span>
+      </div>
+      <div class="ocf-adjust-panel" id="owner-retirement-panel" style="display:${panelOpen ? 'block' : 'none'};">
+        ${row('owner-retirement-years', 'Years to retirement', s.years)}
+        ${row('owner-retirement-growth-super', 'Growth rate — Super (%/yr)', s.growthSuper)}
+        ${row('owner-retirement-growth-investments', 'Growth rate — Investments (%/yr)', s.growthInvestments)}
+        ${row('owner-retirement-growth-property', 'Growth rate — Property (%/yr)', s.growthProperty)}
+        ${row('owner-retirement-growth-other', 'Growth rate — Other assets (%/yr)', s.growthOther)}
+        ${row('owner-retirement-income', 'Desired annual income in retirement ($)', s.desiredIncome)}
+        ${row('owner-retirement-withdrawal', 'Safe withdrawal rate (%)', s.withdrawalRate)}
+        <p style="font-size:11px; color:var(--ink-soft); margin:6px 0 0;">Each bucket compounds at its own rate. Debt and any custom boxes are held flat — no repayment schedule or growth rate modeled for them — and simply added or subtracted at today's value.</p>
+        <p style="font-size:11px; color:var(--ink-soft); margin:6px 0 0;" id="owner-retirement-buildup"></p>
+      </div>
+      <p style="font-size:11px; color:var(--ink-soft); margin-top:8px; font-style:italic;">Simple rule-of-thumb projection, not a retirement or financial plan. The 4% withdrawal rate is a commonly used starting point, not personalised advice.</p>
+    </div>
+  `;
+}
+
+// Read-only — Succession/exit planning already lives in Goals ("Owner
+// Goals" → Exit & Succession category), not duplicated here. Same
+// cross-link pattern as goto-growth-link (renderFinancialDiagnose).
+function renderOwnerSuccessionCard() {
+  const items = (currentCtx?.owner_goals?.periods?.[currentPeriodEnd]?.cats?.['exit_succession']?.items || []).filter((it) => !it.deleted && !it.done);
+  return `
+    <div class="card">
+      <p class="muted">Succession &amp; exit planning</p>
+      ${items.length ? items.map((it) => `<p class="muted plain" style="margin:0 0 6px;">• ${it.text}</p>`).join('') : '<p class="muted plain" style="margin:0;">Nothing recorded yet.</p>'}
+      <button class="mini-link" id="goto-succession-goals-link" type="button" style="margin-top:8px;">→ Edit in Goals</button>
+    </div>
+  `;
+}
+
+// One row per named item within a bucket (e.g. "AustralianSuper", "12 Smith
+// St") — exact same shape/classes as renderReconAdjustmentRow's cash
+// reconciliation adjustment rows, reused rather than reinvented.
+function renderOwnerWealthItemRow(item, bucket) {
+  return `
+    <div class="cash-item cash-adj-item ow-item-row" data-ow-bucket="${bucket}">
+      <span class="cash-item-icon">·</span>
+      <input type="text" class="ow-item-label" placeholder="e.g. AustralianSuper" value="${escAttr(item.label || '')}" />
+      <input type="number" step="0.01" class="ow-item-value" value="${item.value ?? ''}" placeholder="Amount" />
+      <button type="button" class="ow-item-remove cash-adj-remove" title="Remove">✕</button>
+    </div>
+  `;
+}
+
+// Each bucket gets its own bordered box (.cash-accordion-section — same
+// boxed-list treatment already used for cash reconciliation's adjustments),
+// collapsible so a click from the Analyse tiles can open just the one
+// bucket you clicked into instead of dropping you into all five at once.
+function renderOwnerWealthBucket(bucket, label, items, openByDefault) {
+  const total = items.reduce((sum, it) => sum + (Number(it.value) || 0), 0);
+  return `
+    <div class="cash-accordion-section">
+      <button type="button" class="cash-accordion-head" data-accordion-toggle="${bucket}">
+        <span class="cash-accordion-head-label">${label}</span>
+        <span class="cash-accordion-head-value" id="ow-bucket-total-${bucket}"><span class="ow-bucket-amount-text">${formatMoney(total)}</span> <span class="chevron">${openByDefault ? '▴' : '▾'}</span></span>
+      </button>
+      <div class="cash-accordion-body" id="ow-body-${bucket}" style="display:${openByDefault ? 'block' : 'none'};">
+        <div id="ow-items-list-${bucket}">${items.map((it) => renderOwnerWealthItemRow(it, bucket)).join('')}</div>
+        <button type="button" class="mini-link" data-ow-add="${bucket}" style="margin:6px 0 9px;">+ Add item</button>
+      </div>
+    </div>
+  `;
+}
+
+// A user-named box beyond the fixed five — same collapsible shell, but the
+// header carries an editable name and an asset/liability picker instead of
+// a fixed label, plus a "remove this box" action in the body. Name/type
+// controls sit next to (not inside) the toggle target so editing them
+// doesn't also collapse the box.
+function renderOwnerCustomBucket(bucket, openByDefault) {
+  const items = bucket.items || [];
+  const total = items.reduce((sum, it) => sum + (Number(it.value) || 0), 0);
+  const key = `custom-${bucket.id}`;
+  return `
+    <div class="cash-accordion-section" data-ow-custom-id="${bucket.id}">
+      <div class="cash-accordion-head" style="cursor:default;">
+        <input type="text" class="ow-item-label ow-custom-name" data-ow-custom-name="${bucket.id}" value="${escAttr(bucket.label || '')}" placeholder="Box name" style="flex:1; max-width:220px;" />
+        <select class="ow-custom-type" data-ow-custom-type="${bucket.id}" style="font-size:12px; font-family:var(--font-body); border:1px solid var(--line); border-radius:6px; background:var(--paper-raised); color:var(--ink); padding:6px 8px;">
+          <option value="asset" ${bucket.type !== 'liability' ? 'selected' : ''}>Asset (adds)</option>
+          <option value="liability" ${bucket.type === 'liability' ? 'selected' : ''}>Liability (subtracts)</option>
+        </select>
+        <span class="cash-accordion-head-value ${bucket.type === 'liability' ? 'neg' : ''}" data-accordion-toggle="${key}" style="cursor:pointer;" id="ow-bucket-total-${key}"><span class="ow-bucket-amount-text">${bucket.type === 'liability' && total ? '− ' : ''}${formatMoney(total)}</span> <span class="chevron">${openByDefault ? '▴' : '▾'}</span></span>
+      </div>
+      <div class="cash-accordion-body" id="ow-body-${key}" style="display:${openByDefault ? 'block' : 'none'};">
+        <div id="ow-items-list-${key}">${items.map((it) => renderOwnerWealthItemRow(it, key)).join('')}</div>
+        <button type="button" class="mini-link" data-ow-add="${key}" style="margin:6px 0 9px;">+ Add item</button>
+        <button type="button" class="mini-link" data-ow-remove-box="${bucket.id}" style="color:var(--rust);">✕ Remove this box</button>
+      </div>
+    </div>
+  `;
+}
+
+async function renderOwnerInput(content) {
+  const myToken = renderToken;
+  if (!currentPeriodEnd) {
+    content.innerHTML = `<div class="card placeholder"><p class="muted">No period selected</p><p class="muted plain" style="margin:0;">Select or create a period first.</p></div>`;
+    return;
+  }
+  const data = await callRead('get_owner_wealth', currentClientId, currentPeriodEnd);
+  if (myToken !== renderToken) return;
+  const existing = (data?.snapshots || []).find((s) => s.period_end === currentPeriodEnd) || {};
+
+  // Backward-compatible with a bucket that has an old lump-sum total but no
+  // itemized rows yet (saved before itemization existed) — shows it as one
+  // pre-filled, editable line rather than silently losing the figure.
+  const itemsFor = (itemsField, totalField) => {
+    if (Array.isArray(existing[itemsField]) && existing[itemsField].length) return existing[itemsField];
+    if (existing[totalField] != null) return [{ label: '', value: existing[totalField] }];
+    return [];
+  };
+  const bucketItems = {
+    super: itemsFor('super_items', 'super_balance'),
+    investments: itemsFor('investments_items', 'investments'),
+    property: itemsFor('property_items', 'property'),
+    other: itemsFor('other_assets_items', 'other_assets'),
+    debt: itemsFor('debt_items', 'debt'),
+  };
+  const customBuckets = Array.isArray(existing.custom_buckets) ? existing.custom_buckets : [];
+
+  // A jump from one Analyse tile opens just that bucket; any other way of
+  // reaching Input (the sidebar tab, Save-and-return, etc.) opens everything
+  // — see ownerInputFocusBucket's declaration for why.
+  const isOpen = (key) => (ownerInputFocusBucket ? ownerInputFocusBucket === key : true);
+
+  content.innerHTML = `
+    <div class="card">
+      <button type="button" class="mini-link" id="ow-back-to-analyse" style="margin-bottom:8px;">← Back to Owner Wealth summary</button>
+      <p class="muted">Owner Wealth — ${formatShortDate(currentPeriodEnd)}</p>
+      <p class="muted plain" style="margin:0 0 14px;">Personal net worth, captured once a year. Break each bucket into as many named items as you like — a super fund, a specific property, a share portfolio — add or remove lines freely; each bucket's total is just the sum of its items. Not the business's own numbers; those live under Financial Performance.</p>
+      ${renderOwnerWealthBucket('super', 'Superannuation', bucketItems.super, isOpen('super'))}
+      ${renderOwnerWealthBucket('investments', 'Investments', bucketItems.investments, isOpen('investments'))}
+      ${renderOwnerWealthBucket('property', 'Property', bucketItems.property, isOpen('property'))}
+      ${renderOwnerWealthBucket('other', 'Other assets', bucketItems.other, isOpen('other'))}
+      ${renderOwnerWealthBucket('debt', 'Personal debt', bucketItems.debt, isOpen('debt'))}
+      <div id="ow-custom-boxes">${customBuckets.map((b) => renderOwnerCustomBucket(b, isOpen(`custom-${b.id}`))).join('')}</div>
+      <button type="button" class="mini-link" id="ow-add-box-btn" style="margin:8px 0 0;">+ Add box</button>
+      <div class="form-field" style="margin-top:14px;"><label>Notes (optional)</label><textarea id="ow-notes" rows="2">${existing.notes || ''}</textarea></div>
+      <button class="action" id="ow-save-btn" type="button">Save</button>
+      <span id="ow-save-msg" style="margin-left:8px; font-size:12px; color:var(--ink-soft);"></span>
+    </div>
+  `;
+
+  const rowsFor = (bucket) => [...content.querySelectorAll(`.ow-item-row[data-ow-bucket="${bucket}"]`)];
+  // Custom-box totals carry a sign (liabilities show "− $x" and use the
+  // same .neg colour cash reconciliation uses for negative subtotals) —
+  // built-in buckets never do, their sign is implied by which bucket it is.
+  const recalcBucket = (bucket) => {
+    const total = rowsFor(bucket).reduce((sum, row) => sum + (Number(row.querySelector('.ow-item-value').value || 0)), 0);
+    const valueEl = document.getElementById(`ow-bucket-total-${bucket}`);
+    const amountEl = valueEl.querySelector('.ow-bucket-amount-text');
+    const customId = bucket.startsWith('custom-') ? bucket.slice(7) : null;
+    const isLiability = customId && content.querySelector(`[data-ow-custom-type="${customId}"]`)?.value === 'liability';
+    valueEl.classList.toggle('neg', !!isLiability);
+    amountEl.textContent = `${isLiability && total ? '− ' : ''}${formatMoney(total)}`;
+  };
+  const wireItemRow = (row, bucket) => {
+    row.querySelector('.ow-item-value').oninput = () => recalcBucket(bucket);
+    row.querySelector('.ow-item-remove').onclick = () => { row.remove(); recalcBucket(bucket); };
+  };
+  const wireAddButton = (bucket) => {
+    const addBtn = content.querySelector(`[data-ow-add="${bucket}"]`);
+    if (!addBtn) return;
+    addBtn.onclick = () => {
+      const list = document.getElementById(`ow-items-list-${bucket}`);
+      list.insertAdjacentHTML('beforeend', renderOwnerWealthItemRow({ label: '', value: '' }, bucket));
+      const newRow = list.lastElementChild;
+      wireItemRow(newRow, bucket);
+      newRow.querySelector('.ow-item-label').focus();
+    };
+  };
+  const wireAccordionToggle = (key) => {
+    const toggleEl = content.querySelector(`[data-accordion-toggle="${key}"]`);
+    if (!toggleEl) return;
+    toggleEl.onclick = () => {
+      const body = document.getElementById(`ow-body-${key}`);
+      body.style.display = body.style.display === 'none' ? 'block' : 'none';
+      const chevron = toggleEl.querySelector('.chevron');
+      if (chevron) chevron.textContent = body.style.display === 'none' ? '▾' : '▴';
+    };
+  };
+  const wireCustomBox = (section) => {
+    const id = section.dataset.owCustomId;
+    const key = `custom-${id}`;
+    rowsFor(key).forEach((row) => wireItemRow(row, key));
+    wireAddButton(key);
+    wireAccordionToggle(key);
+    section.querySelector('[data-ow-custom-type]').onchange = () => recalcBucket(key);
+    section.querySelector('[data-ow-remove-box]').onclick = () => {
+      const name = section.querySelector('[data-ow-custom-name]').value || 'this box';
+      if (!confirm(`Remove "${name}" and all its items? This only takes effect once you Save.`)) return;
+      section.remove();
+    };
+  };
+
+  ['super', 'investments', 'property', 'other', 'debt'].forEach((bucket) => {
+    rowsFor(bucket).forEach((row) => wireItemRow(row, bucket));
+    wireAddButton(bucket);
+    wireAccordionToggle(bucket);
+  });
+  content.querySelectorAll('#ow-custom-boxes > [data-ow-custom-id]').forEach(wireCustomBox);
+
+  document.getElementById('ow-add-box-btn').onclick = () => {
+    const id = `new-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const container = document.getElementById('ow-custom-boxes');
+    container.insertAdjacentHTML('beforeend', renderOwnerCustomBucket({ id, label: '', type: 'asset', items: [] }, true));
+    const section = container.lastElementChild;
+    wireCustomBox(section);
+    section.querySelector('.ow-custom-name').focus();
+  };
+
+  const goBackToAnalyse = async () => {
+    currentWorkflow = 'analyse';
+    renderWorkflowTabsActive();
+    renderSidebarDomains();
+    await renderMain();
+  };
+  document.getElementById('ow-back-to-analyse').onclick = goBackToAnalyse;
+
+  document.getElementById('ow-save-btn').onclick = async () => {
+    const btn = document.getElementById('ow-save-btn');
+    const msg = document.getElementById('ow-save-msg');
+    btn.disabled = true;
+    msg.textContent = 'Saving…';
+    const itemsPayload = (bucket) => rowsFor(bucket).map((row) => ({ label: row.querySelector('.ow-item-label').value, value: row.querySelector('.ow-item-value').value }));
+    const customBucketsPayload = [...content.querySelectorAll('#ow-custom-boxes > [data-ow-custom-id]')].map((section) => {
+      const id = section.dataset.owCustomId;
+      return {
+        id,
+        label: section.querySelector('[data-ow-custom-name]').value,
+        type: section.querySelector('[data-ow-custom-type]').value,
+        items: itemsPayload(`custom-${id}`),
+      };
+    });
+    try {
+      const res = await fetch('/.netlify/functions/manual-entry', {
+        method: 'POST',
+        body: JSON.stringify({
+          type: 'save_owner_wealth', client_id: currentClientId, period_end: currentPeriodEnd,
+          super_items: itemsPayload('super'), investments_items: itemsPayload('investments'),
+          property_items: itemsPayload('property'), other_assets_items: itemsPayload('other'),
+          debt_items: itemsPayload('debt'), custom_buckets: customBucketsPayload, notes: document.getElementById('ow-notes').value,
+        }),
+      });
+      const result = await res.json();
+      if (result.error) throw new Error(result.error);
+      // Straight back to the summary on success — you just entered data,
+      // seeing the recalculated total/chart is the natural next thing to
+      // see, not sitting on the now-stale form.
+      await goBackToAnalyse();
+    } catch (err) {
+      msg.textContent = 'error';
+      alert('Error: ' + err.message);
+      btn.disabled = false;
+    }
+  };
+}
+
+async function renderOwnerAnalyse(content) {
+  const myToken = renderToken;
+  if (!currentPeriodEnd) {
+    content.innerHTML = `<div class="card placeholder"><p class="muted">No data yet</p><p class="muted plain" style="margin:0;">Add this period's numbers on Owner Wealth → Input first.</p></div>`;
+    return;
+  }
+  const data = await callRead('get_owner_wealth', currentClientId, currentPeriodEnd);
+  if (myToken !== renderToken) return;
+  const snapshots = data?.snapshots || [];
+  const wealth = snapshots.find((s) => s.period_end === currentPeriodEnd) || {};
+  const total = computeNetWorthTotal(wealth);
+
+  // Owner Wealth is annual-only by design (CADENCE_PILLARS, analyze.js) so
+  // there's at most one saved row per year already — no dedupe-by-year step
+  // needed the way the Valuation card's history chart needed one.
+  const periods = snapshots.map((s) => s.period_end);
+  const netWorthValues = snapshots.map((s) => computeNetWorthTotal(s));
+  // Bigger than the default chart size — this is the headline trend for the
+  // whole domain, given more visual weight than the business-equity
+  // cross-reference it sits next to.
+  const trendChart = periods.length >= 2 ? renderTrendLineChart(periods, netWorthValues, 'var(--sage)', 420, 110) : '';
+  const equityTile = renderBusinessEquityTile(data?.latestValuation);
+
+  content.innerHTML = `
+    <div class="card">
+      <p class="muted">Net worth — ${formatShortDate(currentPeriodEnd)}</p>
+      ${total == null ? `<p class="muted plain" style="margin:0;">Nothing entered yet for this period — add figures on Owner Wealth → Input.</p>` : `
+        <div style="background:var(--sage-bg); border-radius:8px; padding:8px 12px; display:inline-block;">
+          <p class="kpi-value" style="margin:0;">${formatMoney(total)}</p>
+          <p class="card-label" style="margin:2px 0 0;">Total net worth</p>
+        </div>
+        <div class="snapshot-grid" style="margin-top:12px;">
+          <div class="snapshot-field ow-jump-tile" data-ow-jump="super" title="Click to edit"><p class="card-label">Superannuation</p><p style="margin:0; font-family:var(--font-mono);">${formatMoney(wealth.super_balance)}</p></div>
+          <div class="snapshot-field ow-jump-tile" data-ow-jump="investments" title="Click to edit"><p class="card-label">Investments</p><p style="margin:0; font-family:var(--font-mono);">${formatMoney(wealth.investments)}</p></div>
+          <div class="snapshot-field ow-jump-tile" data-ow-jump="property" title="Click to edit"><p class="card-label">Property</p><p style="margin:0; font-family:var(--font-mono);">${formatMoney(wealth.property)}</p></div>
+          <div class="snapshot-field ow-jump-tile" data-ow-jump="other" title="Click to edit"><p class="card-label">Other assets</p><p style="margin:0; font-family:var(--font-mono);">${formatMoney(wealth.other_assets)}</p></div>
+          <div class="snapshot-field ow-jump-tile" data-ow-jump="debt" title="Click to edit"><p class="card-label">Personal debt</p><p style="margin:0; font-family:var(--font-mono);">${wealth.debt != null ? '− ' + formatMoney(wealth.debt) : '—'}</p></div>
+          ${(Array.isArray(wealth.custom_buckets) ? wealth.custom_buckets : []).map((b) => {
+            const bTotal = (b.items || []).reduce((sum, it) => sum + (Number(it.value) || 0), 0);
+            return `<div class="snapshot-field ow-jump-tile" data-ow-jump="custom-${b.id}" title="Click to edit"><p class="card-label">${escAttr(b.label || 'Untitled box')}</p><p style="margin:0; font-family:var(--font-mono);">${b.type === 'liability' && bTotal ? '− ' : ''}${formatMoney(bTotal)}</p></div>`;
+          }).join('')}
+        </div>
+      `}
+      ${trendChart && equityTile ? `
+        <div style="display:grid; grid-template-columns: 2fr 1fr; gap:16px; margin-top:14px; align-items:start;">
+          <div style="border:1px solid var(--line); border-radius:8px; padding:12px;">
+            <p class="card-label" style="margin:0 0 4px;">Net worth over time</p>${trendChart}
+          </div>
+          <div style="border:1px solid var(--line); border-radius:8px; padding:12px;">${equityTile}</div>
+        </div>
+      ` : `
+        ${trendChart ? `<div style="border:1px solid var(--line); border-radius:8px; padding:12px; margin-top:14px;"><p class="card-label" style="margin:0 0 4px;">Net worth over time</p>${trendChart}</div>` : ''}
+        ${equityTile ? `<div style="border:1px solid var(--line); border-radius:8px; padding:12px; margin-top:14px;">${equityTile}</div>` : ''}
+      `}
+    </div>
+    ${renderOwnerRetirementCard()}
+    ${renderOwnerSuccessionCard()}
+  `;
+
+  // Click a net worth tile → jump straight to editing that bucket, same
+  // "click a number, land where it's entered" pattern already used
+  // elsewhere in this app (e.g. the cash reconciliation jump links) —
+  // rather than making the accountant hunt for the separate Input tab
+  // themselves.
+  content.querySelectorAll('[data-ow-jump]').forEach((el) => {
+    el.onclick = async () => {
+      const bucket = el.dataset.owJump;
+      // Opens just this one bucket on the Input form (see
+      // ownerInputFocusBucket's declaration) instead of dropping the
+      // accountant into all five-plus-custom boxes at once.
+      ownerInputFocusBucket = bucket;
+      currentWorkflow = 'input';
+      renderWorkflowTabsActive();
+      renderSidebarDomains();
+      await renderMain();
+      ownerInputFocusBucket = null;
+      const list = document.getElementById(`ow-items-list-${bucket}`);
+      if (!list) return;
+      const firstValueInput = list.querySelector('.ow-item-value');
+      if (firstValueInput) { firstValueInput.focus(); firstValueInput.select(); }
+      list.closest('.cash-accordion-section')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    };
+  });
+
+  const businessEquityJump = document.getElementById('ow-business-equity-jump');
+  if (businessEquityJump) {
+    businessEquityJump.onclick = async () => {
+      currentDomain = 'growth';
+      currentWorkflow = 'analyse';
+      renderWorkflowTabsActive();
+      renderSidebarDomains();
+      await renderMain();
+      const valuationEl = document.getElementById('valuation-amount');
+      if (!valuationEl) return;
+      valuationEl.closest('.kpi-card')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    };
+  }
+
+  const yearsInput = document.getElementById('owner-retirement-years');
+  if (yearsInput) {
+    const headlineEl = document.getElementById('owner-retirement-headline');
+    const buildupEl = document.getElementById('owner-retirement-buildup');
+    const growthSuperInput = document.getElementById('owner-retirement-growth-super');
+    const growthInvestmentsInput = document.getElementById('owner-retirement-growth-investments');
+    const growthPropertyInput = document.getElementById('owner-retirement-growth-property');
+    const growthOtherInput = document.getElementById('owner-retirement-growth-other');
+    const incomeInput = document.getElementById('owner-retirement-income');
+    const withdrawalInput = document.getElementById('owner-retirement-withdrawal');
+    const recalcRetirement = () => {
+      ownerRetirementState = {
+        years: Number(yearsInput.value || 0), growthSuper: Number(growthSuperInput.value || 0),
+        growthInvestments: Number(growthInvestmentsInput.value || 0), growthProperty: Number(growthPropertyInput.value || 0),
+        growthOther: Number(growthOtherInput.value || 0), desiredIncome: Number(incomeInput.value || 0),
+        withdrawalRate: Number(withdrawalInput.value || 0),
+      };
+      const result = projectOwnerRetirementOutlook(
+        wealth, ownerRetirementState.years, ownerRetirementState.growthSuper, ownerRetirementState.growthInvestments,
+        ownerRetirementState.growthProperty, ownerRetirementState.growthOther, ownerRetirementState.desiredIncome, ownerRetirementState.withdrawalRate
+      );
+      buildupEl.innerHTML = result.buildup;
+      if (result.targetNestEgg == null) {
+        headlineEl.textContent = `Projected net worth in ${ownerRetirementState.years || 0} years: ${formatMoney(result.projectedNetWorth)}. Set a desired income and withdrawal rate to see a target.`;
+      } else if (result.gap >= 0) {
+        headlineEl.textContent = `Projected: ${formatMoney(result.projectedNetWorth)}. Target for ${formatMoney(ownerRetirementState.desiredIncome)}/year at a ${ownerRetirementState.withdrawalRate}% withdrawal rate: ${formatMoney(result.targetNestEgg)}. On track — projected to exceed target by ${formatMoney(result.gap)}.`;
+      } else {
+        headlineEl.textContent = `Projected: ${formatMoney(result.projectedNetWorth)}. Target for ${formatMoney(ownerRetirementState.desiredIncome)}/year at a ${ownerRetirementState.withdrawalRate}% withdrawal rate: ${formatMoney(result.targetNestEgg)}. Currently ${formatMoney(Math.abs(result.gap))} short at this trajectory.`;
+      }
+    };
+    [yearsInput, growthSuperInput, growthInvestmentsInput, growthPropertyInput, growthOtherInput, incomeInput, withdrawalInput].forEach((el) => { el.oninput = recalcRetirement; });
+    recalcRetirement();
+
+    const toggle = document.getElementById('owner-retirement-toggle');
+    const panel = document.getElementById('owner-retirement-panel');
+    const openPanel = () => {
+      panel.style.display = 'block';
+      toggle.querySelector('.chevron').textContent = '▴';
+      panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    };
+    toggle.onclick = () => {
+      const willOpen = panel.style.display === 'none';
+      panel.style.display = willOpen ? 'block' : 'none';
+      toggle.querySelector('.chevron').textContent = willOpen ? '▴' : '▾';
+    };
+    document.getElementById('owner-retirement-provenance-link').onclick = openPanel;
+  }
+
+  const gotoSuccessionLink = document.getElementById('goto-succession-goals-link');
+  if (gotoSuccessionLink) {
+    gotoSuccessionLink.onclick = async () => {
+      currentDomain = 'goals';
+      currentWorkflow = 'input';
+      renderWorkflowTabsActive();
+      renderSidebarDomains();
+      await renderMain();
+    };
   }
 }
 

@@ -178,6 +178,19 @@ function scoreRiskPillar(flags, riskItems) {
 }
 
 // Simple 0-10 scoring off ratio thresholds — replace with your own bands over time.
+function scoreGrowthPillar(fs, priorFs) {
+  let score = 6; // neutral baseline when there's no prior period to compare
+  if (priorFs?.revenue) {
+    const growthRate = (fs.revenue - priorFs.revenue) / priorFs.revenue;
+    if (growthRate >= 0.10) score = 9;
+    else if (growthRate >= 0.03) score = 7;
+    else if (growthRate >= -0.03) score = 6;
+    else if (growthRate >= -0.10) score = 4;
+    else score = 2;
+  }
+  return Math.max(0, Math.min(10, score));
+}
+
 function scorePillar(pillar, ratios, riskContext) {
   const band = (val, good, ok) => (val == null ? null : val >= good ? 9 : val >= ok ? 6 : 3);
   switch (pillar) {
@@ -185,6 +198,7 @@ function scorePillar(pillar, ratios, riskContext) {
     case 'cash_flow': return band(ratios.current_ratio, 1.5, 1.0);
     case 'tax': return 8; // placeholder until BAS-variance logic is added
     case 'risk': return scoreRiskPillar(riskContext?.flags, riskContext?.riskItems);
+    case 'growth': return scoreGrowthPillar(riskContext?.fs, riskContext?.priorFs);
     default: return 6; // placeholder for pillars not yet ratio-driven
   }
 }
@@ -318,7 +332,7 @@ exports.handler = async (event) => {
     const { client_id, period_end } = JSON.parse(event.body || '{}');
     if (!client_id || !period_end) return { statusCode: 400, body: 'client_id and period_end required' };
 
-    const [{ data: fs }, { data: context }, { data: priorFsList }, kpiLibResult, riskItemsResult] = await Promise.all([
+    const [{ data: fs }, { data: context }, { data: priorFsList }, kpiLibResult, riskItemsResult, trendHistoryResult] = await Promise.all([
       supabase.from('financial_snapshots').select('*').eq('client_id', client_id).eq('period_end', period_end).single(),
       supabase.from('client_context').select('*').eq('client_id', client_id).single(),
       supabase.from('financial_snapshots').select('*').eq('client_id', client_id).lt('period_end', period_end).order('period_end', { ascending: false }).limit(1),
@@ -328,14 +342,22 @@ exports.handler = async (event) => {
       // scoreRiskPillar reads financial straight off the in-memory `flags`
       // computed a few lines down instead of querying for it here.
       supabase.from('risk_items').select('source, category, period_end, status, severity').eq('client_id', client_id).in('source', ['business', 'industry']),
+      // Feeds the growth trajectory commentary below — raw per-period figures
+      // at whatever cadence the client actually reports, not aggregated (the
+      // AI has the cadence in clientData already and can read the trend
+      // itself; no need to duplicate get_growth_trajectory's rollup logic
+      // here just for a qualitative read).
+      supabase.from('financial_snapshots').select('period_end, revenue, net_profit').eq('client_id', client_id).lte('period_end', period_end).order('period_end', { ascending: false }).limit(6),
     ]);
     if (!fs) throw new Error('No financial snapshot found — run xero-pull first');
+
+    const trendHistory = [...(trendHistoryResult?.data || [])].reverse(); // oldest -> newest
 
     const ratios = computeRatios(fs);
     const priorFs = priorFsList?.[0] || null;
     const priorRatios = priorFs ? computeRatios(priorFs) : null;
     const flags = runFlags(fs, priorFs, ratios, priorRatios);
-    const riskContext = { flags, riskItems: riskItemsResult?.data || [] };
+    const riskContext = { flags, riskItems: riskItemsResult?.data || [], fs, priorFs };
     const activePillars = CADENCE_PILLARS[context?.cadence || 'quarterly'];
     const scores = activePillars.map((p) => ({ pillar: p, score: scorePillar(p, ratios, riskContext), active: true }));
     const healthScore = Math.round(
@@ -384,12 +406,13 @@ exports.handler = async (event) => {
     const systemInstructions = `You are the analysis engine for an accounting advisory app. Given this client's data, write, using SHORT, DIRECT language throughout (this is a strict length budget, not a preference):
 1. A diagnosis, UP TO 70 WORDS (use the budget well — this is the most important synthesis in the report — but a hard technical limit means it cannot run longer). Reference the specific ratios/flags, call out any meaningful gap between a KPI's current value and its target where one is set (see "targets" below), and bring in general industry context only where it genuinely adds insight.
 2. Up to 2 "get better" items — efficiency/operational fixes tied to a CURRENT gap or underperforming metric (e.g. closing a margin gap, fixing cost classification, tightening a process) — each with a short title (≤6 words) and impact/difficulty/timeframe in ≤15 words total.
-3. Up to 2 growth opportunities — NEW, additive ideas (new services, pricing changes, expansion, upsell) that are NOT about fixing something currently wrong — each with a short title (≤6 words) and impact/difficulty/timeframe in ≤15 words total. If "cash movement this period" below shows a real surplus with no clear use (no debt paydown, no reinvestment), that's a legitimate opportunity too (e.g. accelerate debt repayment, invest in equipment, build a buffer) — don't force one if the movement doesn't suggest it.
+3. Up to 2 growth opportunities — NEW, additive ideas (new services, pricing changes, marketing/customer acquisition, expansion, upsell) that are NOT about fixing something currently wrong — each with a short title (≤6 words) and impact/difficulty/timeframe in ≤15 words total. If "cash movement this period" below shows a real surplus with no clear use (no debt paydown, no reinvestment), that's a legitimate opportunity too (e.g. accelerate debt repayment, invest in equipment, build a buffer) — don't force one if the movement doesn't suggest it.
 4. Up to 2 tax planning opportunities — things worth the adviser reviewing WITH the client, grounded in this client's actual entity structure, profit level, and numbers below (e.g. timing of income/expenses or asset purchases before year-end, depreciation, super contributions, structure fit for the current profit level, use of losses) — each with a short title (≤6 words) and impact/difficulty/timeframe in ≤15 words total. These are prompts for a conversation, NOT advice to act on: phrase each title/impact as something to review, never as an instruction (e.g. "Review pre-year-end asset timing", not "Buy equipment now"). Skip entirely if nothing genuinely stands out — don't invent one to fill the quota.
 5. For each KPI listed below, ONE interpretation line under 12 words: state the given "value" EXACTLY AS WRITTEN — it's already formatted (e.g. "21.6%", "14d", "1.31x"), so copy it verbatim, never recalculate, reformat, or convert it yourself — and, if a trend is given, whether it's improving or worsening. If marked "estimated", add a 2-3 word reason in parentheses. Skip any KPI not listed — those are unavailable, don't invent a number for them.
 6. Separately, for these six KPIs specifically — GP margin, Net profit margin, Wages/sales, Debtor days, Creditor days, Inventory days — add a benchmark line under 10 words each, e.g. "Typically 40-55% for auto repair shops" (general knowledge, NOT a verified data source, using the client's actual industry and description, not a generic category). These six are industry-driven enough that a benchmark is meaningful — the rest of the KPIs (revenue growth, ROE, debt/equity, current ratio, operating cash conversion, effective tax rate) are capital-structure or lifecycle-dependent rather than industry-dependent, so never benchmark those. Only omit one of the six if you genuinely have no reasonable basis for this specific industry — don't guess vaguely just to fill it in.
+7. A growth trajectory commentary, UP TO 40 WORDS — given "Revenue/net profit history" below (oldest to newest), say plainly whether growth looks like it's accelerating, flattening, lumpy, or declining, and give ONE concrete recommendation for improving it, grounded in these actual numbers (not generic advice). If there's only one period of history, say there isn't enough history yet rather than inventing a trend from a single data point.
 
-Respond ONLY as JSON, no markdown fences: {"diagnosis": "...", "get_better": [{"title":"","impact":"","difficulty":"","timeframe":""}], "opportunities": [{"title":"","impact":"","difficulty":"","timeframe":""}], "tax_planning": [{"title":"","impact":"","difficulty":"","timeframe":""}], "kpi_interpretations": {"<kpi_key>": "..."}, "kpi_benchmarks": {"<kpi_key>": "..."}}`;
+Respond ONLY as JSON, no markdown fences: {"diagnosis": "...", "get_better": [{"title":"","impact":"","difficulty":"","timeframe":""}], "opportunities": [{"title":"","impact":"","difficulty":"","timeframe":""}], "tax_planning": [{"title":"","impact":"","difficulty":"","timeframe":""}], "kpi_interpretations": {"<kpi_key>": "..."}, "kpi_benchmarks": {"<kpi_key>": "..."}, "growth_trajectory_commentary": "..."}`;
 
     const clientData = `Client: ${context?.business_description || 'no description'} (${context?.industry}), entity structure: ${context?.entity_type || 'not set'}
 Cadence: ${context?.cadence}
@@ -398,6 +421,7 @@ Flags fired: ${JSON.stringify(flags)}
 Pillar scores: ${JSON.stringify(scores)}
 Targets set by the client (kpi_key: target value, same units as the KPI's own value): ${JSON.stringify(kpiTargets)}
 Cash movement this period: ${cashSummary || 'not available'}
+Revenue/net profit history, oldest to newest, at this client's own reporting cadence (may be fewer than 6 periods): ${JSON.stringify(trendHistory)}
 KPIs available this period: ${JSON.stringify(availableKpis.map((k) => ({
   key: k.key, name: k.name, value: formatKpiValue(k.value, k.format), prior_value: formatKpiValue(k.priorValue, k.format),
   estimated: k.confidence === 'yellow', estimation_note: k.estimation_note,
@@ -412,7 +436,7 @@ KPIs available this period: ${JSON.stringify(availableKpis.map((k) => ({
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
-        max_tokens: 1500,
+        max_tokens: 1800,
         system: [{ type: 'text', text: systemInstructions, cache_control: { type: 'ephemeral' } }],
         messages: [{ role: 'user', content: clientData }],
       }),
@@ -446,6 +470,7 @@ KPIs available this period: ${JSON.stringify(availableKpis.map((k) => ({
       supabase.from('pillar_scores').insert(scores.map((s) => ({ ...s, client_id, period_end }))),
       supabase.from('health_scores').upsert({ client_id, period_end, score: healthScore, active_pillar_count: scores.length }, { onConflict: 'client_id,period_end' }),
       supabase.from('diagnostics').insert({ client_id, period_end, pillar: 'overall', cause_text: parsed.diagnosis }),
+      ...(parsed.growth_trajectory_commentary ? [supabase.from('diagnostics').insert({ client_id, period_end, pillar: 'growth_trajectory', cause_text: parsed.growth_trajectory_commentary })] : []),
       ...(kpiDiagnosticRows.length ? [supabase.from('diagnostics').insert(kpiDiagnosticRows)] : []),
       supabase.from('recommendations').insert([
         ...(parsed.get_better || []).map((o) => ({ client_id, period_end, type: 'get_better', title: o.title, impact: o.impact, difficulty: o.difficulty, timeframe: o.timeframe })),
