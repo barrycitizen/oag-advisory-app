@@ -8,6 +8,8 @@
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const { syncFinancialRiskItems } = require('./lib/financial-risk-sync');
+const { getAllActiveQuestions } = require('./lib/business-risk-questionnaire');
+const { OWNER_EXIT_READINESS_ITEMS, OWNER_ESTATE_CHECKLIST_ITEMS } = require('./lib/owner-wealth-risk-sync');
 
 // Which pillars are active at each cadence — mirrors the framework's cadence map.
 const CADENCE_PILLARS = {
@@ -177,11 +179,24 @@ function scoreRiskPillar(flags, riskItems) {
   return Math.max(0, Math.round(score * 10) / 10);
 }
 
-// Simple 0-10 scoring off ratio thresholds — replace with your own bands over time.
-function scoreGrowthPillar(fs, priorFs) {
-  let score = 6; // neutral baseline when there's no prior period to compare
-  if (priorFs?.revenue) {
-    const growthRate = (fs.revenue - priorFs.revenue) / priorFs.revenue;
+// posture (Goals → Profile → CLIENT_POSTURES in index.html) is genuinely
+// used here, not decorative — a client on "Consolidate" or "Hold wealth"
+// has explicitly said flat revenue IS the goal, so the default
+// growth-maximizing bands (which score flat as merely neutral, and only
+// reward active growth) would be scoring this business against an
+// objective the owner never asked for. Shrinking is still scored down
+// either way — "hold steady" isn't the same as "any decline is fine."
+function scoreGrowthPillar(fs, priorFs, posture) {
+  if (!priorFs?.revenue) return 6; // neutral baseline when there's no prior period to compare
+  const growthRate = (fs.revenue - priorFs.revenue) / priorFs.revenue;
+  const wantsSteady = posture === 'consolidate' || posture === 'hold_wealth';
+  let score;
+  if (wantsSteady) {
+    if (growthRate >= -0.05 && growthRate <= 0.05) score = 9; // flat is the actual goal here
+    else if (growthRate < -0.05 && growthRate >= -0.15) score = 6;
+    else if (growthRate < -0.15) score = 3; // still bad — "hold steady" isn't "any decline is fine"
+    else score = 6; // growing faster than intended isn't bad, just not the point — neutral rather than penalized
+  } else {
     if (growthRate >= 0.10) score = 9;
     else if (growthRate >= 0.03) score = 7;
     else if (growthRate >= -0.03) score = 6;
@@ -191,6 +206,80 @@ function scoreGrowthPillar(fs, priorFs) {
   return Math.max(0, Math.min(10, score));
 }
 
+// Same question-matching logic as index.html's findBusinessQuestionAnswer
+// and owner-wealth-risk-sync.js's applicability checks — duplicated here
+// rather than shared, same "per-file independence" convention this domain
+// already uses, since this runs server-side in the analysis engine, not
+// the browser.
+function findBusinessAnswer(questionText, businessRows, allQuestions) {
+  const question = (allQuestions || []).find((q) => q.question_text === questionText);
+  if (!question) return { answered: false };
+  const rows = (businessRows || [])
+    .filter((r) => r.question_id === question.id)
+    .sort((a, b) => (b.last_reviewed_date || '').localeCompare(a.last_reviewed_date || ''));
+  if (!rows.length) return { answered: false };
+  return { answered: true, riskPresent: rows[0].status === 'Identified' || rows[0].status === 'Watch' };
+}
+
+function exitReadinessSignalScore(questionText, businessRows, allQuestions) {
+  const { answered, riskPresent } = findBusinessAnswer(questionText, businessRows, allQuestions);
+  if (!answered) return null;
+  return riskPresent ? 0 : 10;
+}
+
+function exitReadinessChecklistScore(status) {
+  if (status === 'yes') return 10;
+  if (status === 'partial') return 5;
+  if (status === 'no') return 0;
+  return null;
+}
+
+// Mirrors index.html's computeExitReadinessScore (10 factors: 4 reused
+// Business Risk Q answers + profitability + the 5 exit readiness
+// checklist items) but only needs the overall number here, not the
+// per-factor breakdown the card shows — kept in sync by eye, same
+// duplication convention as findBusinessAnswer above.
+function computeExitReadinessOverall(exitReadinessChecklist, businessRows, allQuestions, profitabilityScore) {
+  const byKey = Object.fromEntries((exitReadinessChecklist || []).map((it) => [it.key, it]));
+  const scores = [
+    exitReadinessSignalScore('Is the business heavily dependent on the owner?', businessRows, allQuestions),
+    exitReadinessSignalScore('Is there a key employee the business couldn\'t easily replace?', businessRows, allQuestions),
+    exitReadinessSignalScore('Is a significant amount of revenue dependent on one customer?', businessRows, allQuestions),
+    exitReadinessSignalScore('Are critical processes documented?', businessRows, allQuestions),
+    profitabilityScore != null ? profitabilityScore : null,
+    ...Object.keys(OWNER_EXIT_READINESS_ITEMS).map((key) => exitReadinessChecklistScore(byKey[key]?.status)),
+  ];
+  const assessed = scores.filter((s) => s != null);
+  return assessed.length ? Math.round((assessed.reduce((sum, s) => sum + s, 0) / assessed.length) * 10) : null;
+}
+
+// Mirrors index.html's ownerEstateItemApplicability — buy-sell agreement
+// and key-person insurance only count as a real gap when there's actually
+// a co-owner for them to apply to.
+function ownerEstateItemApplicable(key, entityType) {
+  if (key !== 'buy_sell_agreement' && key !== 'key_person_insurance') return true;
+  if (entityType === 'Sole trader') return false;
+  return true; // Partnership, or ambiguous (Company/Trust/Other/unset) — same "don't guess it away" treatment as the frontend's gap-counting
+}
+
+// A single 0-10 number for the Business Health wheel, not a narrative —
+// Exit Readiness's own /100 score is the base (already the most complete
+// signal this domain produces), with up to 2 points off for estate
+// document gaps (will/EPOA/etc — a personal-protection risk Exit
+// Readiness's factor set doesn't cover, since that's about business value
+// specifically). Retirement Outlook is deliberately NOT folded in — its
+// inputs (desired income, growth assumptions) are session-only UI state on
+// the Owner & Succession card, never persisted, so there's nothing here to
+// read. Nothing assessed yet falls back to the same neutral 6 every other
+// unscored pillar uses, rather than treating silence as a penalty.
+function scoreOwnerWealthPillar(ownerWealth) {
+  const { exitReadinessOverall, estateGapCount, estateApplicableCount } = ownerWealth || {};
+  if (exitReadinessOverall == null) return 6;
+  let score = exitReadinessOverall / 10;
+  if (estateApplicableCount > 0) score -= (estateGapCount / estateApplicableCount) * 2;
+  return Math.max(0, Math.min(10, Math.round(score * 10) / 10));
+}
+
 function scorePillar(pillar, ratios, riskContext) {
   const band = (val, good, ok) => (val == null ? null : val >= good ? 9 : val >= ok ? 6 : 3);
   switch (pillar) {
@@ -198,7 +287,8 @@ function scorePillar(pillar, ratios, riskContext) {
     case 'cash_flow': return band(ratios.current_ratio, 1.5, 1.0);
     case 'tax': return 8; // placeholder until BAS-variance logic is added
     case 'risk': return scoreRiskPillar(riskContext?.flags, riskContext?.riskItems);
-    case 'growth': return scoreGrowthPillar(riskContext?.fs, riskContext?.priorFs);
+    case 'growth': return scoreGrowthPillar(riskContext?.fs, riskContext?.priorFs, riskContext?.posture);
+    case 'owner_wealth': return scoreOwnerWealthPillar(riskContext?.ownerWealth);
     default: return 6; // placeholder for pillars not yet ratio-driven
   }
 }
@@ -332,7 +422,7 @@ exports.handler = async (event) => {
     const { client_id, period_end } = JSON.parse(event.body || '{}');
     if (!client_id || !period_end) return { statusCode: 400, body: 'client_id and period_end required' };
 
-    const [{ data: fs }, { data: context }, { data: priorFsList }, kpiLibResult, riskItemsResult, trendHistoryResult] = await Promise.all([
+    const [{ data: fs }, { data: context }, { data: priorFsList }, kpiLibResult, riskItemsResult, trendHistoryResult, ownerWealthSnapshotResult] = await Promise.all([
       supabase.from('financial_snapshots').select('*').eq('client_id', client_id).eq('period_end', period_end).single(),
       supabase.from('client_context').select('*').eq('client_id', client_id).single(),
       supabase.from('financial_snapshots').select('*').eq('client_id', client_id).lt('period_end', period_end).order('period_end', { ascending: false }).limit(1),
@@ -341,15 +431,37 @@ exports.handler = async (event) => {
       // written for THIS period yet (see syncFinancialRiskItems below), so
       // scoreRiskPillar reads financial straight off the in-memory `flags`
       // computed a few lines down instead of querying for it here.
-      supabase.from('risk_items').select('source, category, period_end, status, severity').eq('client_id', client_id).in('source', ['business', 'industry']),
+      // question_id/last_reviewed_date are only needed for the owner_wealth
+      // pillar's exit-readiness scoring below (matching a business row back
+      // to its question) — scoreRiskPillar itself ignores both.
+      supabase.from('risk_items').select('source, category, period_end, status, severity, question_id, last_reviewed_date').eq('client_id', client_id).in('source', ['business', 'industry']),
       // Feeds the growth trajectory commentary below — raw per-period figures
       // at whatever cadence the client actually reports, not aggregated (the
       // AI has the cadence in clientData already and can read the trend
       // itself; no need to duplicate get_growth_trajectory's rollup logic
       // here just for a qualitative read).
       supabase.from('financial_snapshots').select('period_end, revenue, net_profit').eq('client_id', client_id).lte('period_end', period_end).order('period_end', { ascending: false }).limit(6),
+      // Owner & Succession's own checklists for THIS period — feeds the
+      // owner_wealth pillar score below. Fetched unconditionally rather than
+      // gated on cadence, same as risk_items above; the cost of one extra
+      // small query on a quarterly/half-yearly run is negligible next to
+      // gating this whole block on `context.cadence`, which isn't known
+      // until this same Promise.all resolves.
+      supabase.from('owner_wealth_snapshots').select('estate_planning_checklist, exit_readiness_checklist').eq('client_id', client_id).eq('period_end', period_end).maybeSingle(),
     ]);
     if (!fs) throw new Error('No financial snapshot found — run xero-pull first');
+
+    // Isolated the same way read-data.js isolates it — until
+    // migration_risk_items_v3.sql (risk_questions) is run, this throws, and
+    // it must not take down the whole analysis (diagnosis, flags, KPIs)
+    // just because the owner_wealth pillar's exit-readiness scoring below
+    // couldn't match a business answer to its question.
+    let allQuestions = [];
+    try {
+      allQuestions = await getAllActiveQuestions(supabase);
+    } catch (err) {
+      console.error('getAllActiveQuestions failed:', err.message);
+    }
 
     const trendHistory = [...(trendHistoryResult?.data || [])].reverse(); // oldest -> newest
 
@@ -357,7 +469,19 @@ exports.handler = async (event) => {
     const priorFs = priorFsList?.[0] || null;
     const priorRatios = priorFs ? computeRatios(priorFs) : null;
     const flags = runFlags(fs, priorFs, ratios, priorRatios);
-    const riskContext = { flags, riskItems: riskItemsResult?.data || [], fs, priorFs };
+    const businessRows = (riskItemsResult?.data || []).filter((r) => r.source === 'business');
+    const estateChecklist = ownerWealthSnapshotResult?.data?.estate_planning_checklist || [];
+    const exitReadinessChecklist = ownerWealthSnapshotResult?.data?.exit_readiness_checklist || [];
+    const profitabilityScoreForOwner = scorePillar('profitability', ratios, {});
+    const exitReadinessOverall = computeExitReadinessOverall(exitReadinessChecklist, businessRows, allQuestions, profitabilityScoreForOwner);
+    const estateByKey = Object.fromEntries(estateChecklist.map((it) => [it.key, it]));
+    const applicableEstateItems = Object.keys(OWNER_ESTATE_CHECKLIST_ITEMS).filter((key) => ownerEstateItemApplicable(key, context?.entity_type));
+    const ownerWealth = {
+      exitReadinessOverall,
+      estateApplicableCount: applicableEstateItems.length,
+      estateGapCount: applicableEstateItems.filter((key) => estateByKey[key]?.status === 'no').length,
+    };
+    const riskContext = { flags, riskItems: riskItemsResult?.data || [], fs, priorFs, ownerWealth, posture: context?.profile_extra?.posture };
     const activePillars = CADENCE_PILLARS[context?.cadence || 'quarterly'];
     const scores = activePillars.map((p) => ({ pillar: p, score: scorePillar(p, ratios, riskContext), active: true }));
     const healthScore = Math.round(
@@ -404,9 +528,9 @@ exports.handler = async (event) => {
     // treat this as "correctly wired for when it applies" rather than a
     // guaranteed saving on every call.
     const systemInstructions = `You are the analysis engine for an accounting advisory app. Given this client's data, write, using SHORT, DIRECT language throughout (this is a strict length budget, not a preference):
-1. A diagnosis, UP TO 70 WORDS (use the budget well — this is the most important synthesis in the report — but a hard technical limit means it cannot run longer). Reference the specific ratios/flags, call out any meaningful gap between a KPI's current value and its target where one is set (see "targets" below), and bring in general industry context only where it genuinely adds insight.
+1. A diagnosis, UP TO 70 WORDS (use the budget well — this is the most important synthesis in the report — but a hard technical limit means it cannot run longer). Reference the specific ratios/flags, call out any meaningful gap between a KPI's current value and its target where one is set (see "targets" below), and bring in general industry context only where it genuinely adds insight. Where years trading, employee count, or notable context below would change how a number should read (e.g. a ratio that's normal for a 1-year-old business but not a 20-year-old one, or a recent ownership change explaining a dip), factor it in — don't just restate it.
 2. Up to 2 "get better" items — efficiency/operational fixes tied to a CURRENT gap or underperforming metric (e.g. closing a margin gap, fixing cost classification, tightening a process) — each with a short title (≤6 words) and impact/difficulty/timeframe in ≤15 words total.
-3. Up to 2 growth opportunities — NEW, additive ideas (new services, pricing changes, marketing/customer acquisition, expansion, upsell) that are NOT about fixing something currently wrong — each with a short title (≤6 words) and impact/difficulty/timeframe in ≤15 words total. If "cash movement this period" below shows a real surplus with no clear use (no debt paydown, no reinvestment), that's a legitimate opportunity too (e.g. accelerate debt repayment, invest in equipment, build a buffer) — don't force one if the movement doesn't suggest it.
+3. Up to 2 growth opportunities — NEW, additive ideas (new services, pricing changes, marketing/customer acquisition, expansion, upsell) that are NOT about fixing something currently wrong — each with a short title (≤6 words) and impact/difficulty/timeframe in ≤15 words total. If "cash movement this period" below shows a real surplus with no clear use (no debt paydown, no reinvestment), that's a legitimate opportunity too (e.g. accelerate debt repayment, invest in equipment, build a buffer) — don't force one if the movement doesn't suggest it. Check "What the owner wants" below first: if posture is Consolidate or Hold wealth, don't suggest business-expansion ideas — reframe this slot toward efficiency, distributions, or tax/wealth extraction instead, since growing bigger isn't what this owner is asking for.
 4. Up to 2 tax planning opportunities — things worth the adviser reviewing WITH the client, grounded in this client's actual entity structure, profit level, and numbers below (e.g. timing of income/expenses or asset purchases before year-end, depreciation, super contributions, structure fit for the current profit level, use of losses) — each with a short title (≤6 words) and impact/difficulty/timeframe in ≤15 words total. These are prompts for a conversation, NOT advice to act on: phrase each title/impact as something to review, never as an instruction (e.g. "Review pre-year-end asset timing", not "Buy equipment now"). Skip entirely if nothing genuinely stands out — don't invent one to fill the quota.
 5. For each KPI listed below, ONE interpretation line under 12 words: state the given "value" EXACTLY AS WRITTEN — it's already formatted (e.g. "21.6%", "14d", "1.31x"), so copy it verbatim, never recalculate, reformat, or convert it yourself — and, if a trend is given, whether it's improving or worsening. If marked "estimated", add a 2-3 word reason in parentheses. Skip any KPI not listed — those are unavailable, don't invent a number for them.
 6. Separately, for these six KPIs specifically — GP margin, Net profit margin, Wages/sales, Debtor days, Creditor days, Inventory days — add a benchmark line under 10 words each, e.g. "Typically 40-55% for auto repair shops" (general knowledge, NOT a verified data source, using the client's actual industry and description, not a generic category). These six are industry-driven enough that a benchmark is meaningful — the rest of the KPIs (revenue growth, ROE, debt/equity, current ratio, operating cash conversion, effective tax rate) are capital-structure or lifecycle-dependent rather than industry-dependent, so never benchmark those. Only omit one of the six if you genuinely have no reasonable basis for this specific industry — don't guess vaguely just to fill it in.
@@ -415,6 +539,11 @@ exports.handler = async (event) => {
 Respond ONLY as JSON, no markdown fences: {"diagnosis": "...", "get_better": [{"title":"","impact":"","difficulty":"","timeframe":""}], "opportunities": [{"title":"","impact":"","difficulty":"","timeframe":""}], "tax_planning": [{"title":"","impact":"","difficulty":"","timeframe":""}], "kpi_interpretations": {"<kpi_key>": "..."}, "kpi_benchmarks": {"<kpi_key>": "..."}, "growth_trajectory_commentary": "..."}`;
 
     const clientData = `Client: ${context?.business_description || 'no description'} (${context?.industry}), entity structure: ${context?.entity_type || 'not set'}
+Years trading: ${context?.profile_extra?.years_trading ?? 'not set'}
+Employees: ${context?.profile_extra?.employee_count ?? 'not set'}
+Notable context (family situation, ownership history, anything else worth knowing): ${context?.structure_notes || 'none noted'}
+Key contact's role: ${context?.profile_extra?.key_contact_role || 'not set'} — matters for tone: advice for the Owner reads differently than advice being relayed through a Manager who isn't one.
+What the owner wants (major goal / current posture / stated horizon in years): ${context?.profile_extra?.major_goal || 'not set'} / ${context?.profile_extra?.posture || 'not set'} / ${context?.profile_extra?.goal_horizon_years ?? 'not set'}
 Cadence: ${context?.cadence}
 Ratios: ${JSON.stringify(ratios)}
 Flags fired: ${JSON.stringify(flags)}

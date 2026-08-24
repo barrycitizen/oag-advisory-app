@@ -5,6 +5,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const { generateIndustryRiskItems } = require('./lib/industry-risk-checklist');
 const { submitQuestionAnswer, addQuestion, deleteQuestion, unanswerQuestion } = require('./lib/business-risk-questionnaire');
 const { applyReviewAction } = require('./lib/risk-review-actions');
+const { syncOwnerWealthRiskItems } = require('./lib/owner-wealth-risk-sync');
 
 // fy_end is required (not just business_name) because the frontend derives every
 // valid period-end date from cadence + fy_end — without it, Input has no dates to offer.
@@ -42,6 +43,50 @@ async function deletePeriod(body) {
     if (error) throw error;
   }
   return { deleted: true, period_end };
+}
+
+// Soft-delete: hides a client from the default list without touching any of
+// their data. Reversible via unarchiveClient — this is the everyday "remove
+// a client" action; deleteClient below is a separate, deliberate hard-delete.
+async function archiveClient(body) {
+  const { client_id } = body;
+  if (!client_id) throw new Error('client_id required');
+  const { error } = await supabase.from('client_context').update({ is_archived: true }).eq('client_id', client_id);
+  if (error) throw error;
+  return { archived: true };
+}
+
+async function unarchiveClient(body) {
+  const { client_id } = body;
+  if (!client_id) throw new Error('client_id required');
+  const { error } = await supabase.from('client_context').update({ is_archived: false }).eq('client_id', client_id);
+  if (error) throw error;
+  return { archived: false };
+}
+
+// Permanent, irreversible — every row this client_id touches across every
+// client-scoped table, then the client_context row itself last (owner_goals
+// lives nested inside that row's JSONB, so no separate delete needed for
+// it). kpi_library/risk_questions/industry_*_cache are shared reference
+// tables, not client-scoped, and are untouched. Only reachable from an
+// already-archived client in the UI, as a last-resort cleanup rather than
+// the everyday "remove a client" action (see archiveClient above).
+async function deleteClient(body) {
+  const { client_id } = body;
+  if (!client_id) throw new Error('client_id required');
+
+  const tables = [
+    'flags', 'pillar_scores', 'health_scores', 'diagnostics', 'recommendations',
+    'financial_snapshots', 'business_valuations', 'owner_wealth_snapshots',
+    'action_items', 'risk_items', 'xero_connections',
+  ];
+  for (const table of tables) {
+    const { error } = await supabase.from(table).delete().eq('client_id', client_id);
+    if (error) throw error;
+  }
+  const { error } = await supabase.from('client_context').delete().eq('client_id', client_id);
+  if (error) throw error;
+  return { deleted: true };
 }
 
 const FINANCIAL_FIELDS = [
@@ -184,8 +229,38 @@ function cleanOwnerCustomBuckets(buckets) {
   }));
 }
 
+// A small fixed checklist (Will/EPOA/buy-sell/key-person insurance,
+// defined client-side in index.html's OWNER_ESTATE_CHECKLIST_ITEMS) — no
+// server-side key validation, same reasoning as custom_buckets not
+// validating labels: keeps the two in sync without a backend change if the
+// item list ever grows.
+function cleanEstateChecklist(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((it) => it && it.key)
+    .map((it) => ({
+      key: String(it.key),
+      status: ['yes', 'no', 'unknown'].includes(it.status) ? it.status : 'unknown',
+      notes: String(it.notes || '').trim() || null,
+    }));
+}
+
+// Same shape as the estate checklist, but yes/partial/no/unknown (not just
+// yes/no) — these are genuinely gradient questions (recurring revenue,
+// management depth) where "partial" is a real, common answer, not a cop-out.
+function cleanExitReadinessChecklist(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((it) => it && it.key)
+    .map((it) => ({
+      key: String(it.key),
+      status: ['yes', 'partial', 'no', 'unknown'].includes(it.status) ? it.status : 'unknown',
+      notes: String(it.notes || '').trim() || null,
+    }));
+}
+
 async function saveOwnerWealth(body) {
-  const { client_id, period_end, super_items, investments_items, property_items, other_assets_items, debt_items, custom_buckets, notes } = body;
+  const { client_id, period_end, super_items, investments_items, property_items, other_assets_items, debt_items, custom_buckets, estate_planning_checklist, exit_readiness_checklist, notes } = body;
   if (!client_id || !period_end) throw new Error('client_id and period_end required');
 
   const superItems = cleanOwnerWealthItems(super_items);
@@ -194,6 +269,8 @@ async function saveOwnerWealth(body) {
   const otherItems = cleanOwnerWealthItems(other_assets_items);
   const debtItems = cleanOwnerWealthItems(debt_items);
   const customBuckets = cleanOwnerCustomBuckets(custom_buckets);
+  const estateChecklist = cleanEstateChecklist(estate_planning_checklist);
+  const exitReadinessChecklist = cleanExitReadinessChecklist(exit_readiness_checklist);
 
   // NULL for "no items entered" vs a real 0 — same null-vs-zero convention
   // saveFinancials uses, so an unset bucket can honestly show as "not
@@ -206,10 +283,23 @@ async function saveOwnerWealth(body) {
     other_assets_items: otherItems, other_assets: otherItems.length ? sumOwnerWealthItems(otherItems) : null,
     debt_items: debtItems, debt: debtItems.length ? sumOwnerWealthItems(debtItems) : null,
     custom_buckets: customBuckets,
+    estate_planning_checklist: estateChecklist,
+    exit_readiness_checklist: exitReadinessChecklist,
     notes: notes || null, updated_at: new Date().toISOString(),
   };
   const { error } = await supabase.from('owner_wealth_snapshots').upsert(row, { onConflict: 'client_id,period_end' });
   if (error) throw error;
+
+  // Risk Review, Source D — mirrors estate checklist gaps and succession
+  // readiness into risk_items so they're visible from Risk, not just on
+  // Owner Wealth's own card. Non-fatal: an issue here must never take down
+  // the save itself, same guard Source A (financial) uses.
+  try {
+    await syncOwnerWealthRiskItems(supabase, { clientId: client_id, periodEnd: period_end });
+  } catch (err) {
+    console.error('Owner wealth risk sync failed:', err.message);
+  }
+
   return row;
 }
 
@@ -295,6 +385,21 @@ async function saveGoalItems(body) {
 
   const { error } = await supabase.from('client_context').update({ owner_goals: goals }).eq('client_id', client_id);
   if (error) throw error;
+
+  // exit_succession is the one goal category Owner Wealth's risk sync also
+  // reads (target_year, succession_pathway, successor_readiness) — re-sync
+  // on save here too, not just on Owner Wealth's own save, so editing a
+  // succession pathway in Goals shows up in Risk right away rather than
+  // waiting for the next unrelated Owner Wealth save. Non-fatal, same
+  // guard the sync's other call site uses.
+  if (category === 'exit_succession') {
+    try {
+      await syncOwnerWealthRiskItems(supabase, { clientId: client_id, periodEnd: period_end });
+    } catch (err) {
+      console.error('Owner wealth risk sync failed:', err.message);
+    }
+  }
+
   return cats[category];
 }
 
@@ -433,6 +538,48 @@ async function editGoalQuestion(body) {
   return { id, prompt };
 }
 
+const ACTION_ITEM_STATUSES = ['not_started', 'in_progress', 'done'];
+const ACTION_ITEM_OWNERS = ['Client', 'Accountant'];
+
+// Create when no id is given, update when one is — same single-endpoint
+// shape as risk_review_action rather than a separate create/update pair,
+// since every field (text/status/priority/owner/due_date) is editable
+// either way and the caller already knows whether it has an id.
+async function saveActionItem(body) {
+  const { id, client_id, text, source, priority, status, owner, due_date, why } = body;
+  if (!client_id) throw new Error('client_id required');
+  const cleanStatus = ACTION_ITEM_STATUSES.includes(status) ? status : 'not_started';
+  const row = {
+    text: String(text || '').trim(),
+    status: cleanStatus,
+    priority: priority || null,
+    owner: ACTION_ITEM_OWNERS.includes(owner) ? owner : null,
+    due_date: due_date || null,
+    why: why || null,
+    updated_at: new Date().toISOString(),
+    completed_at: cleanStatus === 'done' ? new Date().toISOString() : null,
+  };
+  if (!row.text) throw new Error('text required');
+
+  if (id) {
+    const { data, error } = await supabase.from('action_items').update(row).eq('id', id).eq('client_id', client_id).select().single();
+    if (error) throw error;
+    return data;
+  }
+  const { data, error } = await supabase.from('action_items')
+    .insert({ ...row, client_id, source: source || 'manual' }).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function deleteActionItem(body) {
+  const { id, client_id } = body;
+  if (!id || !client_id) throw new Error('id and client_id required');
+  const { error } = await supabase.from('action_items').delete().eq('id', id).eq('client_id', client_id);
+  if (error) throw error;
+  return { deleted: true };
+}
+
 exports.handler = async (event) => {
   try {
     const body = JSON.parse(event.body || '{}');
@@ -457,6 +604,11 @@ exports.handler = async (event) => {
       : body.type === 'edit_goal_question' ? await editGoalQuestion(body)
       : body.type === 'save_valuation' ? await saveValuation(body)
       : body.type === 'save_owner_wealth' ? await saveOwnerWealth(body)
+      : body.type === 'save_action_item' ? await saveActionItem(body)
+      : body.type === 'delete_action_item' ? await deleteActionItem(body)
+      : body.type === 'archive_client' ? await archiveClient(body)
+      : body.type === 'unarchive_client' ? await unarchiveClient(body)
+      : body.type === 'delete_client' ? await deleteClient(body)
       : null;
 
     if (!result) return { statusCode: 400, body: 'Unknown type' };

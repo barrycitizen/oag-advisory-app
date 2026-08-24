@@ -12,12 +12,30 @@ const { getOrGenerateMultiple } = require('./lib/valuation-multiple');
 
 exports.handler = async (event) => {
   try {
-    const { action, client_id, period_end, view_cadence, periods_count } = JSON.parse(event.body || '{}');
+    const { action, client_id, period_end, view_cadence, periods_count, include_archived } = JSON.parse(event.body || '{}');
 
     if (action === 'list_clients') {
-      const { data, error } = await supabase.from('client_context').select('client_id, business_description, industry, cadence, profile_extra');
-      if (error) throw error;
+      let query = supabase.from('client_context').select('client_id, business_description, industry, cadence, profile_extra, is_archived');
+      if (!include_archived) query = query.eq('is_archived', false);
+      const { data, error } = await query;
+      if (error) {
+        // is_archived column not migrated yet (migration_client_archive.sql)
+        // — degrade to showing every client rather than breaking the list.
+        const { data: fallback, error: fbErr } = await supabase.from('client_context').select('client_id, business_description, industry, cadence, profile_extra');
+        if (fbErr) throw fbErr;
+        return { statusCode: 200, body: JSON.stringify(fallback) };
+      }
       return { statusCode: 200, body: JSON.stringify(data) };
+    }
+
+    // Lets the Xero Sync tab grey itself out with a clear message instead of
+    // letting the user click "Sync" and get a raw {"error": "No Xero
+    // connection found..."} dump back from xero-pull.js. No connect/OAuth
+    // flow exists yet — this only reports whether a row already exists.
+    if (action === 'get_xero_status') {
+      const { data, error } = await supabase.from('xero_connections').select('client_id, tenant_id, last_synced_at').eq('client_id', client_id).maybeSingle();
+      if (error) return { statusCode: 200, body: JSON.stringify({ connected: false }) };
+      return { statusCode: 200, body: JSON.stringify({ connected: !!data, last_synced_at: data?.last_synced_at || null }) };
     }
 
     if (action === 'get_context') {
@@ -443,6 +461,16 @@ exports.handler = async (event) => {
       return { statusCode: 200, body: JSON.stringify({ valuations: valuations || [], suggestedMultiple }) };
     }
 
+    // Client-level, not period-scoped — see migration_action_items.sql for
+    // why. Degrades gracefully the same way owner_wealth_snapshots does
+    // below, in case this migration hasn't been run yet.
+    if (action === 'get_action_items') {
+      const { data: items, error } = await supabase
+        .from('action_items').select('*').eq('client_id', client_id).order('created_at', { ascending: false });
+      if (error) console.error('action_items read failed:', error.message);
+      return { statusCode: 200, body: JSON.stringify({ items: items || [] }) };
+    }
+
     if (action === 'get_owner_wealth') {
       // Run independently (Promise.all, and the wealth-snapshots error is
       // swallowed rather than thrown) so a missing/erroring
@@ -479,12 +507,18 @@ exports.handler = async (event) => {
       // so adding it as a secondary sort makes the order deterministic and
       // stable across reads regardless of what's been updated. Same risk
       // exists for financial's severity ties, so it gets the tiebreaker too.
-      const [{ data: financial }, { data: industry }, { data: business }] = await Promise.all([
+      // owner_wealth is period-scoped like financial (not client-level like
+      // business/industry) — Owner Wealth is its own annual snapshot with
+      // its own period_end, same reasoning financial's query already uses.
+      const [{ data: financial }, { data: industry }, { data: business }, { data: ownerWealth }] = await Promise.all([
         period_end
           ? supabase.from('risk_items').select('*').eq('client_id', client_id).eq('period_end', period_end).eq('source', 'financial').order('severity', { ascending: false }).order('id')
           : Promise.resolve({ data: [] }),
         supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'industry').order('created_at').order('id'),
         supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'business').order('created_at').order('id'),
+        period_end
+          ? supabase.from('risk_items').select('*').eq('client_id', client_id).eq('period_end', period_end).eq('source', 'owner_wealth').order('severity', { ascending: false }).order('id')
+          : Promise.resolve({ data: [] }),
       ]);
 
       // Isolated from the block above on purpose — until migration_risk_items_v3.sql
@@ -512,7 +546,7 @@ exports.handler = async (event) => {
         console.error('getCategoriesForReview failed:', err.message);
       }
 
-      return { statusCode: 200, body: JSON.stringify({ financial: financial || [], industry: industry || [], business: business || [], categoriesToReview, allQuestions }) };
+      return { statusCode: 200, body: JSON.stringify({ financial: financial || [], industry: industry || [], business: business || [], owner_wealth: ownerWealth || [], categoriesToReview, allQuestions }) };
     }
 
     if (action === 'get_report_data') {
