@@ -726,6 +726,9 @@ exports.handler = async (event) => {
       supabase.from('owner_wealth_snapshots').select('estate_planning_checklist, exit_readiness_checklist').eq('client_id', client_id).eq('period_end', period_end).maybeSingle(),
     ]);
     if (!fs) throw new Error('No financial snapshot found — run xero-pull first');
+    // A period row can exist with nothing entered ("+ New period" creates
+    // it) — analysing that produced a diagnosis and scores from nothing.
+    if (fs.revenue == null && fs.net_profit == null) throw new Error('No figures entered for this period yet — add revenue and profit on the Input tab first.');
 
     // Isolated the same way read-data.js isolates it — until
     // migration_risk_items_v3.sql (risk_questions) is run, this throws, and

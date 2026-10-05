@@ -182,7 +182,12 @@ input[type="file"] { border: none; padding: 4px 0; background: transparent; }
    column's width — the non-wrapping version blew the whole row out past
    the card edge, since a non-wrapping flex item's min-content is the SUM
    of its children's widths, not just the widest one. */
-.pillar-legend-item { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 12px; min-width: 0; }
+/* Swatch | name | score on one line, the OK/Good badge tucked under the
+   name — the wheel card's two legend columns are ~124px each, too narrow
+   for all four inline, which used to wrap the score onto its own line. */
+.pillar-legend-item { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 2px 8px; font-size: 12px; min-width: 0; }
+.pillar-legend-item .confidence-badge { grid-column: 2; grid-row: 2; justify-self: start; }
+.pillar-legend-item .pillar-legend-score { grid-column: 3; grid-row: 1; }
 .pillar-swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
 .pillar-legend-name { color: var(--ink-soft); }
 .pillar-legend-score { font-family: var(--font-mono); margin-left: auto; color: var(--ink); }
@@ -6497,19 +6502,23 @@ async function renderOverviewTab(content) {
           <div class="pillar-legend" id="ov-legend"></div>
         ` : '<p class="muted plain" style="text-align:center; margin-top:24px;">No analysis run yet for this period.</p>'}
       </div>
+      <!-- Right of the wheel, same .side-cards column Financial Performance
+           uses — the hero row's second track used to sit empty here. -->
+      <div class="side-cards">
+        ${diagnosisData?.diagnosis ? `
+          <div class="card">
+            <p class="muted">AI diagnosis</p>
+            <p class="muted plain" style="margin:0; white-space:pre-wrap;">${escAttr(diagnosisData.diagnosis)}</p>
+          </div>
+        ` : ''}
+        ${changedPillars.length ? `
+          <div class="card">
+            <p class="muted">What changed</p>
+            ${changedPillars.map((p) => `<div class="flag-row-wrap"><div class="flag-row"><span style="flex:1;">${p.name}</span><span>${trendArrow(p.score, priorPillarMap[p.key])}</span></div></div>`).join('')}
+          </div>
+        ` : ''}
+      </div>
     </div>
-    ${diagnosisData?.diagnosis ? `
-      <div class="card">
-        <p class="muted">AI diagnosis</p>
-        <p class="muted plain" style="margin:0; white-space:pre-wrap;">${diagnosisData.diagnosis}</p>
-      </div>
-    ` : ''}
-    ${changedPillars.length ? `
-      <div class="card">
-        <p class="muted">What changed</p>
-        ${changedPillars.map((p) => `<div class="flag-row-wrap"><div class="flag-row"><span style="flex:1;">${p.name}</span><span>${trendArrow(p.score, priorPillarMap[p.key])}</span></div></div>`).join('')}
-      </div>
-    ` : ''}
     ${ranking.length ? `
       <div class="card">
         <p class="muted">What matters</p>
@@ -7664,6 +7673,15 @@ async function renderFinancialAnalyse(content) {
   renderHealthWheelBlock(body, overview, kpiData?.kpis, kpiData?.snapshot, history, divisionHistory);
 
   const runBtn = document.getElementById('run-analysis-btn');
+  // Nothing to analyse until figures are in — same check analyze-background
+  // makes server-side, surfaced here so the button can't be clicked at all.
+  const snap = kpiData?.snapshot;
+  if (runBtn && (!snap || (snap.revenue == null && snap.net_profit == null))) {
+    runBtn.disabled = true;
+    runBtn.title = 'Enter this period’s figures on the Input tab first';
+    runBtn.insertAdjacentHTML('afterend', `<span class="muted plain" style="margin-left:10px; font-size:12px;">Enter this period’s figures on the Input tab first.</span>`);
+    return;
+  }
   // analyze-background.js runs as a Netlify background function (up to 15
   // min) rather than the old synchronous one (10-30s) — the Claude call
   // alone routinely takes ~20s, which left too little margin once the
@@ -13672,7 +13690,9 @@ async function renderFinancialBrief(content, openDetail) {
   const gpMargin = findKpi('gp_margin');
   const soWhat = diagnosisData?.briefSummary?.financial
     || (diagnosisData?.diagnosis ? diagnosisData.diagnosis.split(/(?<=[.!?])\s/)[0] : null)
-    || 'Run analysis on Financial Performance → Analyse to see a summary here.';
+    || (diagnosisData?.analysisId
+      ? 'Re-run analysis on Financial Performance → Analyse to get a summary here.'
+      : 'Run analysis on Financial Performance → Analyse to see a summary here.');
   // Every KPI that actually moved, ranked by size of the move — not a fixed
   // 3-key list. A hardcoded set (however well-chosen) reads as "these are
   // the only 3 things that could have changed," which is false the moment
@@ -13917,8 +13937,13 @@ async function renderOwnerBrief(content, openDetail) {
   if (myToken !== renderToken) return;
   const latestValuation = (valuationData?.valuations || []).slice(-1)[0];
   const objectiveLabel = CLIENT_OBJECTIVES.find((o) => o.value === ctx?.profile_extra?.major_goal)?.label;
+  // An analysis can exist without the owner summary — periods analysed
+  // before brief_summary was added to the prompt — so only say "run
+  // analysis" when there genuinely isn't one.
   const soWhat = diagnosisData?.briefSummary?.owner
-    || 'Run analysis on Financial Performance → Analyse to see how this period tracks against the owner\'s goal.';
+    || (diagnosisData?.analysisId
+      ? 'Re-run analysis on Financial Performance → Analyse to get an owner summary here — this period was analysed before that was added.'
+      : 'Run analysis on Financial Performance → Analyse to see how this period tracks against the owner\'s goal.');
   const ownerWealth = (ownerWealthData?.snapshots || []).find((s) => s.period_end === currentPeriodEnd) || {};
 
   content.innerHTML = `
@@ -14555,8 +14580,14 @@ async function renderMeetingLanding(content, brief) {
   if (brief?.completed) {
     content.innerHTML = `
       <div class="card">
-        <p class="muted">Meeting complete — ${brief.period_end}</p>
-        <p class="muted plain" style="margin:0 0 6px;">This meeting's priorities and decisions were recorded. See the Report tab for the summary.</p>
+        <p class="muted">Meeting complete — ${formatShortDate(brief.period_end)}</p>
+        <p class="muted plain" style="margin:0 0 6px;">${(() => {
+          const n = brief.priorities?.length || 0;
+          const decided = (brief.priorities || []).filter((p) => p.decision || p.action).length;
+          return n
+            ? `${n} priorit${n === 1 ? 'y' : 'ies'} discussed, ${decided ? `${decided} with a decision or next step recorded` : 'none with a decision recorded'}. See the Report tab for the summary.`
+            : 'No priorities were recorded in this meeting. See the Report tab for the summary.';
+        })()}</p>
         <p class="muted plain" style="margin:0 0 12px;">${brief.actionsPushedCount ? `${brief.actionsPushedCount} action${brief.actionsPushedCount === 1 ? '' : 's'} sent to Actions.` : 'No action text was recorded, so nothing was sent to Actions.'}</p>
         <button class="mini-link" id="goto-actions-from-meeting-link" type="button" style="margin-bottom:10px;">→ View in Actions</button><br>
         <button class="action" id="reopen-meeting-btn">Reopen this meeting</button>
