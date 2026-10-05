@@ -1,3 +1,4 @@
+const { crossOriginRejection } = require('./lib/same-origin');
 // netlify/functions/risk-summary.js
 // One-off AI narrative over the current top risks, for the Risk Review
 // summary card — turns a list of pill-tagged risk items into 2-4 sentences
@@ -29,6 +30,8 @@ Respond with ONLY a JSON object, no markdown fences, no preamble:
 { "summary": "..." }`;
 
 exports.handler = async (event) => {
+  const refused = crossOriginRejection(event); // see lib/same-origin.js
+  if (refused) return refused;
   try {
     const { risks, managedCount } = JSON.parse(event.body || '{}');
     if (!Array.isArray(risks)) return { statusCode: 400, body: 'risks[] required' };

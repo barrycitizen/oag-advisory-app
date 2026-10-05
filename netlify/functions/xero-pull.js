@@ -7,6 +7,7 @@
 //   SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 const { createClient } = require('@supabase/supabase-js');
+const { crossOriginRejection } = require('./lib/same-origin');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
@@ -134,6 +135,8 @@ function extractFields(report, fieldNames) {
 }
 
 exports.handler = async (event) => {
+  const refused = crossOriginRejection(event); // see lib/same-origin.js
+  if (refused) return refused;
   try {
     const { client_id, period_end } = JSON.parse(event.body || '{}');
     if (!client_id || !period_end) {

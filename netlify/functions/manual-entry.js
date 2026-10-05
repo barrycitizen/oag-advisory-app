@@ -1,5 +1,6 @@
 // netlify/functions/manual-entry.js
 const { randomUUID } = require('crypto');
+const { crossOriginRejection } = require('./lib/same-origin');
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const { generateIndustryRiskItems } = require('./lib/industry-risk-checklist');
@@ -89,6 +90,16 @@ async function deleteClient(body) {
   return { deleted: true };
 }
 
+// '' / null / undefined -> null (left blank); otherwise must parse to a
+// finite number, or the save is rejected with the field named — never a
+// silent NaN -> null.
+function toNumberOrNull(field, val) {
+  if (val === '' || val === undefined || val === null) return null;
+  const n = Number(val);
+  if (!Number.isFinite(n)) throw new Error(`${field} must be a number (got "${String(val).slice(0, 40)}")`);
+  return n;
+}
+
 const FINANCIAL_FIELDS = [
   'revenue', 'cogs', 'operating_expenses', 'net_profit', 'wages',
   'debtors', 'creditors', 'cash', 'current_assets', 'current_liabilities',
@@ -125,8 +136,7 @@ function cleanDivisionBreakdown(breakdown, validDivisionIds) {
     .map((d) => {
       const entry = { division_id: d.division_id };
       for (const field of DIVISION_TRADING_FIELDS) {
-        const val = d[field];
-        entry[field] = (val === '' || val === undefined || val === null) ? null : Number(val);
+        entry[field] = toNumberOrNull(`${field} (division)`, d[field]);
       }
       entry.gross_profit = (entry.revenue == null || entry.cogs == null) ? null : entry.revenue - entry.cogs;
       return entry;
@@ -154,9 +164,10 @@ async function saveFinancials(body) {
   };
   // NULL for "left blank" vs a real 0 — a KPI needing this field can then
   // honestly show Unavailable instead of silently calculating off a fake zero.
+  // Anything else must be a real number: Number('12,345') / Number('abc') is
+  // NaN, which JSON-serialises to null — the figure used to vanish silently.
   for (const field of FINANCIAL_FIELDS) {
-    const val = body[field];
-    row[field] = (val === '' || val === undefined || val === null) ? null : Number(val);
+    row[field] = toNumberOrNull(field, body[field]);
   }
   row.gross_profit = (row.revenue == null || row.cogs == null) ? null : row.revenue - row.cogs;
 
@@ -834,6 +845,8 @@ async function deleteActionItem(body) {
 }
 
 exports.handler = async (event) => {
+  const refused = crossOriginRejection(event); // see lib/same-origin.js
+  if (refused) return refused;
   try {
     const body = JSON.parse(event.body || '{}');
     if (!body.type) return { statusCode: 400, body: 'type required' };

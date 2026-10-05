@@ -1,3 +1,4 @@
+const { crossOriginRejection } = require('./lib/same-origin');
 // netlify/functions/risk-advice.js
 // On-demand, per-risk AI advice — deeper and more tailored than what a risk
 // item already carries (its stored `recommendation`/talking point, which is
@@ -36,6 +37,8 @@ Respond with ONLY a JSON object, no markdown fences, no preamble:
 { "advice": "..." }`;
 
 exports.handler = async (event) => {
+  const refused = crossOriginRejection(event); // see lib/same-origin.js
+  if (refused) return refused;
   try {
     const { risk_name, detail, category, source, severity, client_context } = JSON.parse(event.body || '{}');
     if (!risk_name) return { statusCode: 400, body: 'risk_name required' };

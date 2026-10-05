@@ -1,3 +1,4 @@
+const { crossOriginRejection } = require('./lib/same-origin');
 // netlify/functions/expand-text.js
 // Turns a short seed phrase into a fuller draft for a Profile text field — the
 // same idea as "Suggest a goal" but for prose: type a few words, get a draft,
@@ -12,6 +13,8 @@ const FIELD_PROMPTS = {
 };
 
 exports.handler = async (event) => {
+  const refused = crossOriginRejection(event); // see lib/same-origin.js
+  if (refused) return refused;
   try {
     const { seed, field, industry } = JSON.parse(event.body || '{}');
     if (!seed || !field) return { statusCode: 400, body: 'seed and field required' };

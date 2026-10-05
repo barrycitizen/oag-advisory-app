@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="en-AU">
 <head>
 <meta charset="utf-8" />
 <title>OAG Advisory</title>
@@ -545,7 +545,10 @@ input[type="file"] { border: none; padding: 4px 0; background: transparent; }
 .report-score .v { font-family: var(--font-mono); font-size: 24px; margin: 2px 0 4px; }
 .report-score .v span { font-size: 12px; color: var(--ink-soft); }
 .report-score .t { font-size: 11px; margin-left: 6px; }
-.report-figures { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+/* auto-fit on screen: a fixed 5 columns clipped "$1,026,783" to "$1,026," in
+   windows narrower than ~1100px. Print still forces 5 across (see @media print). */
+.report-figures { display: grid; grid-template-columns: repeat(auto-fit, minmax(122px, 1fr)); gap: 8px; }
+.report-figure { min-width: 0; overflow-wrap: anywhere; }
 .report-figure { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; background: var(--paper); }
 .report-figure .v { font-family: var(--font-mono); font-size: 15px; }
 .report-figure .l { font-size: 10.5px; color: var(--ink-soft); margin-top: 1px; }
@@ -1505,12 +1508,24 @@ function restoreScenarioStateIfNeeded() {
 // clobbering whatever the newer render already put on screen.
 let renderToken = 0;
 
+// Throws on a server error (non-2xx) or an unreadable response instead of
+// handing back {error: ...} / blowing up in res.json(). A failed read used to
+// look like "no data" — e.g. Analyse saying "Enter this period's figures
+// first" when the server was actually down — and renderMain now turns the
+// throw into a visible "couldn't load" message (see renderMain).
 async function callRead(action, client_id, period_end, extra) {
   const res = await fetch('/.netlify/functions/read-data', {
     method: 'POST',
     body: JSON.stringify({ action, client_id, period_end, ...(extra || {}) }),
   });
-  return res.json();
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    throw new Error(`The server sent an unexpected response (${res.status}).`);
+  }
+  if (!res.ok) throw new Error(data?.error || `Server error (${res.status}).`);
+  return data;
 }
 
 function capCadence(c) {
@@ -1529,10 +1544,19 @@ function clientDisplayName(ctx, fallbackId) {
 // picker — they're managed entirely from the dedicated Archived clients
 // panel (renderArchivedClients), reached via the sidebar link.
 async function loadClients() {
-  const data = await callRead('list_clients');
   const sel = document.getElementById('client-select');
+  let data;
+  try {
+    data = await callRead('list_clients');
+  } catch (err) {
+    // Startup with the local server down used to leave an empty dropdown
+    // and an unhandled error — say what's wrong instead.
+    console.error('Client list failed to load:', err);
+    sel.innerHTML = '<option value="">Couldn’t load clients — is the server running?</option>';
+    return;
+  }
   sel.innerHTML = '<option value="">Select a client…</option>' +
-    (data || []).map((c) => `<option value="${c.client_id}">${clientDisplayName(c, c.client_id)}</option>`).join('');
+    (data || []).map((c) => `<option value="${escAttr(c.client_id)}">${escAttr(clientDisplayName(c, c.client_id))}</option>`).join('');
   sel.value = currentClientId || '';
   // A long client name still clips in the closed <select> at this sidebar
   // width — title gives a hover tooltip with the full name as a fallback,
@@ -1680,8 +1704,15 @@ function renderPeriodPills() {
 async function refreshHealthBadge() {
   const badge = document.getElementById('health-badge');
   if (!currentPeriodEnd) { badge.textContent = 'Health: —'; return; }
-  const overview = await callRead('get_overview', currentClientId, currentPeriodEnd);
-  badge.textContent = overview?.healthScore ? `Health: ${overview.healthScore.score}/100` : 'Health: —';
+  try {
+    const overview = await callRead('get_overview', currentClientId, currentPeriodEnd);
+    badge.textContent = overview?.healthScore ? `Health: ${overview.healthScore.score}/100` : 'Health: —';
+  } catch (err) {
+    // Fire-and-forget from many places — never let a failed read here
+    // become an unhandled rejection; just stop showing a possibly-stale score.
+    console.error('Health badge failed to load:', err);
+    badge.textContent = 'Health: —';
+  }
 }
 
 function renderSidebarDomains() {
@@ -1794,6 +1825,10 @@ document.getElementById('add-client-btn').addEventListener('click', () => {
       msg.className = 'save-msg err';
       return;
     }
+    // Guard against a double-click creating two identical clients.
+    const saveBtn = document.getElementById('nc-save');
+    if (saveBtn.disabled) return;
+    saveBtn.disabled = true;
     msg.textContent = 'Creating…';
     msg.className = 'save-msg';
     try {
@@ -1815,6 +1850,7 @@ document.getElementById('add-client-btn').addEventListener('click', () => {
     } catch (err) {
       msg.textContent = 'Error: ' + err.message;
       msg.className = 'save-msg err';
+      saveBtn.disabled = false;
     }
   };
 });
@@ -2102,9 +2138,30 @@ document.getElementById('framework-summary-btn').addEventListener('click', () =>
 // gets the "this period isn't saved yet" banner appended afterward, without
 // each of the ~10 render functions needing to remember to call it
 // themselves.
+// Any load failure inside a screen (server down, error, garbage response)
+// lands here. Without this the half-finished render just stopped, leaving the
+// PREVIOUS screen's content showing under the new tab — wrong information
+// with no sign anything failed. Only the latest render reports (renderToken),
+// so a failure in a screen already navigated away from stays quiet.
 async function renderMain() {
-  await renderMainDispatch();
-  refreshUnsavedPeriodBanner();
+  const token = renderToken + 1; // renderMainDispatch bumps renderToken to this
+  try {
+    await renderMainDispatch();
+  } catch (err) {
+    console.error('Screen failed to load:', err);
+    if (token !== renderToken) return;
+    const content = document.getElementById('tab-content');
+    content.innerHTML = `
+      <div class="card" style="border-color:var(--rust);">
+        <p class="muted" style="color:var(--rust);">Couldn't load this screen</p>
+        <p class="muted plain" style="margin:0 0 10px;">${escAttr(err?.message || 'Unknown error')}${/fetch/i.test(err?.message || '') ? ' — is the local server (localhost:8888) still running?' : ''}</p>
+        <button class="action" id="render-retry-btn" type="button">Try again</button>
+      </div>
+    `;
+    document.getElementById('render-retry-btn').onclick = () => renderMain();
+    return;
+  }
+  try { await refreshUnsavedPeriodBanner(); } catch (err) { console.error('Period banner failed to refresh:', err); }
 }
 
 async function renderMainDispatch() {
@@ -2289,7 +2346,7 @@ async function renderManualEntry(content) {
   FINANCIAL_FIELD_DEFS.forEach(([key, label]) => {
     const div = document.createElement('div');
     div.className = 'form-field';
-    div.innerHTML = `<label>${label}</label><input type="number" step="1000" id="me-${key}" />
+    div.innerHTML = `<label for="me-${key}">${label}</label><input type="number" step="1000" id="me-${key}" />
        ${DIVISION_DERIVED_FIELDS.has(key) ? `<p class="muted plain" id="me-derived-hint-${key}" style="margin:2px 0 0; font-size:11px; display:none;">= sum of divisions</p>` : ''}`;
     fieldsEl.appendChild(div);
     wireMoneyInputPreview(document.getElementById(`me-${key}`));
@@ -2384,6 +2441,17 @@ async function renderManualEntry(content) {
 
   document.getElementById('me-save-financials').onclick = async () => {
     const msg = document.getElementById('me-financials-msg');
+    // A number box holding something the browser can't parse (e.g. a pasted
+    // "12,345" or "$5k") reports value "" — it would save as blank with no
+    // warning. Stop and name the field instead.
+    const unreadable = [...content.querySelectorAll('input[type="number"]')].filter((el) => el.validity?.badInput);
+    if (unreadable.length) {
+      const names = unreadable.map((el) => el.closest('.form-field, div')?.querySelector('label')?.textContent?.trim() || el.id).slice(0, 4);
+      msg.textContent = `Can't save — not a number: ${names.join(', ')}${unreadable.length > 4 ? '…' : ''}. Use digits only (no commas or $).`;
+      msg.className = 'save-msg err';
+      unreadable[0].focus();
+      return;
+    }
     msg.textContent = 'Saving…';
     msg.className = 'save-msg';
     const body = {
@@ -2552,7 +2620,7 @@ async function renderPdfReview(container, data) {
         return `
           <div class="card" data-pdfrev-division-id="${d.id}" style="margin-bottom:10px;">
             <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px;">
-              <p class="muted plain" style="margin:0; font-weight:600;">${d.name}</p>
+              <p class="muted plain" style="margin:0; font-weight:600;">${escAttr(d.name)}</p>
               <select class="pdfrev-division-source" data-pdfrev-division-source style="font-size:12px; font-family:var(--font-body); border:1px solid var(--line); border-radius:6px; background:var(--paper-raised); color:var(--ink); padding:5px;">
                 <option value="">— none, enter manually —</option>
                 ${extractedDivisions.map((ed, i) => `<option value="${i}" ${matchIdx === i ? 'selected' : ''}>Fill from PDF's "${ed.name}"</option>`).join('')}
@@ -6436,7 +6504,7 @@ function renderKpiViewTabs(kpis, snapshot, divisionData, categoryKeys) {
   return `
     <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px;">
       <button type="button" class="risk-filter-pill active" data-kpiview-tab="__all__">All</button>
-      ${divisions.map((d) => `<button type="button" class="risk-filter-pill" data-kpiview-tab="${d.id}">${d.name}</button>`).join('')}
+      ${divisions.map((d) => `<button type="button" class="risk-filter-pill" data-kpiview-tab="${d.id}">${escAttr(d.name)}</button>`).join('')}
     </div>
     <div data-kpiview-panel="__all__">
       ${renderUnlockCard(kpis, snapshot)}
@@ -6679,7 +6747,7 @@ function renderHealthWheelBlock(container, overview, kpis, snapshot, history, di
           ${visibleFlags.length
             ? visibleFlags.map((f) => `
               <div class="flag-row-wrap">
-                <div class="flag-row"><span class="flag-dot ${f.severity === 'danger' || f.severity === 'warning' ? 'rust' : 'sage'}"></span> ${f.message}
+                <div class="flag-row"><span class="flag-dot ${f.severity === 'danger' || f.severity === 'warning' ? 'rust' : 'sage'}"></span> ${escAttr(f.message)}
                   <button class="mini-link" data-suggest-target="${escAttr(flagId(f))}" type="button">✨ suggest target</button>
                   <button class="mini-link" data-dismiss-flag="${escAttr(flagId(f))}" type="button">✕ dismiss</button>
                 </div>
@@ -6692,7 +6760,7 @@ function renderHealthWheelBlock(container, overview, kpis, snapshot, history, di
             <div id="flags-dismissed-list" style="display:none; margin-top:6px;">
               ${dismissedFlags.map((f) => `
                 <div class="flag-row-wrap">
-                  <div class="flag-row"><span class="flag-dot"></span> <span class="muted plain">${f.message}</span>
+                  <div class="flag-row"><span class="flag-dot"></span> <span class="muted plain">${escAttr(f.message)}</span>
                     <button class="mini-link" data-restore-flag="${escAttr(flagId(f))}" type="button">↺ restore</button>
                   </div>
                 </div>
@@ -7196,6 +7264,10 @@ function renderHealthWheelBlock(container, overview, kpis, snapshot, history, di
       // would silently wipe every other field on this period.
       const body = { type: 'financials', client_id: currentClientId, period_end: currentPeriodEnd };
       FINANCIAL_FIELD_DEFS.forEach(([key]) => { body[key] = snapshot[key] != null ? snapshot[key] : ''; });
+      // Carry the period's division split through — saveFinancials treats a save
+      // with no division_breakdown as 'not split' and clears it, so a quick edit
+      // here used to silently wipe a divisional client's breakdown.
+      if (snapshot.division_breakdown?.length) body.division_breakdown = snapshot.division_breakdown;
       body.operating_cash_flow = total;
       try {
         const res = await fetch('/.netlify/functions/manual-entry', { method: 'POST', body: JSON.stringify(body) });
@@ -7284,6 +7356,10 @@ function renderHealthWheelBlock(container, overview, kpis, snapshot, history, di
         // omitted field is treated as blank by the save endpoint.
         const body = { type: 'financials', client_id: currentClientId, period_end: currentPeriodEnd };
         FINANCIAL_FIELD_DEFS.forEach(([key]) => { body[key] = snapshot[key] != null ? snapshot[key] : ''; });
+      // Carry the period's division split through — saveFinancials treats a save
+      // with no division_breakdown as 'not split' and clears it, so a quick edit
+      // here used to silently wipe a divisional client's breakdown.
+      if (snapshot.division_breakdown?.length) body.division_breakdown = snapshot.division_breakdown;
         body[fieldName] = input.value;
         try {
           const res = await fetch('/.netlify/functions/manual-entry', { method: 'POST', body: JSON.stringify(body) });
@@ -7466,6 +7542,10 @@ function renderHealthWheelBlock(container, overview, kpis, snapshot, history, di
       // (not sending a partial payload) is what keeps the rest intact.
       const body = { type: 'financials', client_id: currentClientId, period_end: currentPeriodEnd };
       FINANCIAL_FIELD_DEFS.forEach(([key]) => { body[key] = snapshot[key] != null ? snapshot[key] : ''; });
+      // Carry the period's division split through — saveFinancials treats a save
+      // with no division_breakdown as 'not split' and clears it, so a quick edit
+      // here used to silently wipe a divisional client's breakdown.
+      if (snapshot.division_breakdown?.length) body.division_breakdown = snapshot.division_breakdown;
       body.new_borrowing = vals.newBorrowing ?? '';
       body.interest_capitalised = vals.interestCapitalised ?? '';
       body.loan_repayments = vals.loanRepayments ?? '';
@@ -7744,7 +7824,13 @@ async function renderFinancialAnalyse(content) {
     const decidedCount = Object.keys(recState.decisions || {}).length + Object.keys(recState.dismissed || {}).filter((k) => k.startsWith('rec:')).length;
     if (decidedCount && !confirm(`Re-running replaces this period's recommendations with a fresh set, so the ${decidedCount} Accept/Discuss/Reject or dismiss decision${decidedCount === 1 ? '' : 's'} made on them will no longer apply. Actions already created stay on the Action Plan.\n\nRun analysis anyway?`)) return;
     body.textContent = 'Analyzing…';
-    const baseline = await callRead('get_diagnosis', currentClientId, currentPeriodEnd);
+    let baseline;
+    try {
+      baseline = await callRead('get_diagnosis', currentClientId, currentPeriodEnd);
+    } catch (err) {
+      body.innerHTML = `<div class="flag">Couldn't start the analysis: ${escAttr(err.message)}</div>`;
+      return;
+    }
     if (!stillLive()) return;
     const baselineId = baseline?.analysisId ?? null;
 
@@ -7759,7 +7845,10 @@ async function renderFinancialAnalyse(content) {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       await new Promise((r) => setTimeout(r, 3000));
       if (!stillLive()) return;
-      const poll = await callRead('get_diagnosis', currentClientId, currentPeriodEnd);
+      // A blip on one poll (callRead now throws on errors) shouldn't abandon
+      // the wait — the analysis itself is still running server-side.
+      let poll;
+      try { poll = await callRead('get_diagnosis', currentClientId, currentPeriodEnd); } catch { continue; }
       if (!stillLive()) return;
       if (poll?.analysisError) {
         body.innerHTML = `<div class="flag">Error: ${escAttr(poll.analysisError)}</div>`;
@@ -7849,7 +7938,7 @@ async function renderFinancialDiagnose(content) {
     <div class="flag-row-wrap${getRecDecision(recId(group, r)) === 'rejected' ? ' rec-rejected' : ''}">
       <div class="flag-row">
         <span class="flag-dot sage"></span>
-        <span style="flex:1;"><b>${r.title}</b> — ${r.impact || ''} <span class="muted plain">(${r.difficulty || ''}${r.difficulty && r.timeframe ? ', ' : ''}${r.timeframe || ''})</span></span>
+        <span style="flex:1;"><b>${escAttr(r.title)}</b> — ${escAttr(r.impact || '')} <span class="muted plain">(${r.difficulty || ''}${r.difficulty && r.timeframe ? ', ' : ''}${r.timeframe || ''})</span></span>
         ${recDecisionPillsHtml(recId(group, r))}
         <button class="mini-link" data-turn-rec="${escAttr(recId(group, r))}" type="button">→ turn into goal</button>
         <button class="mini-link" data-dismiss-rec="${escAttr(recId(group, r))}" type="button">✕ dismiss</button>
@@ -7866,7 +7955,7 @@ async function renderFinancialDiagnose(content) {
         <div id="dismissed-rec-${group}" style="display:none; margin-top:6px;">
           ${dismissed.map((r) => `
             <div class="flag-row-wrap">
-              <div class="flag-row"><span class="flag-dot"></span> <span class="muted plain">${r.title}</span>
+              <div class="flag-row"><span class="flag-dot"></span> <span class="muted plain">${escAttr(r.title)}</span>
                 <button class="mini-link" data-restore-rec="${escAttr(recId(group, r))}" type="button">↺ restore</button>
               </div>
             </div>
@@ -8074,7 +8163,7 @@ async function renderGrowthAnalyse(content) {
     <div class="flag-row-wrap${getRecDecision(recId(group, r)) === 'rejected' ? ' rec-rejected' : ''}">
       <div class="flag-row">
         <span class="flag-dot sage"></span>
-        <span style="flex:1;"><b>${r.title}</b> — ${r.impact || ''} <span class="muted plain">(${r.difficulty || ''}${r.difficulty && r.timeframe ? ', ' : ''}${r.timeframe || ''})</span></span>
+        <span style="flex:1;"><b>${escAttr(r.title)}</b> — ${escAttr(r.impact || '')} <span class="muted plain">(${r.difficulty || ''}${r.difficulty && r.timeframe ? ', ' : ''}${r.timeframe || ''})</span></span>
         ${recDecisionPillsHtml(recId(group, r))}
         <button class="mini-link" data-turn-rec="${escAttr(recId(group, r))}" type="button">→ turn into goal</button>
         <button class="mini-link" data-dismiss-rec="${escAttr(recId(group, r))}" type="button">✕ dismiss</button>
@@ -8098,7 +8187,7 @@ async function renderGrowthAnalyse(content) {
         <div id="dismissed-rec-${group}" style="display:none; margin-top:6px;">
           ${dismissed.map((r) => `
             <div class="flag-row-wrap">
-              <div class="flag-row"><span class="flag-dot"></span> <span class="muted plain">${r.title}</span>
+              <div class="flag-row"><span class="flag-dot"></span> <span class="muted plain">${escAttr(r.title)}</span>
                 <button class="mini-link" data-restore-rec="${escAttr(recId(group, r))}" type="button">↺ restore</button>
               </div>
             </div>
@@ -9121,7 +9210,7 @@ function renderOwnerSuccessionCard(latestValuation, checklist, targetYear, readi
       ${pathwayFlag ? `<div class="flag">⚠ ${pathwayFlag} <button type="button" id="goto-pathway-from-succession-link" class="mini-link" style="margin-left:4px;">→ Edit in Goals</button></div>` : ''}
 
       <p class="card-label" style="margin:0 0 4px;">Exit plan</p>
-      ${items.length ? items.map((it) => `<p class="muted plain" style="margin:0 0 6px;">• ${it.text}${it.target_year ? ` <span style="color:var(--ink-soft);">(target: ${it.target_year})</span>` : ''}${it.succession_pathway ? ` <span style="color:var(--ink-soft);">— ${successionPathwayLabel(it.succession_pathway)}${it.succession_pathway !== 'none' && it.successor_readiness ? `, ${successionReadinessLabel(it.successor_readiness)}` : ''}</span>` : ''}</p>`).join('') : '<p class="muted plain" style="margin:0;">Nothing recorded yet.</p>'}
+      ${items.length ? items.map((it) => `<p class="muted plain" style="margin:0 0 6px;">• ${escAttr(it.text)}${it.target_year ? ` <span style="color:var(--ink-soft);">(target: ${it.target_year})</span>` : ''}${it.succession_pathway ? ` <span style="color:var(--ink-soft);">— ${successionPathwayLabel(it.succession_pathway)}${it.succession_pathway !== 'none' && it.successor_readiness ? `, ${successionReadinessLabel(it.successor_readiness)}` : ''}</span>` : ''}</p>`).join('') : '<p class="muted plain" style="margin:0;">Nothing recorded yet.</p>'}
       ${targetYear ? `<p class="muted plain" style="margin:6px 0 0; font-size:11px;">Feeds the Retirement outlook above — "Project forward (years)" defaults to ${targetYear - new Date().getFullYear()} years from this.</p>` : ''}
       <button class="mini-link" id="goto-succession-goals-link" type="button" style="margin-top:8px;">→ Edit in Goals</button>
 
@@ -10883,6 +10972,9 @@ async function drawActionsView(content, sinceIso, allItems) {
     const text = input.value.trim();
     if (!text) return;
     const btn = document.getElementById('action-add-btn');
+    // Enter-key path shares this guard — it used to bypass the disabled
+    // button, so Enter twice (or Enter + click) added the action twice.
+    if (btn.disabled) return;
     btn.disabled = true;
     try {
       const owner = document.getElementById('action-new-owner').value || null;
@@ -11098,7 +11190,7 @@ function riskItemRow(r, opts = {}) {
           <span class="flag-dot sage" style="margin-top:5px;"></span>
           <div style="flex:1; min-width:0;">
             <span class="muted plain" style="margin:0;">No risk${r.last_reviewed_date ? ` <span style="font-size:11px;">(${formatShortDate(r.last_reviewed_date)})</span>` : ''}</span>
-            ${r.detail ? `<p class="muted plain" style="margin:2px 0 0; font-size:12px;">${r.detail}</p>` : ''}
+            ${r.detail ? `<p class="muted plain" style="margin:2px 0 0; font-size:12px;">${escAttr(r.detail)}</p>` : ''}
             ${editable && r.question_id ? `
               <button type="button" class="mini-link" style="margin-top:4px;" data-edit-risk-row-id="${r.id}" data-edit-question-id="${r.question_id}" data-edit-category="${escAttr(r.category || '')}">Edit answer</button>
               <button type="button" class="mini-link" style="margin-top:4px;" data-unanswer-risk-row-id="${r.id}">Unanswer</button>
@@ -11114,15 +11206,15 @@ function riskItemRow(r, opts = {}) {
         <span class="flag-dot ${r.severity === 'High' ? 'rust' : 'sage'}" style="margin-top:5px;"></span>
         <div style="flex:1; min-width:0;">
           <div style="display:flex; align-items:baseline; gap:6px; flex-wrap:wrap;">
-            <b>${r.risk_name}</b>
+            <b>${escAttr(r.risk_name)}</b>
             <span class="confidence-badge ${RISK_SEVERITY_BADGE[r.severity] || 'yellow'}">${r.severity || 'Medium'}</span>
             <span class="confidence-badge ${RISK_STATUS_BADGE[r.status] || 'yellow'}">${r.status}</span>
             ${r.is_new ? '<span class="confidence-badge yellow">New</span>' : ''}
             ${r.is_changed ? '<span class="confidence-badge yellow">Changed</span>' : ''}
           </div>
-          ${r.detail ? `<p class="muted plain" style="margin:4px 0 0;">${r.detail}</p>` : ''}
-          ${r.recommendation ? `<p class="muted plain" style="margin:2px 0 0;"><b>Recommended:</b> ${r.recommendation}</p>` : ''}
-          ${r.notes ? `<p class="muted plain" style="margin:2px 0 0; white-space:pre-wrap;">${r.notes}</p>` : ''}
+          ${r.detail ? `<p class="muted plain" style="margin:4px 0 0;">${escAttr(r.detail)}</p>` : ''}
+          ${r.recommendation ? `<p class="muted plain" style="margin:2px 0 0;"><b>Recommended:</b> ${escAttr(r.recommendation)}</p>` : ''}
+          ${r.notes ? `<p class="muted plain" style="margin:2px 0 0; white-space:pre-wrap;">${escAttr(r.notes)}</p>` : ''}
           ${r.impact_estimate ? `<p class="muted plain" style="margin:2px 0 0;">${r.impact_estimate}</p>` : ''}
           ${r.last_reviewed_date ? `<p class="muted plain" style="margin:2px 0 0; font-size:11px;">Reviewed ${formatShortDate(r.last_reviewed_date)}</p>` : ''}
           <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:6px;">
@@ -11261,7 +11353,7 @@ function riskSummaryRow(r, level, capped) {
   return `
     <div class="risk-summary-row${capped ? ' risk-row-capped' : ''}" data-source="${r.source}" data-level="${level}" data-status="${r.status}" data-risk-name="${escAttr(r.risk_name)}" style="padding:8px 0; border-bottom:1px solid var(--line); cursor:pointer;${capped ? ' display:none;' : ''}">
       <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-        <b style="font-size:13px;">${r.risk_name}</b>
+        <b style="font-size:13px;">${escAttr(r.risk_name)}</b>
         <span class="risk-pill risk-pill-severity ${(r.severity || 'Medium').toLowerCase()}">${r.severity || 'Medium'}</span>
         <span class="risk-pill risk-pill-status">${r.status}</span>
         <span class="risk-pill risk-pill-source">${sourceMeta.icon} ${sourceMeta.label}</span>
@@ -12377,7 +12469,7 @@ async function renderGoalsProfile(content) {
       <p class="muted plain" style="margin:0 0 10px;">Only set this up if this client trades as more than one distinct division under one entity (e.g. two shops, two trading names) — leave empty for the normal case of one business. Naming a division here just makes it available — each period in Financial Performance → Input then has its own "Split this period by division" toggle, so revenue/COGS/wages/operating expenses/debtors/creditors can be entered per division for the years you actually have that breakdown for, and left blended for the years you don't. Everything else (cash, assets, equity, tax, etc.) stays entity-level either way.</p>
       <div id="gp-divisions-list">${(ctx?.divisions || []).map((d) => `
         <div class="cash-item" data-gp-division-id="${d.id}">
-          <input type="text" class="gp-division-name" value="${d.name}" placeholder="e.g. Jim's Auto Service" style="flex:1;" />
+          <input type="text" class="gp-division-name" value="${escAttr(d.name)}" placeholder="e.g. Jim's Auto Service" style="flex:1;" />
           <button type="button" class="mini-link gp-division-remove">Remove</button>
         </div>
       `).join('')}</div>
@@ -12789,14 +12881,14 @@ async function renderGoalsInput(content) {
     const isSuccession = cat.key === 'exit_succession';
     return `
       <div class="goal-item-block ${stateClass}" data-cat="${cat.key}" data-id="${it.id}" data-carried="${it.carried}">
-        <p class="goal-text" id="goal-text-${it.id}">${it.text}</p>
+        <p class="goal-text" id="goal-text-${it.id}">${escAttr(it.text)}</p>
         <div class="goal-meta-row">
           <span class="goal-updated" id="goal-updated-${it.id}">${it.carried ? 'From ' + it.sourcePeriod : (it.updated_at ? 'Confirmed ' + it.updated_at.slice(0, 10) : '')}</span>
           <span class="goal-age">${goalAge(it.created_at || it.updated_at)}</span>
           ${categories.length > 1 ? `
             <select class="move-goal-select" data-move-cat="${cat.key}" data-move-id="${it.id}" title="Move to a different goal category">
               <option value="" selected disabled>Move to…</option>
-              ${categories.filter((c) => c.key !== cat.key).map((c) => `<option value="${c.key}">${c.label}</option>`).join('')}
+              ${categories.filter((c) => c.key !== cat.key).map((c) => `<option value="${c.key}">${escAttr(c.label)}</option>`).join('')}
             </select>
           ` : ''}
           <button class="mini-link" data-action="done" data-cat="${cat.key}" data-id="${it.id}" style="margin-left:auto;">done</button>
@@ -12812,7 +12904,7 @@ async function renderGoalsInput(content) {
         </div>
         ${!needsReview ? confirmedNoteHtml(cat.key, it.id) : ''}
         <div class="goal-edit-box" id="goal-edit-${it.id}" style="display:none;">
-          <textarea rows="3" id="goal-input-${it.id}">${it.text}</textarea>
+          <textarea rows="3" id="goal-input-${it.id}">${escAttr(it.text)}</textarea>
           ${isSuccession ? `<div class="form-field" style="margin-top:6px;"><label>Target exit year (optional)</label><input type="number" id="goal-target-year-${it.id}" placeholder="e.g. ${new Date().getFullYear() + 5}" value="${it.target_year ?? ''}" /></div>` : ''}
           ${isSuccession ? `
             <div class="form-field" style="margin-top:6px;"><label>Succession pathway (optional)</label>
@@ -12831,7 +12923,7 @@ async function renderGoalsInput(content) {
   function renderAchievedBlock(cat, it) {
     return `
       <div class="goal-item-block achieved" data-cat="${cat.key}" data-id="${it.id}">
-        <p class="goal-text achieved-text">${it.text}</p>
+        <p class="goal-text achieved-text">${escAttr(it.text)}</p>
         <span class="goal-updated">${it.updated_at ? 'Achieved ' + it.updated_at.slice(0, 10) : ''}</span>
         <div class="toggle-row">
           <button class="toggle-btn" data-action="reopen" data-cat="${cat.key}" data-id="${it.id}">Reopen</button>
@@ -12855,7 +12947,7 @@ async function renderGoalsInput(content) {
       : `<button class="cat-remove-btn" data-remove-cat="${cat.key}" data-custom="${custom}" title="${custom ? 'Delete this goal category' : 'Hide this goal category'}">${custom ? 'Remove' : 'Hide'}</button>`;
     card.innerHTML = `
       <div class="goal-card-header">
-        <p class="goal-cat-label">${cat.label}</p>
+        <p class="goal-cat-label">${escAttr(cat.label)}</p>
         ${removeControl}
       </div>
       <div class="goal-items" id="goal-items-${cat.key}">
@@ -12912,16 +13004,23 @@ async function renderGoalsInput(content) {
     document.getElementById('add-goal-form').style.display = 'block';
     document.getElementById('add-goal-label').focus();
   };
-  document.getElementById('add-goal-confirm').onclick = async () => {
+  document.getElementById('add-goal-confirm').onclick = async (e) => {
     const label = document.getElementById('add-goal-label').value.trim();
-    if (!label) return;
-    const res = await fetch('/.netlify/functions/manual-entry', {
-      method: 'POST',
-      body: JSON.stringify({ type: 'goal_category', client_id: currentClientId, label }),
-    });
-    const data = await res.json();
-    if (data.error) { alert(data.error); return; }
-    renderGoalsInput(content);
+    if (!label || e.currentTarget.disabled) return; // double-click guard — each click creates a category
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      const res = await fetch('/.netlify/functions/manual-entry', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'goal_category', client_id: currentClientId, label }),
+      });
+      const data = await res.json();
+      if (data.error) { alert(data.error); btn.disabled = false; return; }
+      renderGoalsInput(content);
+    } catch (err) {
+      alert('Error: ' + err.message);
+      btn.disabled = false;
+    }
   };
 
   async function handleGoalCardClick(e) {
@@ -14190,7 +14289,7 @@ async function renderGoalsBrief(content, openDetail) {
         </div>
         <div class="toggle-row" style="padding-left:18px; margin:0 0 6px;">${actionsHtml}</div>
         <div class="goal-edit-box" style="display:none; margin:0 0 8px 18px;">
-          <textarea rows="3">${it.text}</textarea>
+          <textarea rows="3">${escAttr(it.text)}</textarea>
           <button type="button" class="action" style="margin-top:6px;" data-brief-goal-save="1" data-cat="${it.cat.key}" data-id="${it.id}">Save goal</button>
         </div>
       </div>
@@ -14205,7 +14304,7 @@ async function renderGoalsBrief(content, openDetail) {
     const groups = categories.map((cat) => {
       const catItems = items.filter((it) => it.cat.key === cat.key);
       if (!catItems.length) return '';
-      return `<div class="goal-cat-group" data-cat-key="${cat.key}"><p class="goal-cat-heading">${cat.label}</p>${catItems.map(goalRowHtml).join('')}</div>`;
+      return `<div class="goal-cat-group" data-cat-key="${cat.key}"><p class="goal-cat-heading">${escAttr(cat.label)}</p>${catItems.map(goalRowHtml).join('')}</div>`;
     }).join('');
     return groups || `<p class="muted plain" style="margin:0;">Nothing here yet.</p>`;
   };
@@ -14220,7 +14319,7 @@ async function renderGoalsBrief(content, openDetail) {
   const catFilterPillsHtml = categories.length > 1 ? `
     <div class="goal-cat-filter-row" id="goals-cat-filter-row" style="display:none;">
       <button type="button" class="risk-filter-pill active" data-goals-cat-filter="all">All <span class="risk-filter-count">(${openTileItems.length})</span></button>
-      ${categories.map((cat) => `<button type="button" class="risk-filter-pill" data-goals-cat-filter="${cat.key}">${cat.label} <span class="risk-filter-count">(${openTileItems.filter((it) => it.cat.key === cat.key).length})</span></button>`).join('')}
+      ${categories.map((cat) => `<button type="button" class="risk-filter-pill" data-goals-cat-filter="${cat.key}">${escAttr(cat.label)} <span class="risk-filter-count">(${openTileItems.filter((it) => it.cat.key === cat.key).length})</span></button>`).join('')}
     </div>
   ` : '';
 
@@ -14997,8 +15096,8 @@ function renderMeetingSession(content, brief) {
     <div class="card priority-card">
       <p class="muted">Priority ${idx + 1} of ${brief.priorities.length}</p>
       <p class="card-value" style="margin-bottom:6px;">${meta.name}</p>
-      <p style="font-size:14px; margin:0 0 10px;">${p.message}</p>
-      ${p.talkingPoint ? `<p style="font-size:13px; margin:0 0 10px; padding:8px 10px; background:var(--sage-bg); border-radius:6px;">💬 ${p.talkingPoint}</p>` : ''}
+      <p style="font-size:14px; margin:0 0 10px;">${escAttr(p.message)}</p>
+      ${p.talkingPoint ? `<p style="font-size:13px; margin:0 0 10px; padding:8px 10px; background:var(--sage-bg); border-radius:6px;">💬 ${escAttr(p.talkingPoint)}</p>` : ''}
       <p class="priority-meta">Impact ${p.impact} · Urgency ${p.urgency} · Ease ${p.ease} · Priority score ${p.priorityScore}</p>
       <div class="form-field full" style="margin-top:14px;"><label>Decision</label><textarea id="mtg-decision" rows="2" placeholder="What did you agree with the client?">${p.decision || ''}</textarea></div>
       <div class="form-field full"><label>Action</label><textarea id="mtg-action" rows="2" placeholder="What happens next, and who owns it?">${p.action || ''}</textarea></div>
@@ -15157,12 +15256,12 @@ async function renderMeetingQuestionsStep(content, phase) {
       <p class="muted plain" style="margin:0 0 14px;">${subtitle}</p>
       ${questions.map((q) => `
         <div class="form-field full">
-          <label id="mtgq-label-${q.id}">${q.prompt}
+          <label id="mtgq-label-${q.id}">${escAttr(q.prompt)}
             <button class="question-edit-btn" data-edit-q="${q.id}" title="Edit this question">edit</button>
             ${isCustomQuestion(q.id) ? `<button class="question-remove-btn" data-remove-q="${q.id}" title="Remove this question">×</button>` : ''}
           </label>
           <div id="mtgq-edit-${q.id}" style="display:none; margin-bottom:6px;">
-            <input type="text" id="mtgq-edit-input-${q.id}" value="${q.prompt}" />
+            <input type="text" id="mtgq-edit-input-${q.id}" value="${escAttr(q.prompt)}" />
             <button class="action" style="margin-top:6px;" data-save-q="${q.id}">Save wording</button>
           </div>
           ${priorPulse?.[q.id] ? `<p class="muted plain" style="margin:0 0 4px; font-size:12px;">Last time (${formatShortDate(priorPulse.periodEnd)}): "${priorPulse[q.id]}"</p>` : ''}
@@ -15171,7 +15270,7 @@ async function renderMeetingQuestionsStep(content, phase) {
             <button class="mini-link" data-turn-answer-goal="${q.id}" type="button">→ turn into goal</button>
             <select id="mtgq-goalcat-${q.id}" style="font-size:11px; padding:1px 2px;">
               <option value="" selected disabled>Choose category…</option>
-              ${goalCategories.map((c) => `<option value="${c.key}">${c.label}</option>`).join('')}
+              ${goalCategories.map((c) => `<option value="${c.key}">${escAttr(c.label)}</option>`).join('')}
             </select>
           </div>
         </div>
@@ -15245,16 +15344,23 @@ async function renderMeetingQuestionsStep(content, phase) {
     document.getElementById('mtgq-add-form').style.display = 'block';
     document.getElementById('mtgq-add-input').focus();
   };
-  document.getElementById('mtgq-add-confirm').onclick = async () => {
+  document.getElementById('mtgq-add-confirm').onclick = async (e) => {
     const prompt = document.getElementById('mtgq-add-input').value.trim();
-    if (!prompt) return;
-    const res = await fetch('/.netlify/functions/manual-entry', {
-      method: 'POST',
-      body: JSON.stringify({ type: 'goal_question', client_id: currentClientId, prompt, phase }),
-    });
-    const data = await res.json();
-    if (data.error) { alert(data.error); return; }
-    renderMeetingQuestionsStep(content, phase);
+    if (!prompt || e.currentTarget.disabled) return; // double-click guard — each click creates a question
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      const res = await fetch('/.netlify/functions/manual-entry', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'goal_question', client_id: currentClientId, prompt, phase }),
+      });
+      const data = await res.json();
+      if (data.error) { alert(data.error); btn.disabled = false; return; }
+      renderMeetingQuestionsStep(content, phase);
+    } catch (err) {
+      alert('Error: ' + err.message);
+      btn.disabled = false;
+    }
   };
 
   // Answers save themselves as each field is left, rather than on an
@@ -15308,14 +15414,14 @@ async function renderMeetingGoalsWrapup(content) {
       ${openGroups.length ? `
         ${openGroups.length > 1 ? `<div class="goal-cat-filter-row" style="display:flex; margin-bottom:10px;">
           <button type="button" class="risk-filter-pill active" data-wrapup-cat-filter="all">All <span class="risk-filter-count">(${openTotal})</span></button>
-          ${openGroups.map(({ cat, items }) => `<button type="button" class="risk-filter-pill" data-wrapup-cat-filter="${cat.key}">${cat.label} <span class="risk-filter-count">(${items.length})</span></button>`).join('')}
+          ${openGroups.map(({ cat, items }) => `<button type="button" class="risk-filter-pill" data-wrapup-cat-filter="${cat.key}">${escAttr(cat.label)} <span class="risk-filter-count">(${items.length})</span></button>`).join('')}
         </div>` : ''}
         ${openGroups.map(({ cat, items }, i) => `
           <div class="goal-cat-group${i === 0 ? ' is-first-visible' : ''}" data-cat-key="${cat.key}">
-            <p class="goal-cat-heading">${cat.label}</p>
+            <p class="goal-cat-heading">${escAttr(cat.label)}</p>
             ${items.map((it) => `
               <div class="goal-wrapup-row" data-cat="${cat.key}" data-id="${it.id}" style="padding:7px 0; border-bottom:1px solid var(--line);">
-                <p class="goal-text" style="margin:0 0 6px;">${it.text}</p>
+                <p class="goal-text" style="margin:0 0 6px;">${escAttr(it.text)}</p>
                 <button class="mini-link" data-wrapup-achieve="1" type="button">✓ Mark achieved</button>
               </div>
             `).join('')}

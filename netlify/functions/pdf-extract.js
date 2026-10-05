@@ -1,3 +1,4 @@
+const { crossOriginRejection } = require('./lib/same-origin');
 // netlify/functions/pdf-extract.js
 const FIELD_LIST = [
   'revenue', 'cogs', 'operating_expenses', 'other_income', 'other_expenses',
@@ -16,6 +17,8 @@ const FIELD_LIST = [
 const DIVISION_FIELD_LIST = ['revenue', 'cogs', 'wages', 'operating_expenses', 'debtors', 'creditors', 'inventory'];
 
 exports.handler = async (event) => {
+  const refused = crossOriginRejection(event); // see lib/same-origin.js
+  if (refused) return refused;
   try {
     const { client_id, period_end, pdf_base64 } = JSON.parse(event.body || '{}');
     if (!client_id || !period_end || !pdf_base64) {

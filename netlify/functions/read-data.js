@@ -6,11 +6,14 @@
 // Env vars required: SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 const { createClient } = require('@supabase/supabase-js');
+const { crossOriginRejection } = require('./lib/same-origin');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const { getCategoriesForReview, getAllActiveQuestions } = require('./lib/business-risk-questionnaire');
 const { getOrGenerateMultiple } = require('./lib/valuation-multiple');
 
 exports.handler = async (event) => {
+  const refused = crossOriginRejection(event); // see lib/same-origin.js
+  if (refused) return refused;
   try {
     const { action, client_id, period_end, view_cadence, periods_count, include_archived } = JSON.parse(event.body || '{}');
 
@@ -52,7 +55,10 @@ exports.handler = async (event) => {
     }
 
     if (action === 'get_context') {
-      const { data, error } = await supabase.from('client_context').select('*').eq('client_id', client_id).single();
+      // maybeSingle, not single: a client that no longer exists (deleted in
+      // another tab) is a normal "nothing here" — every caller already
+      // reads it as ctx?.field — not a 500.
+      const { data, error } = await supabase.from('client_context').select('*').eq('client_id', client_id).maybeSingle();
       if (error) throw error;
       return { statusCode: 200, body: JSON.stringify(data) };
     }

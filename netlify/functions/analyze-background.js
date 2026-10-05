@@ -9,6 +9,7 @@
 // Env vars required: SUPABASE_URL, SUPABASE_SERVICE_KEY, ANTHROPIC_API_KEY
 
 const { createClient } = require('@supabase/supabase-js');
+const { crossOriginRejection } = require('./lib/same-origin');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const { syncFinancialRiskItems } = require('./lib/financial-risk-sync');
 const { getAllActiveQuestions } = require('./lib/business-risk-questionnaire');
@@ -685,6 +686,8 @@ function computeAllKpis(fs, priorFs, kpiLibrary) {
 // run's 'overall' diagnostics row id changes from the pre-trigger
 // baseline, or until this row appears (see 'analysis_error' below).
 exports.handler = async (event) => {
+  const refused = crossOriginRejection(event); // see lib/same-origin.js
+  if (refused) return refused;
   const { client_id, period_end } = JSON.parse(event.body || '{}');
   if (!client_id || !period_end) return { statusCode: 400, body: 'client_id and period_end required' };
   // Clears any stale error marker from a PRIOR failed run before this run
@@ -901,9 +904,25 @@ KPIs available this period: ${JSON.stringify(availableKpis.map((k) => ({
         messages: [{ role: 'user', content: clientData }],
       }),
     });
-    const claudeData = await claudeRes.json();
-    const rawText = claudeData.content?.[0]?.text || '{}';
-    const parsed = JSON.parse(rawText.replace(/```json|```/g, '').trim());
+    const claudeData = await claudeRes.json().catch(() => null);
+    // Stop BEFORE anything below deletes this period's existing analysis. An
+    // API error (overloaded / rate-limited / bad key) used to fall through as
+    // '{}' — the run then wiped the previous diagnosis, recommendations and
+    // scores and replaced them with blanks while reporting success.
+    if (!claudeRes.ok || !claudeData?.content?.[0]?.text) {
+      const reason = claudeData?.error?.message || `status ${claudeRes.status}`;
+      throw new Error(`The AI service didn't return an analysis (${reason}). Nothing was changed — try again in a minute.`);
+    }
+    const rawText = claudeData.content[0].text;
+    let parsed;
+    try {
+      parsed = JSON.parse(rawText.replace(/```json|```/g, '').trim());
+    } catch {
+      throw new Error('The AI returned an incomplete analysis (it may have run out of space). Nothing was changed — try again.');
+    }
+    if (!parsed || typeof parsed !== 'object' || !parsed.diagnosis) {
+      throw new Error('The AI analysis came back without a diagnosis. Nothing was changed — try again.');
+    }
 
     const kpiInterpretations = parsed.kpi_interpretations || {};
     const kpiBenchmarks = parsed.kpi_benchmarks || {};

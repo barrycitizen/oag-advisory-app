@@ -8,6 +8,7 @@
 // Env vars required: SUPABASE_URL, SUPABASE_SERVICE_KEY, ANTHROPIC_API_KEY
 
 const { createClient } = require('@supabase/supabase-js');
+const { crossOriginRejection } = require('./lib/same-origin');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 const CATEGORY_LABELS = {
@@ -16,6 +17,8 @@ const CATEGORY_LABELS = {
 };
 
 exports.handler = async (event) => {
+  const refused = crossOriginRejection(event); // see lib/same-origin.js
+  if (refused) return refused;
   try {
     const { client_id, period_end, category, category_label, focus, count } = JSON.parse(event.body || '{}');
     if (!client_id || !category) return { statusCode: 400, body: 'client_id and category required' };
