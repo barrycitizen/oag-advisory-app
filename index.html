@@ -7736,6 +7736,13 @@ async function renderFinancialAnalyse(content) {
   // analyze-background.js's own catch block since its real return value
   // never reaches this caller).
   if (runBtn) runBtn.onclick = async () => {
+    // A re-run has the AI write a fresh set of recommendations (usually with
+    // new titles), and decisions/dismissals are keyed by title — so any made
+    // for this period stop applying. Say so before it happens rather than
+    // have them silently vanish. Actions already created stay on the plan.
+    const recState = currentCtx?.recommendation_state?.[currentPeriodEnd] || {};
+    const decidedCount = Object.keys(recState.decisions || {}).length + Object.keys(recState.dismissed || {}).filter((k) => k.startsWith('rec:')).length;
+    if (decidedCount && !confirm(`Re-running replaces this period's recommendations with a fresh set, so the ${decidedCount} Accept/Discuss/Reject or dismiss decision${decidedCount === 1 ? '' : 's'} made on them will no longer apply. Actions already created stay on the Action Plan.\n\nRun analysis anyway?`)) return;
     body.textContent = 'Analyzing…';
     const baseline = await callRead('get_diagnosis', currentClientId, currentPeriodEnd);
     if (!stillLive()) return;
@@ -10362,15 +10369,35 @@ function getRecommendationState() {
 function isRecDismissed(recId) {
   return !!getRecommendationState().dismissed[recId];
 }
-async function toggleRecDismissed(recId, dismissed) {
-  const res = await fetch('/.netlify/functions/manual-entry', {
-    method: 'POST',
-    body: JSON.stringify({ type: 'save_recommendation_state', client_id: currentClientId, period_end: currentPeriodEnd, rec_id: recId, dismissed }),
+// Every recommendation-state write goes through this one queue. The server
+// does a read-modify-write of the whole client_context.recommendation_state
+// JSON, so two saves in flight at once (e.g. Accept on one rec, Reject on
+// another a second later) could each read the old state and the later write
+// silently drop the earlier one. Running them strictly one after another
+// closes that gap. The client/period are captured at call time, not when
+// the queued save actually runs.
+let recStateSaveQueue = Promise.resolve();
+function postRecState(recId, fields) {
+  const clientId = currentClientId;
+  const periodEnd = currentPeriodEnd;
+  const run = recStateSaveQueue.then(async () => {
+    const res = await fetch('/.netlify/functions/manual-entry', {
+      method: 'POST',
+      body: JSON.stringify({ type: 'save_recommendation_state', client_id: clientId, period_end: periodEnd, rec_id: recId, ...fields }),
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    // Only update the in-memory copy if the user is still on that client.
+    if (currentCtx && currentClientId === clientId) {
+      if (!currentCtx.recommendation_state) currentCtx.recommendation_state = {};
+      currentCtx.recommendation_state[periodEnd] = data.saved.period_state;
+    }
   });
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  if (!currentCtx.recommendation_state) currentCtx.recommendation_state = {};
-  currentCtx.recommendation_state[currentPeriodEnd] = data.saved.period_state;
+  recStateSaveQueue = run.catch(() => {});
+  return run;
+}
+async function toggleRecDismissed(recId, dismissed) {
+  return postRecState(recId, { dismissed });
 }
 // Accept / Discuss / Reject on a Diagnose/Growth recommendation. Accepting
 // is the commitment step, so it also creates the Action (owner/due date get
@@ -10393,14 +10420,7 @@ function recDecisionPillsHtml(recId) {
   ).join('')}</span>`;
 }
 async function saveRecDecision(recId, fields) {
-  const res = await fetch('/.netlify/functions/manual-entry', {
-    method: 'POST',
-    body: JSON.stringify({ type: 'save_recommendation_state', client_id: currentClientId, period_end: currentPeriodEnd, rec_id: recId, ...fields }),
-  });
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  if (!currentCtx.recommendation_state) currentCtx.recommendation_state = {};
-  currentCtx.recommendation_state[currentPeriodEnd] = data.saved.period_state;
+  return postRecState(recId, fields);
 }
 // Wires every [data-rec-decision] button inside `root`. findRec maps a
 // rec_id back to its recommendation; rerender redraws the screen after.
@@ -10412,7 +10432,14 @@ function wireRecDecisionButtons(root, findRec, rerender) {
       root.querySelectorAll(`button[data-rec-id="${CSS.escape(recId)}"]`).forEach((b) => { b.disabled = true; });
       try {
         const fields = { decision: next };
-        if (next === 'accepted' && !getRecommendationState().actionIds?.[recId]) {
+        // Reuse the action an earlier Accept created — unless it's since
+        // been deleted from the Action Plan, in which case make a fresh one.
+        let existingActionId = getRecommendationState().actionIds?.[recId];
+        if (next === 'accepted' && existingActionId) {
+          const items = (await callRead('get_action_items', currentClientId))?.items || [];
+          if (!items.some((it) => it.id === existingActionId)) existingActionId = null;
+        }
+        if (next === 'accepted' && !existingActionId) {
           const r = findRec(recId);
           if (r) {
             const text = r.impact ? `${r.title} — ${r.impact}` : r.title;
@@ -10431,14 +10458,7 @@ function wireRecDecisionButtons(root, findRec, rerender) {
 }
 
 async function saveSuggestedTargetText(recId, text) {
-  const res = await fetch('/.netlify/functions/manual-entry', {
-    method: 'POST',
-    body: JSON.stringify({ type: 'save_recommendation_state', client_id: currentClientId, period_end: currentPeriodEnd, rec_id: recId, suggested_target: text }),
-  });
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  if (!currentCtx.recommendation_state) currentCtx.recommendation_state = {};
-  currentCtx.recommendation_state[currentPeriodEnd] = data.saved.period_state;
+  return postRecState(recId, { suggested_target: text });
 }
 
 // A single visible confirmation for a background "+ Add to Actions" click
@@ -13200,20 +13220,36 @@ function loadMeeting() { try { return JSON.parse(localStorage.getItem(meetingKey
 let meetingServerSyncTimer = null;
 function saveMeeting(brief) {
   localStorage.setItem(meetingKey(), JSON.stringify(brief));
+  // Client/period captured NOW, not when the debounced save fires — reading
+  // currentClientId/currentPeriodEnd 600ms later wrote this meeting onto
+  // whichever client or period had been switched to in the meantime.
+  const clientId = currentClientId;
+  const periodEnd = currentPeriodEnd;
   clearTimeout(meetingServerSyncTimer);
   meetingServerSyncTimer = setTimeout(() => {
     fetch('/.netlify/functions/manual-entry', {
       method: 'POST',
-      body: JSON.stringify({ type: 'save_meeting_record', client_id: currentClientId, period_end: currentPeriodEnd, record: brief }),
+      body: JSON.stringify({ type: 'save_meeting_record', client_id: clientId, period_end: periodEnd, record: brief }),
     }).catch((err) => console.error('Failed to save meeting record to server:', err.message));
   }, 600);
 }
-function clearMeeting() {
+// Awaited by callers before re-rendering: if the server delete is still in
+// flight when the screen redraws, loadMeetingWithFallback finds nothing
+// locally, re-fetches the OLD record from the server, and caches it again —
+// so "Start a new meeting" just showed the finished meeting again. Also
+// cancels any pending debounced save that would otherwise resurrect it.
+async function clearMeeting() {
+  clearTimeout(meetingServerSyncTimer);
   localStorage.removeItem(meetingKey());
-  fetch('/.netlify/functions/manual-entry', {
-    method: 'POST',
-    body: JSON.stringify({ type: 'save_meeting_record', client_id: currentClientId, period_end: currentPeriodEnd, record: null }),
-  }).catch((err) => console.error('Failed to clear meeting record on server:', err.message));
+  try {
+    await fetch('/.netlify/functions/manual-entry', {
+      method: 'POST',
+      body: JSON.stringify({ type: 'save_meeting_record', client_id: currentClientId, period_end: currentPeriodEnd, record: null }),
+    });
+  } catch (err) {
+    console.error('Failed to clear meeting record on server:', err.message);
+  }
+  localStorage.removeItem(meetingKey());
 }
 // The cross-device/cleared-cache recovery path — only hits the network when
 // there's genuinely nothing local to read. Hydrates the local cache from
@@ -14713,9 +14749,10 @@ async function renderMeetingLanding(content, brief) {
       meetingStepIndex = brief.currentStep || 0;
       renderMain();
     };
-    document.getElementById('restart-meeting-btn').onclick = () => {
+    document.getElementById('restart-meeting-btn').onclick = async (e) => {
       if (!confirm('Start a completely new meeting for this period? This discards the current one\'s recorded priorities and decisions — use "Reopen this meeting" instead if you just want to go back and change something.')) return;
-      clearMeeting();
+      e.target.disabled = true;
+      await clearMeeting();
       renderMain();
     };
     const gotoActionsFromMeetingLink = document.getElementById('goto-actions-from-meeting-link');
@@ -15513,13 +15550,15 @@ async function renderReportTab(content) {
     </div>`).join('')}
   `).join('')}</div>` : '';
 
-  // 4. Priorities — the meeting's decisions.
+  // 4. Priorities — the meeting's decisions. Shows the issue itself
+  // (message), never talkingPoint — that's the adviser's own "how to raise
+  // this" coaching note, not something to print on the client's copy.
   const prioritiesHtml = hasMeeting
     ? brief.priorities.map((p, i) => {
         const meta = PILLAR_META[p.pillar] || { name: p.pillar, color: 'var(--brass)' };
         return `<div class="report-priority" style="--pc:${meta.color};">
           <p class="pname">${i + 1}. ${esc(meta.name)}</p>
-          <p>${esc(p.talkingPoint || p.message)}</p>
+          <p>${esc(p.message)}</p>
           ${p.decision ? `<p><b>What we decided:</b> ${esc(p.decision)}</p>` : ''}
           ${p.action ? `<p><b>Next step:</b> ${esc(p.action)}</p>` : ''}
         </div>`;
@@ -15607,7 +15646,7 @@ async function renderReportTab(content) {
   // (falling back to the decision, then the issue itself), or with no
   // meeting, the first few recommendations as "where to focus".
   const nextSteps = hasMeeting
-    ? brief.priorities.map((p) => ({ area: PILLAR_META[p.pillar]?.name || p.pillar, color: PILLAR_META[p.pillar]?.color, text: p.action || p.decision || p.talkingPoint || p.message }))
+    ? brief.priorities.map((p) => ({ area: PILLAR_META[p.pillar]?.name || p.pillar, color: PILLAR_META[p.pillar]?.color, text: p.action || p.decision || p.message }))
     : recGroups.flatMap((g) => g.items.map((r) => ({ area: g.label, text: r.title }))).slice(0, 3);
   const nextStepsHtml = nextSteps.length ? `
     <ol class="report-next">${nextSteps.map((s) => `<li><span class="a" ${s.color ? `style="color:${s.color};"` : ''}>${esc(s.area)}</span>${esc(s.text)}</li>`).join('')}</ol>
