@@ -164,6 +164,10 @@ input[type="file"] { border: none; padding: 4px 0; background: transparent; }
    borderless look, which those places still want untouched. */
 .brief-figures .cash-net-stat { background: var(--paper); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; }
 .brief-figures .cash-net-stat:hover { border-color: var(--brass-soft); }
+/* Read-only stat tiles (div, not button) — e.g. the meeting's cash story. */
+.brief-figures div.cash-net-stat { cursor: default; }
+.brief-figures div.cash-net-stat:hover { border-color: var(--line); }
+.brief-figures .v.neg { color: var(--rust); }
 /* Same "active" treatment as .risk-filter-pill.active, so a stat tile
    currently driving a filter looks visibly pressed, not identical to the
    other six sitting idle — without this, a 1-result filtered view and a
@@ -187,6 +191,7 @@ input[type="file"] { border: none; padding: 4px 0; background: transparent; }
    for all four inline, which used to wrap the score onto its own line. */
 .pillar-legend-item { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 2px 8px; font-size: 12px; min-width: 0; }
 .pillar-legend-item .confidence-badge { grid-column: 2; grid-row: 2; justify-self: start; }
+.not-scored-note { font-size: 11px; color: var(--ink-soft); font-style: italic; margin: 12px 0 0; text-align: center; line-height: 1.4; }
 .pillar-legend-item .pillar-legend-score { grid-column: 3; grid-row: 1; }
 .pillar-swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
 .pillar-legend-name { color: var(--ink-soft); }
@@ -252,6 +257,17 @@ input[type="file"] { border: none; padding: 4px 0; background: transparent; }
 .risk-section-header.Medium { background: #F5EDD9; color: var(--brass); }
 .risk-section-header.Managed { background: var(--sage-bg); color: var(--sage); }
 
+/* Accept / Discuss / Reject on Diagnose & Growth recommendations — a small
+   segmented control; the active choice fills in its own colour. */
+.rec-decision { display: inline-flex; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; flex-shrink: 0; }
+.rec-decision-btn { border: none; background: var(--paper-raised); color: var(--ink-soft); font-size: 10.5px; font-family: var(--font-body); padding: 3px 9px; cursor: pointer; }
+.rec-decision-btn + .rec-decision-btn { border-left: 1px solid var(--line); }
+.rec-decision-btn:hover:not(:disabled) { background: var(--paper); color: var(--ink); }
+.rec-decision-btn.accepted.active { background: var(--sage-bg); color: var(--sage); font-weight: 600; }
+.rec-decision-btn.discuss.active { background: #F5EDD9; color: var(--brass); font-weight: 600; }
+.rec-decision-btn.rejected.active { background: var(--rust-bg); color: var(--rust); font-weight: 600; }
+.rec-decision-btn:disabled { opacity: 0.6; cursor: default; }
+.rec-rejected .flag-row > span:nth-child(2) { opacity: 0.5; text-decoration: line-through; }
 .risk-filter-pill { padding: 5px 12px; border-radius: 14px; border: 1px solid var(--line); background: var(--paper); color: var(--ink-soft); font-size: 12px; cursor: pointer; font-family: var(--font-body); }
 .risk-filter-pill.active { background: #F5EDD9; color: var(--brass); border-color: var(--brass); font-weight: 500; }
 .risk-filter-pill:hover:not(.active) { border-color: var(--brass-soft); }
@@ -6464,6 +6480,8 @@ async function renderOverviewTab(content) {
 
   const hs = overview?.healthScore || null;
   const priorHs = overview?.priorHealthScore || null;
+  // Only meaningful once analysis has run — before that nothing is scored.
+  const notScoredNames = hs ? notScoredAreaNames(overview?.pillarScores, currentCtx?.cadence) : [];
   const pillarMap = {};
   (overview?.pillarScores || []).forEach((p) => { pillarMap[p.pillar] = p.score; });
   const priorPillarMap = {};
@@ -6500,6 +6518,7 @@ async function renderOverviewTab(content) {
           <div class="wheel-score"><b>${hs.score}</b> / 100</div>
           ${priorHs ? `<p class="trend-line">${trendArrow(hs.score, priorHs.score)}</p>` : ''}
           <div class="pillar-legend" id="ov-legend"></div>
+          ${notScoredNoteHtml(notScoredNames)}
         ` : '<p class="muted plain" style="text-align:center; margin-top:24px;">No analysis run yet for this period.</p>'}
       </div>
       <!-- Right of the wheel, same .side-cards column Financial Performance
@@ -6542,6 +6561,7 @@ async function renderOverviewTab(content) {
         <table style="width:100%; border-collapse: collapse; font-size: 13px;">
           <tbody>
             ${pillars.map((p) => `<tr><td style="padding:8px 0; border-top:1px solid var(--line);"><span style="display:inline-block; width:8px; height:8px; border-radius:2px; background:${p.color}; margin-right:8px;"></span>${p.name}</td><td style="padding:8px 0; border-top:1px solid var(--line); text-align:right;"><span style="font-family: var(--font-mono);">${p.score == null ? '—' : p.score.toFixed(1) + '/10'}</span>${p.score != null ? ` ${scoreBadgeHtml(p.score, false)}` : ''}${priorPillarMap[p.key] !== undefined ? `<br>${trendArrow(p.score, priorPillarMap[p.key])}` : ''}</td></tr>`).join('')}
+            ${notScoredNames.map((name) => `<tr><td style="padding:8px 0; border-top:1px solid var(--line); color:var(--ink-soft);"><span style="display:inline-block; width:8px; height:8px; border-radius:2px; border:1px solid var(--line); margin-right:8px;"></span>${escAttr(name)}</td><td style="padding:8px 0; border-top:1px solid var(--line); text-align:right;"><span class="confidence-badge neutral">Not scored</span></td></tr>`).join('')}
           </tbody>
         </table>
       </div>
@@ -6569,6 +6589,27 @@ async function renderOverviewTab(content) {
 // uses for the overall score, just over a smaller set. The full 8-pillar
 // wheel lives on the Overview tab (see renderOverviewTab).
 const FINANCIAL_PILLAR_KEYS = ['profitability', 'cash_flow', 'tax'];
+
+// Which areas a client's cadence is scored on — mirrors analyze-background.js's
+// CADENCE_PILLARS. The analysis now leaves an area out when there's nothing
+// to score it from (rather than a placeholder 6), so anything here without a
+// pillar_scores row is genuinely "not scored", and screens say so instead of
+// letting it silently vanish. onlyKeys narrows to e.g. FINANCIAL_PILLAR_KEYS.
+const CADENCE_PILLAR_KEYS = {
+  quarterly: ['profitability', 'cash_flow', 'tax'],
+  half_yearly: ['profitability', 'cash_flow', 'tax', 'growth', 'risk', 'systems_team'],
+  annual: ['profitability', 'cash_flow', 'tax', 'growth', 'risk', 'systems_team', 'owner_wealth', 'owner_goals'],
+};
+function notScoredAreaNames(pillarScores, cadence, onlyKeys) {
+  const scored = new Set((pillarScores || []).filter((p) => p.score != null).map((p) => p.pillar));
+  return (CADENCE_PILLAR_KEYS[cadence || 'quarterly'] || [])
+    .filter((key) => !onlyKeys || onlyKeys.includes(key))
+    .filter((key) => !scored.has(key))
+    .map((key) => PILLAR_META[key]?.name || key);
+}
+function notScoredNoteHtml(names) {
+  return names.length ? `<p class="not-scored-note">Not scored yet (not enough information): ${names.map(escAttr).join(', ')}</p>` : '';
+}
 function computeFinancialScore(pillarScores) {
   const scores = (pillarScores || []).filter((p) => FINANCIAL_PILLAR_KEYS.includes(p.pillar));
   if (!scores.length) return null;
@@ -6629,6 +6670,7 @@ function renderHealthWheelBlock(container, overview, kpis, snapshot, history, di
           <p class="trend-line" style="margin:6px 0;">${scoreBadgeHtml(financialScore, true, true)}</p>
           ${priorFinancialScore != null ? `<p class="trend-line">${trendArrow(financialScore, priorFinancialScore)}</p>` : ''}
           <div class="pillar-legend" id="ov-legend"></div>
+          ${notScoredNoteHtml(notScoredAreaNames(overview?.pillarScores, currentCtx?.cadence, FINANCIAL_PILLAR_KEYS))}
         ` : '<p class="muted plain" style="text-align:center; margin-top:24px;">No analysis run yet for this period.</p>'}
       </div>
       <div class="side-cards">
@@ -7794,13 +7836,15 @@ async function renderFinancialDiagnose(content) {
     const title = rest.join(':');
     return { group, item: (data[group] || []).find((r) => r.title === title) };
   };
+  // Accept (creates the Action) / Discuss / Reject replaces the old
+  // "→ turn into action" link — see wireRecDecisionButtons.
   const recRow = (r, group) => `
-    <div class="flag-row-wrap">
+    <div class="flag-row-wrap${getRecDecision(recId(group, r)) === 'rejected' ? ' rec-rejected' : ''}">
       <div class="flag-row">
         <span class="flag-dot sage"></span>
-        <span><b>${r.title}</b> — ${r.impact || ''} <span class="muted plain">(${r.difficulty || ''}${r.difficulty && r.timeframe ? ', ' : ''}${r.timeframe || ''})</span></span>
+        <span style="flex:1;"><b>${r.title}</b> — ${r.impact || ''} <span class="muted plain">(${r.difficulty || ''}${r.difficulty && r.timeframe ? ', ' : ''}${r.timeframe || ''})</span></span>
+        ${recDecisionPillsHtml(recId(group, r))}
         <button class="mini-link" data-turn-rec="${escAttr(recId(group, r))}" type="button">→ turn into goal</button>
-        <button class="mini-link" data-turn-rec-action="${escAttr(recId(group, r))}" type="button">→ turn into action</button>
         <button class="mini-link" data-dismiss-rec="${escAttr(recId(group, r))}" type="button">✕ dismiss</button>
       </div>
     </div>
@@ -7871,23 +7915,7 @@ async function renderFinancialDiagnose(content) {
   // read as concrete near-term tasks ("ask the client to...") rather than a
   // longer-horizon thing to work toward, so Actions is often the better fit.
   // Goals stays available too; this doesn't replace it, just adds the option.
-  content.querySelectorAll('button[data-turn-rec-action]').forEach((btn) => {
-    btn.onclick = async () => {
-      const { item: r } = findRecByFullId(btn.dataset.turnRecAction);
-      if (!r) return;
-      const text = r.impact ? `${r.title} — ${r.impact}` : r.title;
-      btn.disabled = true;
-      btn.textContent = 'adding…';
-      try {
-        await addActionItem(text, 'diagnose', null, r.timeframe ? `${r.difficulty || ''}${r.difficulty && r.timeframe ? ', ' : ''}${r.timeframe}` : null);
-        btn.textContent = '✓ added to Actions';
-      } catch (err) {
-        btn.textContent = 'error';
-        btn.disabled = false;
-        alert('Error: ' + err.message);
-      }
-    };
-  });
+  wireRecDecisionButtons(content, (id) => findRecByFullId(id).item, () => renderFinancialDiagnose(content));
   content.querySelectorAll('button[data-dismiss-rec]').forEach((btn) => {
     btn.onclick = async () => {
       btn.disabled = true;
@@ -8036,12 +8064,12 @@ async function renderGrowthAnalyse(content) {
   // group this function renders — see meeting-intelligence-build-spec.md
   // §5); rows without them just render nothing extra.
   const recRow = (r, group) => `
-    <div class="flag-row-wrap">
+    <div class="flag-row-wrap${getRecDecision(recId(group, r)) === 'rejected' ? ' rec-rejected' : ''}">
       <div class="flag-row">
         <span class="flag-dot sage"></span>
-        <span><b>${r.title}</b> — ${r.impact || ''} <span class="muted plain">(${r.difficulty || ''}${r.difficulty && r.timeframe ? ', ' : ''}${r.timeframe || ''})</span></span>
+        <span style="flex:1;"><b>${r.title}</b> — ${r.impact || ''} <span class="muted plain">(${r.difficulty || ''}${r.difficulty && r.timeframe ? ', ' : ''}${r.timeframe || ''})</span></span>
+        ${recDecisionPillsHtml(recId(group, r))}
         <button class="mini-link" data-turn-rec="${escAttr(recId(group, r))}" type="button">→ turn into goal</button>
-        <button class="mini-link" data-turn-rec-action="${escAttr(recId(group, r))}" type="button">→ turn into action</button>
         <button class="mini-link" data-dismiss-rec="${escAttr(recId(group, r))}" type="button">✕ dismiss</button>
       </div>
       ${r.takes || r.risk || r.decision ? `
@@ -8110,23 +8138,7 @@ async function renderGrowthAnalyse(content) {
       }
     };
   });
-  content.querySelectorAll('button[data-turn-rec-action]').forEach((btn) => {
-    btn.onclick = async () => {
-      const { item: r } = findRecByFullId(btn.dataset.turnRecAction);
-      if (!r) return;
-      const text = r.impact ? `${r.title} — ${r.impact}` : r.title;
-      btn.disabled = true;
-      btn.textContent = 'adding…';
-      try {
-        await addActionItem(text, 'diagnose', null, r.timeframe ? `${r.difficulty || ''}${r.difficulty && r.timeframe ? ', ' : ''}${r.timeframe}` : null);
-        btn.textContent = '✓ added to Actions';
-      } catch (err) {
-        btn.textContent = 'error';
-        btn.disabled = false;
-        alert('Error: ' + err.message);
-      }
-    };
-  });
+  wireRecDecisionButtons(content, (id) => findRecByFullId(id).item, () => renderGrowthAnalyse(content));
   content.querySelectorAll('button[data-dismiss-rec]').forEach((btn) => {
     btn.onclick = async () => {
       btn.disabled = true;
@@ -10360,6 +10372,64 @@ async function toggleRecDismissed(recId, dismissed) {
   if (!currentCtx.recommendation_state) currentCtx.recommendation_state = {};
   currentCtx.recommendation_state[currentPeriodEnd] = data.saved.period_state;
 }
+// Accept / Discuss / Reject on a Diagnose/Growth recommendation. Accepting
+// is the commitment step, so it also creates the Action (owner/due date get
+// set on the Action Plan) — once only: the created action's id is stored on
+// the rec, and re-accepting reuses it. Clicking the active decision again
+// clears it. Rejected recs stay listed (muted) so the call is reversible,
+// and never reach the client report.
+const REC_DECISIONS = [
+  { key: 'accepted', label: 'Accept' },
+  { key: 'discuss', label: 'Discuss' },
+  { key: 'rejected', label: 'Reject' },
+];
+function getRecDecision(recId) {
+  return getRecommendationState().decisions?.[recId] || null;
+}
+function recDecisionPillsHtml(recId) {
+  const current = getRecDecision(recId);
+  return `<span class="rec-decision" role="group" aria-label="Decision">${REC_DECISIONS.map((d) =>
+    `<button type="button" class="rec-decision-btn ${d.key}${current === d.key ? ' active' : ''}" data-rec-decision="${d.key}" data-rec-id="${escAttr(recId)}" aria-pressed="${current === d.key}">${current === d.key && d.key === 'accepted' ? '✓ Accepted' : d.label}</button>`
+  ).join('')}</span>`;
+}
+async function saveRecDecision(recId, fields) {
+  const res = await fetch('/.netlify/functions/manual-entry', {
+    method: 'POST',
+    body: JSON.stringify({ type: 'save_recommendation_state', client_id: currentClientId, period_end: currentPeriodEnd, rec_id: recId, ...fields }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  if (!currentCtx.recommendation_state) currentCtx.recommendation_state = {};
+  currentCtx.recommendation_state[currentPeriodEnd] = data.saved.period_state;
+}
+// Wires every [data-rec-decision] button inside `root`. findRec maps a
+// rec_id back to its recommendation; rerender redraws the screen after.
+function wireRecDecisionButtons(root, findRec, rerender) {
+  root.querySelectorAll('button[data-rec-decision]').forEach((btn) => {
+    btn.onclick = async () => {
+      const recId = btn.dataset.recId;
+      const next = getRecDecision(recId) === btn.dataset.recDecision ? null : btn.dataset.recDecision;
+      root.querySelectorAll(`button[data-rec-id="${CSS.escape(recId)}"]`).forEach((b) => { b.disabled = true; });
+      try {
+        const fields = { decision: next };
+        if (next === 'accepted' && !getRecommendationState().actionIds?.[recId]) {
+          const r = findRec(recId);
+          if (r) {
+            const text = r.impact ? `${r.title} — ${r.impact}` : r.title;
+            const saved = await addActionItem(text, 'diagnose', null, r.timeframe ? `${r.difficulty || ''}${r.difficulty && r.timeframe ? ', ' : ''}${r.timeframe}` : null);
+            if (saved?.id) fields.action_id = saved.id;
+          }
+        }
+        await saveRecDecision(recId, fields);
+        rerender();
+      } catch (err) {
+        alert('Error: ' + err.message);
+        root.querySelectorAll(`button[data-rec-id="${CSS.escape(recId)}"]`).forEach((b) => { b.disabled = false; });
+      }
+    };
+  });
+}
+
 async function saveSuggestedTargetText(recId, text) {
   const res = await fetch('/.netlify/functions/manual-entry', {
     method: 'POST',
@@ -13641,23 +13711,57 @@ function briefDetailLinkHtml(id, label) {
 // has, just without takes/risk/decision (opportunities-only, see §5), and
 // now actually shown in Meeting Mode at all rather than only on the
 // standalone Diagnose screen (see normalizeGetBetterToFlagShape's comment).
-function financialRecCardHtml(heading, items) {
-  if (!items.length) return '';
+// group is the get_diagnosis key ('getBetter' / 'taxPlanning') so the
+// rec_id matches Diagnose's own (rec:<group>:<title>) — a decision made
+// mid-meeting shows on Diagnose afterwards and vice versa. Accept / Discuss
+// / Reject replaces the old one-way "add to Actions" button here, since the
+// meeting is exactly where that call gets made (Accept still creates the
+// Action — see wireRecDecisionButtons). Dismissed recs stay hidden.
+function financialRecCardHtml(heading, items, group) {
+  const dismissed = getRecommendationState().dismissed || {};
+  const visible = items.filter((o) => !dismissed[`rec:${group}:${o.title}`]);
+  if (!visible.length) return '';
   return `
     <div class="card">
       <p class="muted">${escAttr(heading)}</p>
-      ${items.map((o) => {
-        const text = o.impact ? `${o.title} — ${o.impact}` : o.title;
-        const why = [o.difficulty, o.timeframe].filter(Boolean).join(', ') || null;
+      ${visible.map((o) => {
+        const recId = `rec:${group}:${o.title}`;
         return `
-        <div class="flag-row-wrap">
-          <div class="flag-row"><span class="flag-dot sage"></span><b>${escAttr(o.title)}</b> — ${escAttr(o.impact || '')} <span class="muted plain">(${[o.difficulty, o.timeframe].filter(Boolean).join(', ')})</span></div>
-          <div class="toggle-row" style="padding-left:20px; margin:4px 0 6px;">
-            ${addToActionsButtonHtml(text, null, 'diagnose', why)}
-          </div>
+        <div class="flag-row-wrap${getRecDecision(recId) === 'rejected' ? ' rec-rejected' : ''}">
+          <div class="flag-row"><span class="flag-dot sage"></span><span style="flex:1;"><b>${escAttr(o.title)}</b> — ${escAttr(o.impact || '')} <span class="muted plain">(${[o.difficulty, o.timeframe].filter(Boolean).join(', ')})</span></span>${recDecisionPillsHtml(recId)}</div>
         </div>
       `;
       }).join('')}
+    </div>
+  `;
+}
+
+// "Where the cash went" for the meeting's Financial step — the same
+// template sentence as the Analyse tab's cash card and the client report,
+// plus money in / out / net, without the Analyse card's edit accordion
+// (that stays one click away in full detail). ideas.md flagged the cash
+// story never reaching the client outside the prep-time Analyse view.
+function meetingCashStoryCardHtml(ocfKpi) {
+  const r = ocfKpi?.cash_reconciliation;
+  const totals = cashInOut(r);
+  const story = cashStorySentence(r);
+  if (!totals || !story) return '';
+  const signed = (v) => (v < 0 ? `−${formatMoney(-v)}` : formatMoney(v));
+  const stat = (label, value, cls) => `<div class="cash-net-stat"><div class="v ${cls || ''}">${value}</div><div class="l">${label}</div></div>`;
+  // Same honesty as the Analyse card's Unexplained badge: in − out only
+  // covers what's been entered, so when it doesn't foot to the real bank
+  // movement, say by how much rather than let the tiles imply it does.
+  const unexplained = totals.delta_cash != null ? totals.delta_cash - totals.net : null;
+  return `
+    <div class="card">
+      <p class="muted">Where the cash went</p>
+      <p class="muted plain" style="margin:0;">${escAttr(story)}</p>
+      <div class="brief-figures">
+        ${stat('Money in', formatMoney(totals.cashIn))}
+        ${stat('Money out', formatMoney(totals.cashOut), 'neg')}
+        ${stat('Net change in the bank', signed(totals.delta_cash), totals.delta_cash < 0 ? 'neg' : '')}
+      </div>
+      ${unexplained != null && Math.abs(unexplained) >= 1 ? `<p class="muted plain" style="margin:10px 0 0; font-size:12px; color:var(--rust);">⚠ ${signed(unexplained)} of the bank movement isn't explained by what's been entered — worth checking the figures before relying on this.</p>` : ''}
     </div>
   `;
 }
@@ -13730,8 +13834,9 @@ async function renderFinancialBrief(content, openDetail) {
         </div>
       ` : ''}
     </div>
-    ${financialRecCardHtml('Get better — fixes for a current gap', diagnosisData?.getBetter || [])}
-    ${financialRecCardHtml('Tax planning — worth reviewing with the client', diagnosisData?.taxPlanning || [])}
+    ${meetingCashStoryCardHtml(cashConv)}
+    ${financialRecCardHtml('Get better — fixes for a current gap', diagnosisData?.getBetter || [], 'getBetter')}
+    ${financialRecCardHtml('Tax planning — worth reviewing with the client', diagnosisData?.taxPlanning || [], 'taxPlanning')}
     ${briefWhatToDoHtml(domainRanking)}
     <div class="kpi-grid" style="margin-bottom:12px;">
       ${renderCashOutlookCard(snapshot, kpis)}
@@ -13742,6 +13847,10 @@ async function renderFinancialBrief(content, openDetail) {
   wireCashOutlookCard(snapshot, kpis);
   wireTaxOutlookCard(snapshot, kpis);
   wireBriefWhatToDoHtml(content);
+  wireRecDecisionButtons(content, (id) => {
+    const [, group, ...rest] = id.split(':');
+    return (diagnosisData?.[group] || []).find((r) => r.title === rest.join(':'));
+  }, () => renderFinancialBrief(content, openDetail));
   document.getElementById('fin-brief-detail-btn').onclick = openDetail;
   document.querySelector('[data-fin-tile="gp_margin"]').onclick = () => {
     pendingFinancialKpiScrollKey = 'gp_margin';
@@ -13807,10 +13916,10 @@ async function renderGrowthBrief(content, openDetail) {
         <p class="muted">Live opportunities</p>
         ${opportunities.map((o) => {
           const text = o.impact ? `${o.title} — ${o.impact}` : o.title;
-          const why = [o.difficulty, o.timeframe].filter(Boolean).join(', ') || null;
+          const recId = `rec:opportunities:${o.title}`;
           return `
-          <div class="flag-row-wrap">
-            <div class="flag-row"><span class="flag-dot sage"></span><b>${escAttr(o.title)}</b> — ${escAttr(o.impact || '')} <span class="muted plain">(${[o.difficulty, o.timeframe].filter(Boolean).join(', ')})</span></div>
+          <div class="flag-row-wrap${getRecDecision(recId) === 'rejected' ? ' rec-rejected' : ''}">
+            <div class="flag-row"><span class="flag-dot sage"></span><span style="flex:1;"><b>${escAttr(o.title)}</b> — ${escAttr(o.impact || '')} <span class="muted plain">(${[o.difficulty, o.timeframe].filter(Boolean).join(', ')})</span></span>${recDecisionPillsHtml(recId)}</div>
             ${o.takes || o.risk || o.decision ? `
               <div class="muted plain" style="font-size:12px; margin:4px 0 0 20px; line-height:1.5;">
                 ${o.takes ? `<div>What it'd take: ${escAttr(o.takes)}</div>` : ''}
@@ -13819,7 +13928,6 @@ async function renderGrowthBrief(content, openDetail) {
               </div>
             ` : ''}
             <div class="toggle-row" style="padding-left:20px; margin:4px 0 6px;">
-              ${addToActionsButtonHtml(text, null, 'diagnose', why)}
               <button type="button" class="mini-link" data-brief-todo-goal="1" data-todo-text="${escAttr(text)}">→ turn into goal</button>
             </div>
           </div>
@@ -13836,6 +13944,7 @@ async function renderGrowthBrief(content, openDetail) {
     ${briefDetailLinkHtml('growth-brief-detail-btn', 'Growth')}
   `;
   wireBriefWhatToDoHtml(content);
+  wireRecDecisionButtons(content, (id) => opportunities.find((r) => `rec:opportunities:${r.title}` === id), () => renderGrowthBrief(content, openDetail));
   document.getElementById('growth-brief-detail-btn').onclick = openDetail;
 }
 
@@ -14659,6 +14768,44 @@ async function renderMeetingLanding(content, brief) {
 // goals/pulse already use for their own "what did they say last time"
 // context — a client who isn't met with every single period still gets
 // last time's actual list, not just whatever's immediately prior.
+// Last meeting vs now, for Actions: of everything that was on the list at
+// the previous period's meeting, what's been done since, what has slipped
+// (still open and past its due date), and what's still open on time. Plus
+// how many new actions have been added since. "At the last meeting" =
+// created before the end of that meeting's day, so actions agreed DURING
+// it count as its commitments. null when there's no earlier meeting.
+function computeActionProgress(items, meetingRecords, periodEnd) {
+  const lastPeriod = Object.keys(meetingRecords || {}).filter((p) => p < periodEnd).sort().pop();
+  const lastAt = meetingRecords?.[lastPeriod]?.created_at;
+  if (!lastAt) return null;
+  const meetingStart = new Date(lastAt);
+  const cutoff = new Date(meetingStart.getTime() + 24 * 60 * 60 * 1000);
+  const todayIso = today();
+  const atMeeting = (items || []).filter((it) => it.created_at && new Date(it.created_at) <= cutoff
+    // already finished before that meeting — not a commitment it carried
+    && !(it.status === 'done' && it.completed_at && new Date(it.completed_at) < meetingStart));
+  const done = atMeeting.filter((it) => it.status === 'done');
+  const notDone = atMeeting.filter((it) => it.status !== 'done');
+  const slipped = notDone.filter((it) => it.due_date && it.due_date < todayIso);
+  const open = notDone.filter((it) => !slipped.includes(it));
+  const addedSince = (items || []).filter((it) => it.created_at && new Date(it.created_at) > cutoff).length;
+  return { lastPeriod, lastAt, done, slipped, open, addedSince, total: atMeeting.length };
+}
+function actionProgressCardHtml(progress) {
+  if (!progress || !progress.total) return '';
+  const row = (it, kind) => `<div class="flag-row-wrap"><div class="flag-row"><span class="flag-dot ${kind === 'done' ? 'sage' : kind === 'slipped' ? 'rust' : ''}"></span><span style="flex:1;">${escAttr(it.text)}</span><span class="muted plain" style="font-size:11px; white-space:nowrap;">${kind === 'done' ? `done ${it.completed_at ? formatShortDate(it.completed_at.slice(0, 10)) : ''}` : it.due_date ? `${kind === 'slipped' ? 'was due' : 'due'} ${formatShortDate(it.due_date)}` : 'no due date'}${it.owner ? ` · ${escAttr(it.owner)}` : ''}</span></div></div>`;
+  const group = (label, list, kind) => list.length ? `<p class="goal-cat-heading">${label} (${list.length})</p>${list.map((it) => row(it, kind)).join('')}` : '';
+  return `
+    <div class="card">
+      <p class="muted">Since last meeting — ${formatShortDate(progress.lastAt.slice(0, 10))}</p>
+      <p class="muted plain" style="margin:0 0 8px;">Of the ${progress.total} action${progress.total === 1 ? '' : 's'} on the list then: <b style="color:var(--sage);">${progress.done.length} done</b>, <b style="color:${progress.slipped.length ? 'var(--rust)' : 'inherit'};">${progress.slipped.length} slipped</b>, ${progress.open.length} still open.${progress.addedSince ? ` ${progress.addedSince} new since.` : ''}</p>
+      ${group('Slipped — past due', progress.slipped, 'slipped')}
+      ${group('Done', progress.done, 'done')}
+      ${group('Still open', progress.open, 'open')}
+    </div>
+  `;
+}
+
 function findPriorMeetingPriorities(meetingRecords, periodEnd) {
   const periods = Object.keys(meetingRecords || {}).filter((p) => p < periodEnd).sort().reverse();
   for (const p of periods) {
@@ -14961,7 +15108,9 @@ async function renderMeetingQuestionsStep(content, phase) {
     ? "Quick catch-up before diving into the numbers — doesn't change what's shown next, just context for the conversation."
     : 'Forward-looking — a good answer here often becomes next period\'s goal.';
 
+  const actionProgress = phase === 'open' ? computeActionProgress(actionsData?.items, ctx?.meeting_records, currentPeriodEnd) : null;
   content.innerHTML = `
+    ${actionProgressCardHtml(actionProgress)}
     <div class="meeting-side-cards">
       ${outstandingActionsCardHtml(outstanding)}
       ${priorPrioritiesCardHtml(priorPriorities)}
@@ -15240,20 +15389,9 @@ async function renderReportTab(content) {
     ${scoreTile('Business health', hs.score, priorHs?.score)}
     ${financialScore != null ? scoreTile('Financial score', financialScore, priorFinancialScore) : ''}
   ` : '';
-  // Areas this client's cadence covers (mirrors analyze-background.js's
-  // CADENCE_PILLARS) that came back without a score — the analysis leaves
-  // an area out rather than inventing a neutral 6, so say so plainly
-  // instead of letting it silently vanish.
-  const CADENCE_AREAS = {
-    quarterly: ['profitability', 'cash_flow', 'tax'],
-    half_yearly: ['profitability', 'cash_flow', 'tax', 'growth', 'risk', 'systems_team'],
-    annual: Object.keys(PILLAR_META),
-  };
-  const notScored = (CADENCE_AREAS[ctx?.cadence || 'quarterly'] || [])
-    .filter((key) => !pillarRows.some((p) => p.key === key))
-    .map((key) => PILLAR_META[key]?.name || key);
+  const notScored = notScoredAreaNames(pillarScores, ctx?.cadence);
   const pillarGridHtml = pillarRows.length ? `
-    ${notScored.length ? `<p class="report-sub" style="margin:0 0 8px;">Not yet scored (not enough information yet): ${notScored.map(esc).join(', ')}.</p>` : ''}
+    ${notScored.length ? `<p class="report-sub" style="margin:0 0 8px;">Not scored yet (not enough information): ${notScored.map(esc).join(', ')}.</p>` : ''}
     <div class="report-pillar-grid">
       ${pillarRows.map((p) => `<div class="report-pillar-cell">
         <div class="n"><span class="report-pillar-dot" style="background:${PILLAR_META[p.key].color};"></span>${esc(PILLAR_META[p.key].name)}</div>
@@ -15339,19 +15477,33 @@ async function renderReportTab(content) {
   // planning, Opportunities), minus anything dismissed in the app for this
   // period (same rec:<group>:<title> ids as renderFinancialDiagnose), so a
   // recommendation the adviser has ruled out never reaches the client.
-  const dismissedRecs = ctx?.recommendation_state?.[currentPeriodEnd]?.dismissed || {};
-  const recGroups = [
+  const recPeriodState = ctx?.recommendation_state?.[currentPeriodEnd] || {};
+  const dismissedRecs = recPeriodState.dismissed || {};
+  const recDecisions = recPeriodState.decisions || {};
+  const allRecs = [
     ['getBetter', 'Improving the business'],
     ['taxPlanning', 'Tax planning'],
     ['opportunities', 'Growth opportunities'],
-  ].map(([group, label]) => ({ label, items: (diag?.[group] || []).filter((r) => !dismissedRecs[`rec:${group}:${r.title}`]) }))
+  ].flatMap(([group, label]) => (diag?.[group] || [])
+    .filter((r) => !dismissedRecs[`rec:${group}:${r.title}`])
+    .map((r) => ({ r, group, label, decision: recDecisions[`rec:${group}:${r.title}`] || null })));
+  // Once anything's been Accepted / Discussed / Rejected this period, the
+  // report prints only what was agreed or is still open for discussion —
+  // rejected and never-decided ones stay off the client's copy. Before any
+  // decision exists, it prints them all (the old behaviour), so a report
+  // run before the meeting isn't empty.
+  const recsDecided = allRecs.some((x) => x.decision);
+  const recGroups = (recsDecided
+    ? [['accepted', 'Agreed'], ['discuss', 'To discuss']].map(([d, label]) => ({ label, items: allRecs.filter((x) => x.decision === d) }))
+    : [...new Set(allRecs.map((x) => x.label))].map((label) => ({ label, items: allRecs.filter((x) => x.label === label) }))
+  ).map((g) => ({ ...g, items: g.items.map((x) => ({ ...x.r, _area: x.label })) }))
     .filter((g) => g.items.length);
   // One 2-across grid for all groups, each card tagged with its group,
   // rather than a heading per group — a heading-per-group list ran to a
   // page and a half on its own.
   const recsHtml = recGroups.length ? `<div class="report-grid2">${recGroups.map((g) => `
     ${g.items.map((r) => `<div class="report-rec">
-      <p class="rg">${g.label}</p>
+      <p class="rg">${recsDecided ? `${g.label} · ${esc(r._area)}` : g.label}</p>
       <p class="rt">${esc(r.title)}</p>
       ${r.impact || r.impact_estimate ? `<p>${esc(r.impact || r.impact_estimate)}</p>` : ''}
       ${r.difficulty || r.timeframe ? `<p class="rm">${esc([r.difficulty && `Effort: ${r.difficulty}`, r.timeframe && `Timeframe: ${r.timeframe}`].filter(Boolean).join(' · '))}</p>` : ''}
@@ -15421,6 +15573,20 @@ async function renderReportTab(content) {
     </table>
   ` : `<p class="report-empty">No open actions.</p>`;
 
+  // Progress since the previous meeting — same split as the opening
+  // check-in's card (computeActionProgress), written for the client.
+  const progress = computeActionProgress(actionsData?.items, ctx?.meeting_records, currentPeriodEnd);
+  const progressList = (list, note) => list.length
+    ? `<ul class="report-list">${list.map((it) => `<li>${esc(it.text)}${note(it) ? ` <span style="color:var(--ink-soft);">— ${note(it)}</span>` : ''}</li>`).join('')}</ul>`
+    : '<p class="report-empty">None.</p>';
+  const progressHtml = progress?.total ? `
+    <p style="margin:0 0 10px;">Of the ${progress.total} action${progress.total === 1 ? '' : 's'} agreed by our last meeting (${formatShortDate(progress.lastAt.slice(0, 10))}): <b>${progress.done.length} done</b>, <b>${progress.slipped.length} past due</b>, ${progress.open.length} still in progress.</p>
+    <div class="report-grid2">
+      <div><h3>Done</h3>${progressList(progress.done, (it) => it.completed_at ? formatShortDate(it.completed_at.slice(0, 10)) : '')}</div>
+      <div><h3>Past due</h3>${progressList(progress.slipped, (it) => `was due ${formatShortDate(it.due_date)}${it.owner ? ` · ${esc(it.owner)}` : ''}`)}</div>
+    </div>
+  ` : '';
+
   // Out-of-date analysis — figures saved (synced_at, only bumped by a real
   // financials save, not the tax-split/scenario saves) after the analysis
   // last ran. The diagnosis, scores and recommendations then describe the
@@ -15448,6 +15614,18 @@ async function renderReportTab(content) {
     ${openActions.length ? `<p class="report-sub" style="margin:8px 0 0;">${openActions.length} open action${openActions.length === 1 ? '' : 's'} in total — see the action plan.</p>` : ''}
   ` : '';
 
+  // Cash story that doesn't reconcile — the sentence lists what's been
+  // entered and then states the real bank movement, which reads as a
+  // contradiction to a client when the two are far apart. Screen-only, like
+  // the stale-analysis warning.
+  const cashTotals = cashInOut(kpi('op_cash_conversion')?.cash_reconciliation);
+  const cashGap = cashTotals && cashTotals.delta_cash != null ? cashTotals.delta_cash - cashTotals.net : null;
+  const cashGapWarningHtml = cashStory && cashGap != null && Math.abs(cashGap) >= 1000 ? `
+    <div class="report-stale">
+      <p style="margin:0;"><b>Cash story doesn't add up.</b> ${cashGap < 0 ? '−' : ''}${formatMoney(Math.abs(cashGap))} of the bank movement isn't explained by the figures entered, so "Where the cash went" may read oddly to the client. Check the cash reconciliation on Financial Performance → Analyse before sharing.</p>
+    </div>
+  ` : '';
+
   const section = (title, body) => `<div class="report-section"><h2>${title}</h2>${body}</div>`;
   const meetingLine = brief
     ? `Meeting ${brief.created_at ? formatShortDate(brief.created_at.slice(0, 10)) : 'on file'}${brief.completed ? '' : ' (in progress)'}`
@@ -15463,6 +15641,7 @@ async function renderReportTab(content) {
       <p class="muted plain" style="margin:0;">Client report for this period — built from the meeting, goals, figures and Actions.</p>
       <button class="action" id="report-print-btn" type="button">Print / Save as PDF</button>
       ${staleWarningHtml}
+      ${cashGapWarningHtml}
     </div>
     <div class="client-report" id="client-report">
       <!-- Page 1 — at a glance: built to fit one A4 sheet on its own. -->
@@ -15481,8 +15660,9 @@ async function renderReportTab(content) {
       ${openingQs.length ? section('What you told us', qaHtml(openingQs)) : ''}
       ${performanceDetail ? section('Performance in detail', performanceDetail) : ''}
       ${hasMeeting ? section('Priorities we discussed', prioritiesHtml) : ''}
-      ${section('Recommendations', recsHtml || `<p class="report-empty">${diag ? 'No open recommendations for this period.' : 'No analysis run for this period yet.'}</p>`)}
+      ${section(recsDecided ? 'What we agreed' : 'Recommendations', recsHtml || `<p class="report-empty">${!diag ? 'No analysis run for this period yet.' : recsDecided ? 'Nothing accepted or left open for discussion this period.' : 'No open recommendations for this period.'}</p>`)}
       ${section('Goals', goalsHtml)}
+      ${progressHtml ? section('Progress since our last meeting', progressHtml) : ''}
       ${section('Action plan', actionsHtml)}
       ${closingQs.length ? section('Looking ahead', qaHtml(closingQs)) : ''}
       <p class="report-footer">Prepared ${formatShortDate(today())} · ${esc(clientName)} · period ending ${formatShortDate(currentPeriodEnd)}</p>

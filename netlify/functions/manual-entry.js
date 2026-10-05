@@ -628,12 +628,26 @@ async function saveMeetingRecord(body) {
 // stable about that item — a flag's own message text, a KPI's key, a
 // recommendation's title.
 async function saveRecommendationState(body) {
-  const { client_id, period_end, rec_id, dismissed, suggested_target } = body;
+  const { client_id, period_end, rec_id, dismissed, suggested_target, decision, action_id } = body;
   if (!client_id || !period_end || !rec_id) throw new Error('client_id, period_end and rec_id required');
 
   const { data: existing } = await supabase.from('client_context').select('recommendation_state').eq('client_id', client_id).single();
   const state = existing?.recommendation_state || {};
   const period = state[period_end] || { dismissed: {}, suggestedTargets: {} };
+  // Accept / Discuss / Reject on a recommendation (same rec_id keying as
+  // dismissed), plus the action_items id an Accept created — so accepting
+  // twice, or un-accepting and re-accepting, never spawns a duplicate action.
+  if (!period.decisions) period.decisions = {};
+  if (!period.actionIds) period.actionIds = {};
+  if (decision !== undefined) {
+    if (decision === null) delete period.decisions[rec_id];
+    else if (['accepted', 'discuss', 'rejected'].includes(decision)) period.decisions[rec_id] = decision;
+    else throw new Error('decision must be accepted, discuss, rejected or null');
+  }
+  if (action_id !== undefined) {
+    if (action_id === null) delete period.actionIds[rec_id];
+    else period.actionIds[rec_id] = action_id;
+  }
   if (dismissed !== undefined) {
     if (dismissed) period.dismissed[rec_id] = true;
     else delete period.dismissed[rec_id];
@@ -794,6 +808,13 @@ async function saveActionItem(body) {
   if (!row.text) throw new Error('text required');
 
   if (id) {
+    // Keep the ORIGINAL completion time when an already-done item is edited
+    // (text, owner, etc.) — re-stamping it "now" made "done since last
+    // meeting" (index.html's computeActionProgress) count old work as new.
+    if (cleanStatus === 'done') {
+      const { data: prev } = await supabase.from('action_items').select('status, completed_at').eq('id', id).eq('client_id', client_id).maybeSingle();
+      if (prev?.status === 'done' && prev.completed_at) row.completed_at = prev.completed_at;
+    }
     const { data, error } = await supabase.from('action_items').update(row).eq('id', id).eq('client_id', client_id).select().single();
     if (error) throw error;
     return data;
