@@ -1,7 +1,10 @@
-// netlify/functions/analyze.js
+// netlify/functions/analyze-background.js
 // Runs the deterministic rules engine (ratios, flags, pillar scoring) and then
 // calls Claude for the diagnosis/advise narrative — matching the framework's
 // separation of Analysis Engine (rules = your IP) from the AI narrative layer.
+// Background function (see the exports.handler comment below) — the Claude
+// call alone routinely takes ~20s, which left too little margin under a
+// synchronous function's 10-30s limit.
 //
 // Env vars required: SUPABASE_URL, SUPABASE_SERVICE_KEY, ANTHROPIC_API_KEY
 
@@ -10,6 +13,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const { syncFinancialRiskItems } = require('./lib/financial-risk-sync');
 const { getAllActiveQuestions } = require('./lib/business-risk-questionnaire');
 const { OWNER_EXIT_READINESS_ITEMS, OWNER_ESTATE_CHECKLIST_ITEMS } = require('./lib/owner-wealth-risk-sync');
+const { getOrGenerateGpMarginBenchmark } = require('./lib/gp-margin-benchmark');
 
 // Which pillars are active at each cadence — mirrors the framework's cadence map.
 const CADENCE_PILLARS = {
@@ -187,7 +191,7 @@ function scoreRiskPillar(flags, riskItems) {
 // objective the owner never asked for. Shrinking is still scored down
 // either way — "hold steady" isn't the same as "any decline is fine."
 function scoreGrowthPillar(fs, priorFs, posture) {
-  if (!priorFs?.revenue) return 6; // neutral baseline when there's no prior period to compare
+  if (!priorFs?.revenue) return null; // not scored — no prior period to compare against
   const growthRate = (fs.revenue - priorFs.revenue) / priorFs.revenue;
   const wantsSteady = posture === 'consolidate' || posture === 'hold_wealth';
   let score;
@@ -270,26 +274,278 @@ function ownerEstateItemApplicable(key, entityType) {
 // specifically). Retirement Outlook is deliberately NOT folded in — its
 // inputs (desired income, growth assumptions) are session-only UI state on
 // the Owner & Succession card, never persisted, so there's nothing here to
-// read. Nothing assessed yet falls back to the same neutral 6 every other
-// unscored pillar uses, rather than treating silence as a penalty.
+// read. Nothing assessed yet returns null (not scored — see scorePillar)
+// rather than treating silence as either a penalty or a pass.
 function scoreOwnerWealthPillar(ownerWealth) {
   const { exitReadinessOverall, estateGapCount, estateApplicableCount } = ownerWealth || {};
-  if (exitReadinessOverall == null) return 6;
+  if (exitReadinessOverall == null) return null;
   let score = exitReadinessOverall / 10;
   if (estateApplicableCount > 0) score -= (estateGapCount / estateApplicableCount) * 2;
   return Math.max(0, Math.min(10, Math.round(score * 10) / 10));
 }
 
+// ---- Tax pillar scoring ----
+// Compares the client's actual effective tax rate (tax_expense / net_profit,
+// both self-reported per snapshot) against what's standard for their entity
+// type, rather than the flat 8 this used to return unconditionally. Two
+// things a naive rate comparison would get wrong on its own:
+//
+// 1. A loss year produces a low/zero rate too, for an entirely different
+//    reason (no taxable income, not good planning) — Profitability already
+//    scores the loss itself, so Tax stays neutral rather than double-
+//    counting or misreading the loss as tax efficiency.
+// 2. tax_expense/net_profit are captured PER SNAPSHOT — only meaningful as
+//    an annual rate, not a lone quarter's (one quarter can carry a lumpy
+//    one-off tax item). So this only computes a fresh score once a full
+//    financial year's worth of periods is on file for a quarterly/half-
+//    yearly client — at the period landing on the fy_end anniversary — and
+//    simply carries the last completed year's score forward for the
+//    quarters in between. Same "tax is fundamentally annual" spirit
+//    CADENCE_PILLARS already applies to owner_wealth/owner_goals, just as
+//    carry-forward instead of exclusion, since Tax is meant to be visible
+//    at every cadence per that same map.
+//
+// Flow-through entities (Sole trader/Partnership/Trust) pay no tax at the
+// ENTITY level by design — profit is taxed in the owners'/partners'/
+// beneficiaries' own hands, so entity-level tax_expense being null or $0 is
+// the CORRECT, expected outcome, not a data gap and not remarkable either
+// way. Comparing it against a standard rate (as this used to for Sole
+// trader, and not at all for Partnership/Trust, which just returned a flat
+// 8) was answering the wrong question. What's actually worth surfacing for
+// these three is structural: how much marginal-rate exposure this profit
+// level would carry if it landed in ONE individual's hands. That's a
+// conservative, worst-case proxy — the real partner/beneficiary count and
+// their other income isn't tracked anywhere server-side, only ephemeral,
+// adviser-typed browser state on the Current tax position card (see
+// index.html's taxPositionCompareState) — but high concentrated exposure is
+// exactly what makes income-splitting or a different structure worth a
+// conversation, and low exposure means the current one is already fine.
+const PERIODS_PER_YEAR = { quarterly: 4, half_yearly: 2, annual: 1 };
+const COMPANY_TAX_RATE = 0.25; // base rate entity default — overridden per-client by profile_extra.company_tax_rate when set (see index.html's matching Profile field)
+// FY2026-27 resident individual brackets + flat 2% Medicare levy — same
+// figures and same "starting point, not a guarantee" caveat as index.html's
+// DEFAULT_TAX_RATES/estimateIndividualTax. Duplicated here rather than
+// shared, per this codebase's established per-file-independence convention
+// (see findKpiTarget's own comment above) — this runs server-side with no
+// access to the client-side, session-editable taxRatesState anyway, and an
+// objective score needs a fixed baseline rather than whatever an adviser
+// happens to have typed into a scenario tool mid-meeting.
+const INDIVIDUAL_TAX_BANDS = [[18200, 0], [45000, 15], [135000, 30], [190000, 37], [Infinity, 45]];
+const MEDICARE_RATE = 0.02;
+const MEDICARE_THRESHOLD = 24276;
+
+function estimateIndividualEffectiveRate(income) {
+  if (income <= 0) return 0;
+  let tax = 0, lower = 0;
+  for (const [upper, ratePct] of INDIVIDUAL_TAX_BANDS) {
+    if (income <= lower) break;
+    tax += (Math.min(income, upper) - lower) * (ratePct / 100);
+    lower = upper;
+  }
+  if (income > MEDICARE_THRESHOLD) tax += income * MEDICARE_RATE;
+  return tax / income;
+}
+
+// Combined tax across however many partners/beneficiaries were actually
+// entered and SAVED on the Current tax position card (financial_snapshots.
+// tax_structure_split — see migration_tax_structure_split.sql), instead of
+// scoreTaxFromAnnualFigures' own "assume one taxpayer" fallback. Mirrors
+// index.html's estimateTaxForEntity/renderTaxPositionEstimateTiles math
+// (duplicated rather than shared, per this file's own established per-file-
+// independence convention above) — share is a literal % of the pool (5
+// means 5%, not "100% of whatever else was entered"), otherIncome stacks on
+// top of that person's share via the same incremental-tax-effect formula,
+// profitAdjustment shifts the whole pool before it's split. Returns null
+// when there's nothing usable saved (Sole trader always has an implicit
+// 100% share; Partnership/Trust need at least one real share entered).
+function computeTaxFromSavedSplit(entityType, pool, split) {
+  if (!split) return null;
+  const isSolo = entityType === 'Sole trader';
+  const rawShares = isSolo ? [100] : (split.shares || []).map(Number);
+  const validIdx = rawShares.map((v, i) => (!isNaN(v) && v > 0 ? i : -1)).filter((i) => i >= 0);
+  if (!validIdx.length) return null;
+  const rawOther = split.otherIncome || [];
+  const adjustedPool = pool + (Number(split.profitAdjustment) || 0);
+  let total = 0;
+  validIdx.forEach((i) => {
+    const amt = adjustedPool * (rawShares[i] / 100);
+    const other = Number(rawOther[i]) || 0;
+    total += other !== 0
+      ? (amt + other) * estimateIndividualEffectiveRate(amt + other) - other * estimateIndividualEffectiveRate(other)
+      : amt * estimateIndividualEffectiveRate(amt);
+  });
+  return total;
+}
+
+// Quarterly/half-yearly periods walk in fixed steps from fy_end's month/day
+// (see index.html's generatePeriodOptions) — always landing on the same
+// month+day each cycle — so comparing just month+day (ignoring year)
+// reliably identifies the one period per year that completes a financial
+// year, without needing to know every other period the client has.
+function isFyEndPeriod(periodEnd, fyEnd, cadence) {
+  if (cadence === 'annual') return true; // one period IS one year already
+  if (!fyEnd) return true; // can't place the year boundary — compute fresh rather than never
+  const p = new Date(periodEnd + 'T00:00:00Z');
+  const f = new Date(fyEnd + 'T00:00:00Z');
+  return p.getUTCMonth() === f.getUTCMonth() && p.getUTCDate() === f.getUTCDate();
+}
+
+function scoreTaxFromAnnualFigures(entityType, annualNetProfit, annualTaxExpense, companyTaxRate, taxStructureSplit) {
+  if (annualNetProfit == null) return null;
+  if (annualNetProfit <= 0) return 6; // loss year — not a tax-planning signal either way
+
+  if (entityType === 'Sole trader' || entityType === 'Partnership' || entityType === 'Trust') {
+    // No entity-level tax to compare against for these (see the block
+    // comment above). If the adviser has actually SAVED a split on the
+    // Current tax position card, use the real combined rate across however
+    // many people it describes — otherwise fall back to the concentrated-
+    // in-one-person rate as a conservative, worst-case reference point.
+    const savedTax = computeTaxFromSavedSplit(entityType, annualNetProfit, taxStructureSplit);
+    const effectiveRate = savedTax != null ? savedTax / annualNetProfit : estimateIndividualEffectiveRate(annualNetProfit);
+    if (effectiveRate <= 0.19) return 9; // in/near the lowest brackets — plenty of headroom, no pressure to change structure
+    if (effectiveRate <= 0.30) return 7; // moderate — roughly company-rate territory, worth a periodic check
+    if (effectiveRate <= 0.37) return 5; // meaningfully above company rate if concentrated — splitting income or a different structure may help
+    return 3; // high marginal exposure — worth a real conversation about structure/splitting
+  }
+
+  if (annualTaxExpense == null) return null;
+  const standardRate = (typeof companyTaxRate === 'number' && companyTaxRate > 0) ? companyTaxRate : COMPANY_TAX_RATE;
+  const diff = (annualTaxExpense / annualNetProfit) - standardRate;
+  if (diff <= -0.05) return 9; // comfortably below standard — efficient (e.g. genuine deductions like super contributions)
+  if (diff <= 0.03) return 7; // roughly in line
+  if (diff <= 0.08) return 5; // somewhat above standard — worth a look
+  return 3; // notably above standard — real inefficiency or a data/timing issue
+}
+
+async function computeTaxPillarScore(supabase, { clientId, periodEnd, cadence, fyEnd, entityType, fs, companyTaxRate }) {
+  const periodsPerYear = PERIODS_PER_YEAR[cadence] || 4;
+
+  if (!isFyEndPeriod(periodEnd, fyEnd, cadence)) {
+    // Mid-year — carry forward the immediately prior period's tax score
+    // rather than reading a lone quarter's rate as this year's verdict.
+    // Chains correctly across quarters since each one just inherits what
+    // the last one held (itself either freshly computed at the prior
+    // fy-end or also carried forward).
+    const { data: priorScore } = await supabase
+      .from('pillar_scores').select('score')
+      .eq('client_id', clientId).eq('pillar', 'tax').lt('period_end', periodEnd)
+      .order('period_end', { ascending: false }).limit(1).maybeSingle();
+    if (priorScore?.score != null) return priorScore.score;
+    // No tax score on file at all yet (this client's very first analysis
+    // run) — fall through and score off just this one period, best-effort,
+    // rather than showing nothing until a full year exists.
+  }
+
+  // fs.tax_structure_split is THIS period's saved split, used either way
+  // below as the best available (and only) one on file — a quarterly/half-
+  // yearly client's split is assumed roughly stable across the year rather
+  // than tracked per-quarter, same simplification as most of this scoring
+  // already makes.
+  if (periodsPerYear === 1) return scoreTaxFromAnnualFigures(entityType, fs.net_profit, fs.tax_expense, companyTaxRate, fs.tax_structure_split);
+
+  const { data: trailing } = await supabase
+    .from('financial_snapshots').select('net_profit, tax_expense')
+    .eq('client_id', clientId).lte('period_end', periodEnd)
+    .order('period_end', { ascending: false }).limit(periodsPerYear);
+  const rows = trailing || [];
+  if (rows.length < periodsPerYear) {
+    // This IS the fy-end-aligned date, but a full year isn't on file yet
+    // (e.g. the client's very first period happens to land on it) — score
+    // off what's actually here rather than pretend a full year exists.
+    return scoreTaxFromAnnualFigures(entityType, fs.net_profit, fs.tax_expense, companyTaxRate, fs.tax_structure_split);
+  }
+  const sum = (field) => {
+    let total = 0;
+    for (const r of rows) {
+      if (r[field] == null) return null;
+      total += Number(r[field]);
+    }
+    return total;
+  };
+  return scoreTaxFromAnnualFigures(entityType, sum('net_profit'), sum('tax_expense'), companyTaxRate, fs.tax_structure_split);
+}
+
+// Clamped linear interpolation between a "poor" reference point and a
+// "good" one — replaces the old hard 3-band cliffs (a value one hair below
+// a threshold used to read wildly differently from one hair above it) with
+// a smooth score that actually reflects how far into good/bad territory a
+// number sits. Works in either direction: pass badPoint > goodPoint for a
+// "lower is better" metric (e.g. debtor days) and the interpolation still
+// comes out the right way round.
+function interpolateScore(value, badPoint, goodPoint, badScore = 1, goodScore = 9.5) {
+  if (value == null) return null;
+  const t = Math.max(0, Math.min(1, (value - badPoint) / (goodPoint - badPoint)));
+  return Math.round((badScore + t * (goodScore - badScore)) * 10) / 10;
+}
+
+// Shared qualitative label for any 0-10 pillar/KPI-style score — purely for
+// display (index.html mirrors this), so "6.2" reads as "OK" and "8.7" reads
+// as "Very good" consistently everywhere a score shows, rather than a bare
+// number the reader has to calibrate for themselves each time.
+function scoreLabel(score) {
+  if (score == null) return null;
+  if (score >= 8.5) return 'Very good';
+  if (score >= 7) return 'Good';
+  if (score >= 5) return 'OK';
+  if (score >= 3) return 'Watch';
+  return 'Poor';
+}
+
+// Net profit margin is the actual "is this business profitable" answer —
+// weighted most heavily (0.7). GP margin is a real secondary factor (it's
+// where a margin problem usually originates), scored against a "good"
+// reference point picked in priority order: the client's own target when
+// one is set (findKpiTarget) — "58% target, sitting at 25.7%" is a much
+// sharper story than a flat threshold could tell — else the AI-suggested,
+// per-industry typical-range benchmark (getOrGenerateGpMarginBenchmark,
+// same cache-per-industry pattern as the Growth domain's valuation
+// multiple), else a generic 15-45% range as the last resort when the
+// client has no industry on file at all for the benchmark call to use.
+function scoreProfitabilityPillar(ratios, gpMarginTarget, gpBenchmark) {
+  const npScore = interpolateScore(ratios.np_margin, -0.10, 0.20);
+  const gpBad = gpBenchmark?.typical_low != null ? gpBenchmark.typical_low : 0.15;
+  const gpGood = gpMarginTarget != null ? gpMarginTarget
+    : gpBenchmark?.typical_high != null ? gpBenchmark.typical_high
+    : 0.45;
+  const gpScore = interpolateScore(ratios.gp_margin, gpBad, Math.max(gpGood, gpBad + 0.01));
+  if (npScore == null && gpScore == null) return null;
+  if (npScore == null) return gpScore;
+  if (gpScore == null) return npScore;
+  return Math.round((npScore * 0.7 + gpScore * 0.3) * 10) / 10;
+}
+
+// Operating cash conversion (this period's actual profit-to-cash
+// conversion) is the real "cash flow" answer — current ratio is a
+// balance-sheet LIQUIDITY snapshot, not a flow measure, and used to be the
+// whole score on its own (a business could be actively bleeding cash every
+// period and still score 9/10 here purely on liquidity, which is exactly
+// what was happening before this change). ~40% conversion reads as poor,
+// ~100% (all profit becoming real cash) as very good. Current ratio
+// demotes to a real but secondary liquidity check (0.4 weight) — a
+// business converting profit to cash fine period-to-period can still be in
+// genuine short-term trouble if current liabilities dwarf current assets.
+function scoreCashFlowPillar(ratios, ocfConversion) {
+  const conversionScore = interpolateScore(ocfConversion, 0.40, 1.00);
+  const liquidityScore = interpolateScore(ratios.current_ratio, 0.8, 2.0);
+  if (conversionScore == null && liquidityScore == null) return null;
+  if (conversionScore == null) return liquidityScore;
+  if (liquidityScore == null) return conversionScore;
+  return Math.round((conversionScore * 0.6 + liquidityScore * 0.4) * 10) / 10;
+}
+
+// null means "not scored" — no data to score from, or (systems_team,
+// owner_goals) no scoring logic yet. Unscored pillars are left out of the
+// health score and never persisted, rather than counted as a made-up
+// neutral 6: a 6 printed in a client report reads as a real assessment.
 function scorePillar(pillar, ratios, riskContext) {
-  const band = (val, good, ok) => (val == null ? null : val >= good ? 9 : val >= ok ? 6 : 3);
   switch (pillar) {
-    case 'profitability': return band(ratios.gp_margin, 0.4, 0.25);
-    case 'cash_flow': return band(ratios.current_ratio, 1.5, 1.0);
-    case 'tax': return 8; // placeholder until BAS-variance logic is added
+    case 'profitability': return scoreProfitabilityPillar(ratios, riskContext?.gpMarginTarget, riskContext?.gpBenchmark);
+    case 'cash_flow': return scoreCashFlowPillar(ratios, riskContext?.ocfConversion);
+    case 'tax': return riskContext?.taxScore ?? null;
     case 'risk': return scoreRiskPillar(riskContext?.flags, riskContext?.riskItems);
     case 'growth': return scoreGrowthPillar(riskContext?.fs, riskContext?.priorFs, riskContext?.posture);
     case 'owner_wealth': return scoreOwnerWealthPillar(riskContext?.ownerWealth);
-    default: return 6; // placeholder for pillars not yet ratio-driven
+    default: return null; // systems_team, owner_goals — no scoring logic built yet
   }
 }
 
@@ -417,10 +673,30 @@ function computeAllKpis(fs, priorFs, kpiLibrary) {
   });
 }
 
+// Background function (the -background filename suffix is what Netlify
+// keys off — no config needed): the Claude call alone routinely takes
+// ~20s, which left almost no margin under the 10-30s synchronous function
+// limit once the surrounding Supabase reads/writes and risk sync are
+// added on top — a real, observed failure mode, not a theoretical one.
+// Background functions get up to 15 minutes, but the tradeoff is the
+// caller gets an immediate empty 202 response with no body — so the
+// frontend (index.html's run-analysis-btn handler) can't await a direct
+// result the way it used to. It instead polls get_diagnosis until this
+// run's 'overall' diagnostics row id changes from the pre-trigger
+// baseline, or until this row appears (see 'analysis_error' below).
 exports.handler = async (event) => {
+  const { client_id, period_end } = JSON.parse(event.body || '{}');
+  if (!client_id || !period_end) return { statusCode: 400, body: 'client_id and period_end required' };
+  // Clears any stale error marker from a PRIOR failed run before this run
+  // starts, so a fresh attempt's poll doesn't misread old failure state as
+  // this run's result. Best-effort — if this fails, the worst case is a
+  // stale error banner briefly outliving a successful re-run.
   try {
-    const { client_id, period_end } = JSON.parse(event.body || '{}');
-    if (!client_id || !period_end) return { statusCode: 400, body: 'client_id and period_end required' };
+    await supabase.from('diagnostics').delete().eq('client_id', client_id).eq('period_end', period_end).eq('pillar', 'analysis_error');
+  } catch (err) {
+    console.error('Failed to clear stale analysis_error marker:', err.message);
+  }
+  try {
 
     const [{ data: fs }, { data: context }, { data: priorFsList }, kpiLibResult, riskItemsResult, trendHistoryResult, ownerWealthSnapshotResult] = await Promise.all([
       supabase.from('financial_snapshots').select('*').eq('client_id', client_id).eq('period_end', period_end).single(),
@@ -481,17 +757,66 @@ exports.handler = async (event) => {
       estateApplicableCount: applicableEstateItems.length,
       estateGapCount: applicableEstateItems.filter((key) => estateByKey[key]?.status === 'no').length,
     };
-    const riskContext = { flags, riskItems: riskItemsResult?.data || [], fs, priorFs, ownerWealth, posture: context?.profile_extra?.posture };
+    const taxScore = await computeTaxPillarScore(supabase, {
+      clientId: client_id, periodEnd: period_end, cadence: context?.cadence, fyEnd: context?.fy_end, entityType: context?.entity_type, fs,
+      companyTaxRate: context?.profile_extra?.company_tax_rate,
+    });
+    // Gives the AI something concrete to say about tax structure for Sole
+    // trader/Partnership/Trust instead of guessing — same computation the
+    // pillar score itself now uses (see computeTaxFromSavedSplit), just
+    // phrased as a sentence rather than a 0-10 number.
+    let taxSplitSummary = null;
+    if (fs.net_profit != null && fs.tax_structure_split) {
+      const combinedTax = computeTaxFromSavedSplit(context?.entity_type, fs.net_profit, fs.tax_structure_split);
+      if (combinedTax != null) {
+        const rate = fs.net_profit > 0 ? ((combinedTax / fs.net_profit) * 100).toFixed(1) : '0.0';
+        const peopleCount = (fs.tax_structure_split.shares || []).filter((v) => Number(v) > 0).length || 1;
+        taxSplitSummary = `Saved split across ${peopleCount} ${peopleCount === 1 ? 'person' : 'people'} — estimated combined effective rate ~${rate}% on ${money(fs.net_profit)} profit.`;
+      }
+    }
+    // Moved ahead of pillar scoring (used to run after) so the Cash flow
+    // pillar can use the real operating-cash-conversion figure instead of
+    // current ratio alone — see scoreCashFlowPillar. Same formula
+    // deriveOperatingCashFlow's own comment already documents: EBITDA basis
+    // (net profit + interest + D&A), both pre-tax, same as kpi_library's
+    // op_cash_conversion denominator, so this reads identically to what the
+    // KPI card itself shows.
+    const ocf = deriveOperatingCashFlow(fs, priorFs);
+    const ebitdaApprox = (fs.net_profit || 0) + (fs.interest_expense || 0) + (fs.depreciation_amortisation || 0);
+    const ocfConversion = (ocf.value != null && ebitdaApprox) ? ocf.value / ebitdaApprox : null;
+    const gpMarginTarget = findKpiTarget(context?.owner_goals, period_end, 'gp_margin');
+    // Only worth the lookup (a cache read, or on a cache miss an AI call —
+    // see gp-margin-benchmark.js) when there's no client-set target to use
+    // instead and an industry is actually on file to ask about. Non-fatal:
+    // a benchmark failure must not take down the whole analysis, same
+    // pattern as syncFinancialRiskItems/getAllActiveQuestions below.
+    let gpBenchmark = null;
+    if (gpMarginTarget == null && context?.industry) {
+      try {
+        gpBenchmark = await getOrGenerateGpMarginBenchmark(supabase, context.industry, context.business_description);
+      } catch (err) {
+        console.error('GP margin benchmark lookup failed:', err.message);
+      }
+    }
+    const riskContext = {
+      flags, riskItems: riskItemsResult?.data || [], fs, priorFs, ownerWealth, taxScore, ocfConversion, gpMarginTarget, gpBenchmark,
+      posture: context?.profile_extra?.posture,
+    };
     const activePillars = CADENCE_PILLARS[context?.cadence || 'quarterly'];
-    const scores = activePillars.map((p) => ({ pillar: p, score: scorePillar(p, ratios, riskContext), active: true }));
-    const healthScore = Math.round(
-      (scores.reduce((sum, s) => sum + (s.score || 0), 0) / (10 * scores.length)) * 100
-    );
+    // Only pillars that actually got a score — an unscored one (null) used
+    // to count as 0 here (dragging health down) or arrive as a placeholder 6
+    // (propping it up). Health is the average of what was really assessed;
+    // null when nothing could be scored at all.
+    const scores = activePillars
+      .map((p) => ({ pillar: p, score: scorePillar(p, ratios, riskContext), active: true }))
+      .filter((s) => s.score != null);
+    const healthScore = scores.length
+      ? Math.round((scores.reduce((sum, s) => sum + s.score, 0) / (10 * scores.length)) * 100)
+      : null;
 
     // kpi_library may not exist yet on a fresh setup — degrade gracefully
     // rather than failing the whole analysis over an optional add-on table.
     const kpiLibrary = kpiLibResult.error ? [] : (kpiLibResult.data || []);
-    const ocf = deriveOperatingCashFlow(fs, priorFs);
     const fsForKpis = ocf.derived ? { ...fs, operating_cash_flow: ocf.value } : fs;
     const kpis = computeAllKpis(fsForKpis, priorFs, kpiLibrary);
     if (ocf.derived) {
@@ -530,13 +855,15 @@ exports.handler = async (event) => {
     const systemInstructions = `You are the analysis engine for an accounting advisory app. Given this client's data, write, using SHORT, DIRECT language throughout (this is a strict length budget, not a preference):
 1. A diagnosis, UP TO 70 WORDS (use the budget well — this is the most important synthesis in the report — but a hard technical limit means it cannot run longer). Reference the specific ratios/flags, call out any meaningful gap between a KPI's current value and its target where one is set (see "targets" below), and bring in general industry context only where it genuinely adds insight. Where years trading, employee count, or notable context below would change how a number should read (e.g. a ratio that's normal for a 1-year-old business but not a 20-year-old one, or a recent ownership change explaining a dip), factor it in — don't just restate it.
 2. Up to 2 "get better" items — efficiency/operational fixes tied to a CURRENT gap or underperforming metric (e.g. closing a margin gap, fixing cost classification, tightening a process) — each with a short title (≤6 words) and impact/difficulty/timeframe in ≤15 words total.
-3. Up to 2 growth opportunities — NEW, additive ideas (new services, pricing changes, marketing/customer acquisition, expansion, upsell) that are NOT about fixing something currently wrong — each with a short title (≤6 words) and impact/difficulty/timeframe in ≤15 words total. If "cash movement this period" below shows a real surplus with no clear use (no debt paydown, no reinvestment), that's a legitimate opportunity too (e.g. accelerate debt repayment, invest in equipment, build a buffer) — don't force one if the movement doesn't suggest it. Check "What the owner wants" below first: if posture is Consolidate or Hold wealth, don't suggest business-expansion ideas — reframe this slot toward efficiency, distributions, or tax/wealth extraction instead, since growing bigger isn't what this owner is asking for.
+3. Up to 2 growth opportunities — NEW, additive ideas (new services, pricing changes, marketing/customer acquisition, expansion, upsell) that are NOT about fixing something currently wrong — each with a short title (≤6 words) and impact/difficulty/timeframe in ≤15 words total. If "cash movement this period" below shows a real surplus with no clear use (no debt paydown, no reinvestment), that's a legitimate opportunity too (e.g. accelerate debt repayment, invest in equipment, build a buffer) — don't force one if the movement doesn't suggest it. Check "What the owner wants" below first: if posture is Consolidate or Hold wealth, don't suggest business-expansion ideas — reframe this slot toward efficiency, distributions, or tax/wealth extraction instead, since growing bigger isn't what this owner is asking for. For each, also give: "takes" — what actually doing this would require (≤12 words, e.g. "Two new hires and a 90-day ramp"); "risk" — the real downside if it doesn't work out (≤12 words, e.g. "Upfront hiring cost with no guaranteed pickup"); "decision" — the concrete choice facing the client, phrased as a question or a fork, not a restatement of the title (≤12 words, e.g. "Hire ahead of demand, or wait for signed contracts first?").
 4. Up to 2 tax planning opportunities — things worth the adviser reviewing WITH the client, grounded in this client's actual entity structure, profit level, and numbers below (e.g. timing of income/expenses or asset purchases before year-end, depreciation, super contributions, structure fit for the current profit level, use of losses) — each with a short title (≤6 words) and impact/difficulty/timeframe in ≤15 words total. These are prompts for a conversation, NOT advice to act on: phrase each title/impact as something to review, never as an instruction (e.g. "Review pre-year-end asset timing", not "Buy equipment now"). Skip entirely if nothing genuinely stands out — don't invent one to fill the quota.
 5. For each KPI listed below, ONE interpretation line under 12 words: state the given "value" EXACTLY AS WRITTEN — it's already formatted (e.g. "21.6%", "14d", "1.31x"), so copy it verbatim, never recalculate, reformat, or convert it yourself — and, if a trend is given, whether it's improving or worsening. If marked "estimated", add a 2-3 word reason in parentheses. Skip any KPI not listed — those are unavailable, don't invent a number for them.
 6. Separately, for these six KPIs specifically — GP margin, Net profit margin, Wages/sales, Debtor days, Creditor days, Inventory days — add a benchmark line under 10 words each, e.g. "Typically 40-55% for auto repair shops" (general knowledge, NOT a verified data source, using the client's actual industry and description, not a generic category). These six are industry-driven enough that a benchmark is meaningful — the rest of the KPIs (revenue growth, ROE, debt/equity, current ratio, operating cash conversion, effective tax rate) are capital-structure or lifecycle-dependent rather than industry-dependent, so never benchmark those. Only omit one of the six if you genuinely have no reasonable basis for this specific industry — don't guess vaguely just to fill it in.
-7. A growth trajectory commentary, UP TO 40 WORDS — given "Revenue/net profit history" below (oldest to newest), say plainly whether growth looks like it's accelerating, flattening, lumpy, or declining, and give ONE concrete recommendation for improving it, grounded in these actual numbers (not generic advice). If there's only one period of history, say there isn't enough history yet rather than inventing a trend from a single data point.
+7. A growth trajectory commentary, UP TO 40 WORDS — given "Revenue/net profit history" below (oldest to newest), say plainly whether growth looks like it's accelerating, flattening, lumpy, or declining. If something is genuinely holding it back, give ONE concrete recommendation for improving it, grounded in these actual numbers (not generic advice). If the trend is genuinely healthy and there's no real fix to push, say so plainly and name what's working — don't invent an improvement just to fill the slot; "keep doing what's working" is a legitimate answer, not a fallback. If there's only one period of history, say there isn't enough history yet rather than inventing a trend from a single data point.
+8. For EVERY KPI listed below (not just the six benchmarked ones), one plain verdict word — "good", "ok", or "bad" — on how favourably THIS value reads for THIS business. If a target is set for that KPI (see "targets" below), judge against how close the value is to it, not a blunt pass/fail (narrowly missing a tough target is "ok", not "bad"). For the six benchmarked KPIs (point 6): if no target is set, this verdict MUST be derived from the SAME benchmark range you wrote in point 6 for that KPI — "good" if the value sits at or beyond the healthy end of that range, "bad" if it sits meaningfully outside it, "ok" in between — never a separately-reasoned judgment that could disagree with your own stated range, since both are shown on the same card and a mismatch reads as a contradiction to the accountant. For every other KPI with no target, judge against realistic typical/industry expectations for this business's type and life stage — the same judgment call you're already making for the interpretation line in point 5. Reserve "bad" for a genuine concern, not merely below-average. If you have no defensible basis to judge a KPI at all (e.g. debt/equity or effective tax rate for a business with no clear norm to compare against), use "ok" rather than guessing at "good" or "bad".
+9. A "brief_summary" for each of financial, growth, owner — ONE sentence, UNDER 25 WORDS, the single thing an adviser would actually say out loud to open that part of a client meeting. This is a distinct, shorter synthesis from the main diagnosis in point 1 — not a truncation of it. "financial" covers profit/cash/tax together (lead with cash or tax specifically if either is the more pressing story this period, not just margin). "growth" names the most promising live opportunity, if any, or says plainly there isn't one worth raising. "owner" connects the business's trajectory to the owner's stated goal/posture (see "What the owner wants" below) — e.g. progress toward or away from their target, not a restatement of the valuation number alone. (Risk gets its own summary elsewhere, from the actual risk register — not asked for here, since this call has no visibility into individual risk items, only financial flags.)
 
-Respond ONLY as JSON, no markdown fences: {"diagnosis": "...", "get_better": [{"title":"","impact":"","difficulty":"","timeframe":""}], "opportunities": [{"title":"","impact":"","difficulty":"","timeframe":""}], "tax_planning": [{"title":"","impact":"","difficulty":"","timeframe":""}], "kpi_interpretations": {"<kpi_key>": "..."}, "kpi_benchmarks": {"<kpi_key>": "..."}, "growth_trajectory_commentary": "..."}`;
+Respond ONLY as JSON, no markdown fences: {"diagnosis": "...", "get_better": [{"title":"","impact":"","difficulty":"","timeframe":""}], "opportunities": [{"title":"","impact":"","difficulty":"","timeframe":"","takes":"","risk":"","decision":""}], "tax_planning": [{"title":"","impact":"","difficulty":"","timeframe":""}], "kpi_interpretations": {"<kpi_key>": "..."}, "kpi_benchmarks": {"<kpi_key>": "..."}, "kpi_verdicts": {"<kpi_key>": "good|ok|bad"}, "growth_trajectory_commentary": "...", "brief_summary": {"financial":"","growth":"","owner":""}}`;
 
     const clientData = `Client: ${context?.business_description || 'no description'} (${context?.industry}), entity structure: ${context?.entity_type || 'not set'}
 Years trading: ${context?.profile_extra?.years_trading ?? 'not set'}
@@ -545,6 +872,7 @@ Notable context (family situation, ownership history, anything else worth knowin
 Key contact's role: ${context?.profile_extra?.key_contact_role || 'not set'} — matters for tone: advice for the Owner reads differently than advice being relayed through a Manager who isn't one.
 What the owner wants (major goal / current posture / stated horizon in years): ${context?.profile_extra?.major_goal || 'not set'} / ${context?.profile_extra?.posture || 'not set'} / ${context?.profile_extra?.goal_horizon_years ?? 'not set'}
 Cadence: ${context?.cadence}
+Tax structure split (only applies to Sole trader/Partnership/Trust, which pay no tax at the entity level themselves — for these entity types, tax_expense is normal/expected to be blank, not a data gap): ${taxSplitSummary || 'not saved — no per-partner/beneficiary breakdown available, so no combined personal tax estimate exists for this period'}
 Ratios: ${JSON.stringify(ratios)}
 Flags fired: ${JSON.stringify(flags)}
 Pillar scores: ${JSON.stringify(scores)}
@@ -576,12 +904,15 @@ KPIs available this period: ${JSON.stringify(availableKpis.map((k) => ({
 
     const kpiInterpretations = parsed.kpi_interpretations || {};
     const kpiBenchmarks = parsed.kpi_benchmarks || {};
-    // Reuses the diagnostics table (pillar = kpi key, or 'benchmark_<kpi key>' for
-    // the separate AI-estimated benchmark line) rather than new tables/columns —
-    // one row per KPI per period, same shape as the existing pillar='overall' row.
+    const kpiVerdicts = parsed.kpi_verdicts || {};
+    // Reuses the diagnostics table (pillar = kpi key, or 'benchmark_<kpi key>'/
+    // 'verdict_<kpi key>' for the separate AI-estimated benchmark/verdict lines)
+    // rather than new tables/columns — one row per KPI per period, same shape
+    // as the existing pillar='overall' row.
     const kpiDiagnosticRows = [
       ...availableKpis.filter((k) => kpiInterpretations[k.key]).map((k) => ({ client_id, period_end, pillar: k.key, cause_text: kpiInterpretations[k.key] })),
       ...availableKpis.filter((k) => kpiBenchmarks[k.key]).map((k) => ({ client_id, period_end, pillar: `benchmark_${k.key}`, cause_text: kpiBenchmarks[k.key] })),
+      ...availableKpis.filter((k) => ['good', 'ok', 'bad'].includes(kpiVerdicts[k.key])).map((k) => ({ client_id, period_end, pillar: `verdict_${k.key}`, cause_text: kpiVerdicts[k.key] })),
     ];
 
     // flags/pillar_scores/recommendations/diagnostics have no uniqueness constraint on
@@ -596,14 +927,25 @@ KPIs available this period: ${JSON.stringify(availableKpis.map((k) => ({
 
     await Promise.all([
       supabase.from('flags').insert(flags.map((f) => ({ ...f, client_id, period_end }))),
-      supabase.from('pillar_scores').insert(scores.map((s) => ({ ...s, client_id, period_end }))),
-      supabase.from('health_scores').upsert({ client_id, period_end, score: healthScore, active_pillar_count: scores.length }, { onConflict: 'client_id,period_end' }),
+      ...(scores.length ? [supabase.from('pillar_scores').insert(scores.map((s) => ({ ...s, client_id, period_end })))] : []),
+      // Nothing scorable (e.g. an empty period) — drop any earlier health
+      // score for this period rather than leave a stale one showing.
+      healthScore != null
+        ? supabase.from('health_scores').upsert({ client_id, period_end, score: healthScore, active_pillar_count: scores.length }, { onConflict: 'client_id,period_end' })
+        : supabase.from('health_scores').delete().eq('client_id', client_id).eq('period_end', period_end),
       supabase.from('diagnostics').insert({ client_id, period_end, pillar: 'overall', cause_text: parsed.diagnosis }),
       ...(parsed.growth_trajectory_commentary ? [supabase.from('diagnostics').insert({ client_id, period_end, pillar: 'growth_trajectory', cause_text: parsed.growth_trajectory_commentary })] : []),
       ...(kpiDiagnosticRows.length ? [supabase.from('diagnostics').insert(kpiDiagnosticRows)] : []),
+      // One-sentence "so what" per domain, distinct from the fuller diagnosis
+      // above — feeds the Meeting brief cards and Overview's digest (see
+      // meeting-intelligence-build-spec.md §3/§1). Reuses the diagnostics
+      // table, pillar='brief_<domain>', same convention as benchmark_/verdict_.
+      ...(parsed.brief_summary ? [supabase.from('diagnostics').insert(
+        Object.entries(parsed.brief_summary).filter(([, text]) => text).map(([domain, text]) => ({ client_id, period_end, pillar: `brief_${domain}`, cause_text: text }))
+      )] : []),
       supabase.from('recommendations').insert([
         ...(parsed.get_better || []).map((o) => ({ client_id, period_end, type: 'get_better', title: o.title, impact: o.impact, difficulty: o.difficulty, timeframe: o.timeframe })),
-        ...(parsed.opportunities || []).map((o) => ({ client_id, period_end, type: 'growth', title: o.title, impact: o.impact, difficulty: o.difficulty, timeframe: o.timeframe })),
+        ...(parsed.opportunities || []).map((o) => ({ client_id, period_end, type: 'growth', title: o.title, impact: o.impact, difficulty: o.difficulty, timeframe: o.timeframe, takes: o.takes || null, risk: o.risk || null, decision: o.decision || null })),
         ...(parsed.tax_planning || []).map((o) => ({ client_id, period_end, type: 'tax_planning', title: o.title, impact: o.impact, difficulty: o.difficulty, timeframe: o.timeframe })),
       ]),
     ]);
@@ -614,18 +956,30 @@ KPIs available this period: ${JSON.stringify(availableKpis.map((k) => ({
     // Non-fatal: an issue here must never take down analysis itself.
     try {
       await syncFinancialRiskItems(supabase, {
-        clientId: client_id, periodEnd: period_end,
-        previousPeriodEnd: priorFs?.period_end || null,
-        flags,
+        clientId: client_id, periodEnd: period_end, flags,
       });
     } catch (err) {
       console.error('Financial risk sync failed:', err.message);
     }
 
-    const kpisWithInterpretation = kpis.map((k) => ({ ...k, interpretation: kpiInterpretations[k.key] || null, benchmark: kpiBenchmarks[k.key] || null }));
+    const kpisWithInterpretation = kpis.map((k) => ({ ...k, interpretation: kpiInterpretations[k.key] || null, benchmark: kpiBenchmarks[k.key] || null, verdict: ['good', 'ok', 'bad'].includes(kpiVerdicts[k.key]) ? kpiVerdicts[k.key] : null }));
 
     return { statusCode: 200, body: JSON.stringify({ ratios, flags, scores, healthScore, kpis: kpisWithInterpretation, ...parsed }) };
   } catch (err) {
+    // This return body is never delivered anywhere — a background
+    // function's caller already got its 202 the moment this invocation
+    // started. The diagnostics row below is what actually reaches the
+    // frontend: the run-analysis-btn poll checks for a fresh
+    // 'analysis_error' row the same way it checks for a fresh 'overall'
+    // one, so a genuine failure (bad API response, Supabase error, etc.)
+    // still surfaces as an error instead of silently reading as "still
+    // analyzing" forever.
+    console.error('Analysis failed:', err.message);
+    try {
+      await supabase.from('diagnostics').insert({ client_id, period_end, pillar: 'analysis_error', cause_text: err.message });
+    } catch (writeErr) {
+      console.error('Failed to record analysis_error marker:', writeErr.message);
+    }
     return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
   }
 };

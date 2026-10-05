@@ -3,16 +3,34 @@
 // Financial Risk Sync (Source A of Risk Review)
 // ------------------------------------------------------------------
 // Takes the output of analyze.js's runFlags() and writes it into the
-// shared risk_items table alongside business/industry risks, so the
-// dashboard can roll up all three sources into one view.
+// shared risk_items table alongside business/industry/owner_wealth risks,
+// so the dashboard can roll up all sources into one view.
+//
+// PERSISTENT, not period-scoped — same model as owner-wealth-risk-sync.js
+// (which itself was converted from an earlier period-rebuilt design for
+// the same reason). At most one row per (client_id, risk_name) exists at
+// a time for this source: an existing row is updated in place (review
+// status preserved) when the same risk_category keeps firing, a brand new
+// risk_category gets a fresh row (still generated every run — persistence
+// doesn't mean nothing new ever appears), and a risk_category that stops
+// firing gets auto-resolved to 'Managed' rather than deleted, so the
+// history isn't lost. Deleting a row via the UI (see index.html's
+// .risk-delete-btn) removes the reviewable risk_items row, but NOT the
+// underlying period-by-period record of when this actually fired — that
+// lives separately in the `flags` table (period-scoped, untouched by any
+// of this, rewritten fresh every analyze.js run), which is the genuine
+// "was this true in period X" history. risk_items is the human-facing,
+// currently-being-tracked layer on top of it, not the history itself.
 //
 // Also handles the thing a raw flag list can't do on its own:
-//   - is_new       — this flag didn't exist last period
-//   - is_changed   — severity changed since last period
-//   - auto-resolve — a flag that existed last period but isn't firing
-//                    this period gets marked Managed, not deleted, so
-//                    the history isn't lost (e.g. "Cash-flow risk —
-//                    resolved, last seen Q2 2026")
+//   - is_new       — this risk_category has never had a row before
+//   - is_changed   — severity changed since the existing row was last written
+//   - auto-resolve — a risk that was active but isn't firing this run gets
+//                    marked Managed, not deleted (e.g. "Cash-flow risk —
+//                    resolved")
+//   - status carry-forward — Confirm/Investigate/Not applicable survives
+//                    every re-run (same period, next period, whenever),
+//                    instead of resetting back to Detected
 //
 // Same lib/ placement as industry-risk-checklist.js — not a Netlify
 // function itself, just required from analyze.js.
@@ -65,77 +83,73 @@ function normalizeFlag(flag) {
   };
 }
 
-// Main entry point. Call this once per period, right after runFlags() has
-// run for a client — see analyze.js's handler.
-//
-// previousPeriodEnd is optional — pass it if you have the prior period's
-// period_end (analyze.js already fetches priorFs for the ratio comparisons,
-// so priorFs?.period_end is free). If omitted, everything is written as
-// is_new = true and nothing gets auto-resolved.
-//
-// Deletes and re-inserts THIS period's financial risk_items before writing
-// — analyze.js's "Run analysis" can be re-run for the same period any time
-// (see the flags/pillar_scores/etc. delete-then-insert a few lines up in
-// the handler), and without this guard every re-run would pile up
-// duplicate rows on top of the old ones.
-async function syncFinancialRiskItems(supabase, { clientId, periodEnd, previousPeriodEnd, flags }) {
+// Review status carries forward when an active row already exists —
+// 'Detected' is excluded since it's every fresh row's own default
+// (carrying it forward would be a no-op), and 'Managed' is excluded
+// because if the same risk_category is firing again despite being marked
+// resolved, that past call was apparently wrong or temporary and deserves
+// a fresh Detected look, not to stay silently hidden.
+const CARRY_FORWARD_STATUSES = new Set(['Identified', 'Watch', 'Not applicable']);
+
+// Main entry point. Call this once per analysis run, right after
+// runFlags() has run for a client — see analyze.js's handler. periodEnd is
+// recorded on each row as "last touched in this period" (informational —
+// see read-data.js's get_risk_items, which no longer filters financial by
+// period, same as business/industry/owner_wealth) but no longer drives
+// which rows exist; risk_name does.
+async function syncFinancialRiskItems(supabase, { clientId, periodEnd, flags }) {
   const normalized = flags.map(normalizeFlag);
 
-  let previousRows = [];
-  if (previousPeriodEnd) {
-    const { data } = await supabase
-      .from('risk_items')
-      .select('risk_name, severity, status')
-      .eq('client_id', clientId)
-      .eq('period_end', previousPeriodEnd)
-      .eq('source', 'financial');
-    previousRows = data || [];
-  }
-  const previousByName = Object.fromEntries(previousRows.map((r) => [r.risk_name, r]));
-
-  const { error: delError } = await supabase
-    .from('risk_items')
-    .delete()
-    .eq('client_id', clientId)
-    .eq('period_end', periodEnd)
-    .eq('source', 'financial');
-  if (delError) throw delError;
+  // Existing state for this client — read once, up front, so this run's
+  // active flags can be diffed against it below (update-in-place vs
+  // insert vs auto-resolve), instead of wiping everything and rebuilding.
+  const { data: existingRows, error: fetchError } = await supabase
+    .from('risk_items').select('id, risk_name, status, severity')
+    .eq('client_id', clientId).eq('source', 'financial');
+  if (fetchError) throw fetchError;
+  const existingByName = Object.fromEntries((existingRows || []).map((r) => [r.risk_name, r]));
 
   const today = new Date().toISOString().slice(0, 10);
+  const ids = [];
 
-  // This period's active flags.
-  const activeRows = normalized.map((flag) => {
-    const prevRow = previousByName[flag.riskName];
-    return {
+  // Active this run: update the existing row in place (content refreshed,
+  // review status preserved if it was Identified/Watch/Not applicable) or
+  // insert new (fresh, so status defaults to Detected).
+  for (const flag of normalized) {
+    const existing = existingByName[flag.riskName];
+    const payload = {
       client_id: clientId, period_end: periodEnd, source: 'financial',
       category: flag.category, risk_name: flag.riskName, detail: flag.detail,
-      status: 'Detected', severity: flag.severity, impact_estimate: flag.impactEstimate,
-      is_new: !prevRow, is_changed: !!prevRow && prevRow.severity !== flag.severity,
+      severity: flag.severity, impact_estimate: flag.impactEstimate,
+      is_new: !existing, is_changed: !!existing && existing.severity !== flag.severity,
       last_reviewed_date: today,
     };
-  });
+    if (existing) {
+      const status = CARRY_FORWARD_STATUSES.has(existing.status) ? existing.status : 'Detected';
+      const { error } = await supabase.from('risk_items').update({ ...payload, status }).eq('id', existing.id);
+      if (error) throw error;
+      ids.push(existing.id);
+    } else {
+      const { data, error } = await supabase.from('risk_items').insert({ ...payload, status: 'Detected' }).select('id').single();
+      if (error) throw error;
+      ids.push(data.id);
+    }
+  }
 
-  // Auto-resolve: anything flagged last period but not present this period
-  // gets carried forward as Managed, not silently dropped. Skips rows
-  // already Managed last period so a long-resolved risk doesn't keep
-  // re-appearing every subsequent period.
+  // No longer firing: auto-resolve rather than delete, so the history
+  // isn't lost. Skipped once already Managed so a long-resolved risk
+  // doesn't get its last_reviewed_date bumped every single run.
   const activeNames = new Set(normalized.map((f) => f.riskName));
-  const resolvedRows = previousRows
-    .filter((r) => !activeNames.has(r.risk_name) && r.status !== 'Managed')
-    .map((r) => ({
-      client_id: clientId, period_end: periodEnd, source: 'financial',
-      category: mapCategoryFromRiskName(r.risk_name), risk_name: r.risk_name,
-      detail: 'Resolved — no longer detected as of this period',
-      status: 'Managed', severity: r.severity, is_new: false, is_changed: true,
-      last_reviewed_date: today,
-    }));
+  for (const [riskName, existing] of Object.entries(existingByName)) {
+    if (activeNames.has(riskName)) continue;
+    if (existing.status === 'Managed') continue;
+    const { error } = await supabase.from('risk_items')
+      .update({ status: 'Managed', detail: 'Resolved — no longer detected as of the latest analysis.', last_reviewed_date: today })
+      .eq('id', existing.id);
+    if (error) throw error;
+  }
 
-  const rows = [...activeRows, ...resolvedRows];
-  if (!rows.length) return [];
-
-  const { data, error } = await supabase.from('risk_items').insert(rows).select('id');
-  if (error) throw error;
-  return (data || []).map((r) => r.id);
+  return ids;
 }
 
 module.exports = {

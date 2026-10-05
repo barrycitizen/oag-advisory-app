@@ -1,0 +1,20 @@
+-- Persists the partner/beneficiary split (or single Sole trader/Company
+-- income adjustment) typed into the Current tax position card's estimate
+-- panel — previously pure browser state (index.html's taxPositionCompareState)
+-- that reset on reload and was invisible to the server, so the Tax pillar
+-- score and AI diagnosis could only ever fall back to a "concentrated in one
+-- person" proxy (see analyze-background.js's scoreTaxFromAnnualFigures) even
+-- when the adviser had already worked out the real split with the client.
+--
+-- One JSON blob per period, same shape as taxPositionCompareState:
+-- { shares: [number|null, ...], otherIncome: [number|null, ...], profitAdjustment: number|null }
+-- Sole trader/Company use only shares[0]/otherIncome[0] (fixed 100% share);
+-- Partnership/Trust use up to 4 entries. Null/absent = nothing saved yet,
+-- same "estimate off net profit alone" fallback as before applies.
+--
+-- Deliberately NOT auto-saved as the adviser types (see the card's own
+-- "Save this split" button) — this is an assumption being recorded, not an
+-- actual fact, and autosaving half-finished trial numbers into what the
+-- score/AI reads would blur that line the same way overwriting an actual
+-- with a scenario figure would.
+alter table financial_snapshots add column if not exists tax_structure_split jsonb;

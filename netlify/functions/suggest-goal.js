@@ -12,7 +12,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 
 const CATEGORY_LABELS = {
   personal: 'Personal', business: 'Business', income: 'Income',
-  lifestyle: 'Lifestyle', exit_succession: 'Exit & Succession',
+  wealth: 'Wealth', exit_succession: 'Exit & Succession',
 };
 
 exports.handler = async (event) => {

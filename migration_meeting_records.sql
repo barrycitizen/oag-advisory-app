@@ -1,0 +1,18 @@
+-- Meeting Mode records — until now, a meeting's brief (which priorities got
+-- scored, the Decision/Action captured for each, current step, completed
+-- status) lived ONLY in the browser's localStorage. That meant an
+-- in-progress meeting didn't exist on any other device, a cleared cache
+-- silently destroyed it, and even a *finished* meeting's Report-tab summary
+-- was one cache-clear away from gone. Every other part of this app is
+-- Supabase-backed; this brings Meeting Mode in line with that instead of
+-- leaving it as the one thing that quietly isn't.
+--
+-- `client_context.meeting_records` is keyed by period_end, one entry per
+-- period, holding the same shape the localStorage brief already used
+-- (created_at, currentStep, priorities[], currentIndex, completed,
+-- actionsPushedCount, prioritiesPushed). localStorage stays in place as a
+-- fast local cache (written first, so the UI never waits on a network
+-- round-trip), but this column is now the durable source of truth —
+-- resuming a meeting or reading a finished one falls back here whenever the
+-- local cache is empty (different device, cleared cache, etc).
+alter table client_context add column if not exists meeting_records jsonb default '{}'::jsonb;

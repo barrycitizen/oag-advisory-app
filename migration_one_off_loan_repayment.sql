@@ -1,0 +1,14 @@
+-- A loan balance's movement (see the Borrowings tile in "Where did the cash
+-- go?") already fully captures the NET effect of every repayment made this
+-- period, regular or one-off — a balance doesn't record why it moved, only
+-- by how much, so nothing about the reconciliation total was ever missing.
+--
+-- loan_repayments is entered as the regular/scheduled amount only; this
+-- field is the unplanned/early extra repayment ON TOP of that, the same
+-- way one-off income/expense already works on Cash outlook and Tax
+-- outlook. The reconciliation totals the two together
+-- (recon-loan_repayments + recon-one_off_loan_repayment, see index.html
+-- and read-data.js's buildCashReconciliation) to get the full amount
+-- repaid this period — additive, not a breakout of a figure already
+-- counted once.
+alter table financial_snapshots add column if not exists one_off_loan_repayment numeric;

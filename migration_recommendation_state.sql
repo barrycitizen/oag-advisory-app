@@ -1,0 +1,19 @@
+-- Per-period dismiss/suggested-target state for the various "recommendation"
+-- surfaces scattered around the app (Financial Performance's flags, each
+-- KPI card's improvement tip, Diagnose's Get better/Tax planning items,
+-- Growth's Opportunities) — none of these have a real database id of their
+-- own since they're derived fresh from that period's diagnostics/kpi_report
+-- each time, so the caller builds a stable opaque `rec_id` instead (a flag's
+-- own message text, a KPI's key, a recommendation's title — see the
+-- `flag:`/`kpitip:`/`rec:` prefixes used in index.html).
+--
+-- Two things this fixes: (1) clicking "suggest target" on a flag ran a
+-- fresh AI call with nothing saved, so navigating away and back lost the
+-- suggestion and re-clicking could return a different one; (2) there was no
+-- way to say "not worth acting on" for a flag/tip/recommendation short of
+-- ignoring it forever — Risk items already have exactly this via their own
+-- status workflow, this brings the same idea to everything else.
+--
+-- `client_context.recommendation_state` is keyed by period_end, one entry
+-- per period: { dismissed: { [rec_id]: true }, suggestedTargets: { [rec_id]: text } }.
+alter table client_context add column if not exists recommendation_state jsonb default '{}'::jsonb;

@@ -1,0 +1,24 @@
+-- The capex estimate (fixed_assets movement + depreciation) was landing
+-- thousands off a real client's own fixed asset schedule — traced to two
+-- missing inputs, both genuine, independent facts a schedule can carry that
+-- fixed_assets + depreciation_amortisation alone can't reconstruct:
+--
+-- capital_works_deduction — leasehold/structural improvements amortise on
+-- their own P&L line on most schedules, separate from plant & equipment
+-- depreciation. Without it, that amortisation either gets missed entirely
+-- or silently misread as new capex (both happened while working this case
+-- out) instead of being added back the same way depreciation is.
+--
+-- nbv_assets_sold — net book value of anything disposed of this period. A
+-- disposal removes value from fixed_assets for a reason that's neither a
+-- purchase nor depreciation; without adding it back, the estimate
+-- understates capex by exactly that amount. It's easy to mistake "the
+-- disposed asset was already fully written down" (net book value $0) for
+-- "disposals don't matter here" — they do, this field is just $0 in that
+-- particular case, not always.
+--
+-- Both optional, both default to having no effect (treated as 0) when left
+-- blank — existing snapshots and clients who don't need this precision are
+-- unaffected.
+alter table financial_snapshots add column if not exists capital_works_deduction numeric;
+alter table financial_snapshots add column if not exists nbv_assets_sold numeric;

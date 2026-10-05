@@ -1,0 +1,15 @@
+-- Persists the Growth outlook "model a scenario" card's assumptions
+-- (index.html's growthOutlookState) — previously pure browser state that
+-- reset on every page reload, even though the adviser might have spent real
+-- time dialling in a scenario during a client meeting.
+--
+-- One JSON blob per period: { unit, revenue, cogs, gpMarginChange, wages,
+-- opex, otherIncome, netProfit } — same shape as growthOutlookState. Null
+-- means no scenario saved (back to nil), same convention as
+-- tax_structure_split above it.
+--
+-- Auto-saved as the adviser types (debounced), unlike tax_structure_split —
+-- this never feeds the Tax pillar score or AI diagnosis the way that split
+-- does, it's purely a what-if display, so there's no real-vs-scenario data
+-- to blur by saving early.
+alter table financial_snapshots add column if not exists growth_outlook_scenario jsonb;

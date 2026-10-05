@@ -1,0 +1,23 @@
+-- Trading divisions — lets a client optionally split revenue/cogs/wages/
+-- operating_expenses/debtors/creditors across multiple trading divisions
+-- (e.g. two shops under one legal entity), so GP margin, revenue growth,
+-- wages %, debtor days and creditor days can be computed per division
+-- instead of blended. Everything else (cash, assets, liabilities, equity,
+-- tax, etc.) stays entity-level, unsplit — a typical multi-division
+-- business shares one bank account, one tax return, one balance sheet.
+--
+-- `client_context.divisions` is the master switch: a client's fixed list of
+-- named divisions, [{id, name}], managed once via Profile. Empty/null =
+-- this client behaves exactly as before, no new UI anywhere.
+--
+-- `financial_snapshots.division_breakdown` carries one period's actual
+-- figures per division: [{division_id, revenue, cogs, wages,
+-- operating_expenses, debtors, creditors, gross_profit}]. The entity-level
+-- revenue/cogs/wages/operating_expenses/debtors/creditors columns on that
+-- same row are always the server-computed sum of this breakdown when it's
+-- present — never entered independently — so the rest of the app (flags,
+-- pillar scoring, Growth, Risk, Report, Meeting Mode, the existing
+-- entity-level KPI cards) keeps working unchanged, reading correct totals
+-- with zero awareness that divisions exist.
+alter table client_context add column if not exists divisions jsonb;
+alter table financial_snapshots add column if not exists division_breakdown jsonb;

@@ -1,13 +1,19 @@
 // netlify/functions/pdf-extract.js
 const FIELD_LIST = [
   'revenue', 'cogs', 'operating_expenses', 'other_income', 'other_expenses',
-  'interest_expense', 'depreciation_amortisation', 'net_profit', 'wages',
+  'interest_expense', 'depreciation_amortisation', 'capital_works_deduction', 'net_profit', 'wages',
   'debtors', 'creditors', 'cash', 'current_assets', 'current_liabilities',
   'total_assets', 'total_liabilities', 'total_debt', 'equity', 'inventory', 'fixed_assets',
   'operating_cash_flow', 'tax_expense',
   'owner_drawings', 'funds_introduced', 'director_loan_balance',
-  'loan_repayments', 'equipment_purchases',
+  'loan_repayments', 'one_off_loan_repayment', 'new_borrowing', 'interest_capitalised', 'equipment_purchases', 'nbv_assets_sold',
 ];
+
+// The subset of FIELD_LIST a document can plausibly report broken out by
+// division/business unit — mirrors DIVISION_TRADING_FIELDS in
+// manual-entry.js (kept as its own copy, same "per-file independence"
+// convention already used throughout this codebase, not shared code).
+const DIVISION_FIELD_LIST = ['revenue', 'cogs', 'wages', 'operating_expenses', 'debtors', 'creditors', 'inventory'];
 
 exports.handler = async (event) => {
   try {
@@ -33,6 +39,7 @@ Field meanings:
 - other_expenses: non-operating/other expenses not already covered by operating_expenses, interest, or depreciation
 - interest_expense: interest paid on loans/borrowings
 - depreciation_amortisation: depreciation and amortisation expense
+- capital_works_deduction: amortisation of leasehold or structural/building improvements specifically — look for it as its OWN line in the P&L/income statement first (e.g. "Amortisation of leasehold improvements", "Capital works deduction"), the same place depreciation_amortisation comes from; a fixed asset schedule may also show it broken out from plant & equipment depreciation if the P&L doesn't separate it — enter as a positive number, and only if it's genuinely reported apart from depreciation_amortisation (don't split a single combined figure yourself)
 - net_profit: profit/loss BEFORE tax is deducted (i.e. "Profit before tax" / "Net profit before tax" — not the after-tax bottom line). If the statement shows both a pre-tax and post-tax figure, use the pre-tax one.
 - wages: wages and salaries expense
 - debtors: accounts receivable / trade debtors
@@ -50,16 +57,65 @@ Field meanings:
 - tax_expense: income tax expense/provision for the period
 - owner_drawings: cash withdrawn by the owner/shareholder for personal use this period (often in a statement of changes in equity, or an equity/drawings account note) — enter as a positive number
 - funds_introduced: cash contributed/injected by the owner/shareholder this period (capital introduced) — enter as a positive number
-- director_loan_balance: the CLOSING BALANCE of the director's/shareholder's loan account at this period end (a balance, not a movement) — positive if the business owes the director money, from a related-party loan note or the balance sheet
-- loan_repayments: principal repaid on loans/borrowings this period (from a cash flow statement's financing section, or loan statement) — enter as a positive number, interest is separate (see interest_expense)
+- director_loan_balance: the CLOSING BALANCE of the director's/shareholder's loan account at this period end (a balance, not a movement), from a related-party loan note or the balance sheet — enter as POSITIVE if the business owes the director money (a liability), or NEGATIVE if it's a receivable, i.e. the director/shareholder owes the business instead (check which side of the balance sheet — liabilities vs assets — the line actually sits on, don't assume)
+- loan_repayments: REGULAR/scheduled principal repaid on loans/borrowings this period (from a cash flow statement's financing section, or loan statement) — enter as a positive number, interest is separate (see interest_expense). If the document calls out a one-off/extra repayment separately (see one_off_loan_repayment below), exclude that amount from this figure — this is the regular schedule only, not the combined total.
+- one_off_loan_repayment: if the document explicitly calls out an unplanned, early, or lump-sum extra loan repayment as distinct from the regular scheduled repayments (e.g. a note saying a loan was paid out early, or an "extra repayment" line), enter that amount here — it's IN ADDITION to loan_repayments above, not a portion already counted within it. Leave blank/not_found if the document doesn't distinguish one from the regular schedule, or reports only one combined repayments figure (in which case put the whole thing in loan_repayments instead).
+- new_borrowing: new debt drawn down this period (e.g. "proceeds from borrowings" in a cash flow statement's financing section, or a new loan drawdown noted on a loan statement) — enter as a positive number. Leave blank/not_found if the document doesn't disclose this separately from the loan balance movement; don't calculate it yourself from other figures.
+- interest_capitalised: if a loan statement explicitly shows interest being added to/capitalised onto the loan balance (rather than paid separately in cash) — common on redraw, interest-only, or line-of-credit facilities — enter that amount here. This is a portion of interest_expense above, not an amount in addition to it. Leave blank/not_found if the document doesn't say interest was capitalised, or reports only one combined interest figure; don't infer or calculate this from the loan balance movement yourself.
 - equipment_purchases: cash spent on equipment, vehicles, or other fixed assets this period (capex, often in a cash flow statement's investing section, or fixed asset additions in the notes) — enter as a positive number
+- nbv_assets_sold: the net book value (cost less accumulated depreciation, NOT the original cost) of any fixed assets disposed of/sold during this period — usually in a fixed asset schedule's disposals column, or derivable there if cost and accumulated depreciation for the disposed item are both shown — enter as a positive number, or 0 if nothing was disposed of and the document is explicit about that
 
 Most financial statements show a COMPARATIVE column (this period vs. the same period last year/last quarter). If one is present, ALSO extract that comparative column's figures separately, and state which period_end it represents (as an actual YYYY-MM-DD date if the document states or clearly implies one, otherwise your best label like "prior year" if you can't pin down an exact date). If there is no comparative column, omit "comparative" entirely — don't invent one.
 
-Respond ONLY as JSON, no other text: {"values": {"revenue": 0, ...}, "not_found": ["field names you could not locate"], "notes": "anything ambiguous or worth a human double-checking, e.g. two possible figures for the same line item", "comparative": {"period_end": "YYYY-MM-DD or a label if no exact date is stated", "values": {...}, "not_found": [...]}}
+If a field genuinely isn't in the document, put it in not_found rather than guessing a number. If the document requires combining multiple divisions/entities into one set of figures (e.g. two P&Ls for one legal entity), do that arithmetic and report the combined totals in "values" as usual — but ALSO report each division's own ${DIVISION_FIELD_LIST.join(', ')} separately in "divisions" (one entry per division, named as the document names it, only the fields that division's own P&L actually shows). Don't narrate the working in prose either way. If the document is for a single business with no division/segment breakdown, omit "divisions" entirely — most documents are this case. Report your findings by calling the extract_financials tool exactly once. Keep "notes" to one short sentence, or omit it if nothing's ambiguous — it's a flag for a human to double-check something, not a summary of your reasoning.`;
 
-If a field genuinely isn't in the document, put it in not_found rather than guessing a number.`;
+    // A field-name → {type:'number'} map, reused for both the current period's
+    // and the comparative period's "values" shape in the tool schema below.
+    const valueProps = Object.fromEntries(FIELD_LIST.map((f) => [f, { type: 'number' }]));
+    const divisionValueProps = Object.fromEntries(DIVISION_FIELD_LIST.map((f) => [f, { type: 'number' }]));
+    const tool = {
+      name: 'extract_financials',
+      description: 'Report the financial figures extracted from the document.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          values: { type: 'object', properties: valueProps, description: 'Extracted figures for the main/current period — only fields actually found' },
+          not_found: { type: 'array', items: { type: 'string' }, description: 'Field names from the requested list that are not present in the document' },
+          notes: { type: 'string', description: 'One short sentence flagging anything ambiguous, or omit entirely if nothing is' },
+          // Named exactly as the document names each division/business unit —
+          // matching against this app's own configured division names (if any)
+          // happens client-side during review, not here, so this function stays
+          // stateless (no client_id-specific lookups) and fast.
+          divisions: {
+            type: 'array',
+            description: 'One entry per division/business unit, only if the document actually breaks figures out this way — omit entirely for a single-business document',
+            items: {
+              type: 'object',
+              properties: { name: { type: 'string' }, ...divisionValueProps },
+              required: ['name'],
+            },
+          },
+          comparative: {
+            type: 'object',
+            description: 'The comparative/prior column, if the document shows one',
+            properties: {
+              period_end: { type: 'string', description: 'YYYY-MM-DD if stated/clearly implied, otherwise a best-effort label like "prior year"' },
+              values: { type: 'object', properties: valueProps },
+              not_found: { type: 'array', items: { type: 'string' } },
+            },
+          },
+        },
+        required: ['values'],
+      },
+    };
 
+    // Forcing a tool call (rather than asking for JSON in free text) means the
+    // API hands back already-structured, already-parsed input — no more regex-
+    // stripping code fences off raw text and hoping nothing else is around it.
+    // On a document complex enough to need real reasoning (e.g. consolidating
+    // multiple divisions), free-text responses were opening with several
+    // paragraphs of prose before the JSON, which both broke the old parser and
+    // burned enough output time to trip the platform's function timeout.
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -71,6 +127,8 @@ If a field genuinely isn't in the document, put it in not_found rather than gues
         model: 'claude-sonnet-4-6',
         max_tokens: 2200,
         system: [{ type: 'text', text: systemInstructions, cache_control: { type: 'ephemeral' } }],
+        tools: [tool],
+        tool_choice: { type: 'tool', name: 'extract_financials' },
         messages: [{
           role: 'user',
           content: [
@@ -80,8 +138,10 @@ If a field genuinely isn't in the document, put it in not_found rather than gues
       }),
     });
     const data = await res.json();
-    const rawText = data.content?.[0]?.text || '{}';
-    const parsed = JSON.parse(rawText.replace(/```json|```/g, '').trim());
+    if (data.error) throw new Error(data.error.message || 'Claude API error');
+    const toolBlock = (data.content || []).find((b) => b.type === 'tool_use');
+    if (!toolBlock) throw new Error('Claude did not return structured data for this document.');
+    const parsed = toolBlock.input || {};
 
     return {
       statusCode: 200,
@@ -92,6 +152,7 @@ If a field genuinely isn't in the document, put it in not_found rather than gues
         extracted: parsed.values || {},
         not_found: parsed.not_found || [],
         notes: parsed.notes || null,
+        divisions: parsed.divisions || [],
         review_required: true,
         comparative: parsed.comparative ? {
           period_end: parsed.comparative.period_end || null,

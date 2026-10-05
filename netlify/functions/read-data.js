@@ -28,6 +28,19 @@ exports.handler = async (event) => {
       return { statusCode: 200, body: JSON.stringify(data) };
     }
 
+    // Global (not client-scoped) — the same national tax brackets/Medicare
+    // levy/super cap apply to every client in a given FY. Degrades to an
+    // empty object rather than throwing if migration_tax_rates_by_fy.sql
+    // hasn't been applied yet — index.html's own hardcoded seed entry covers
+    // that case, same "don't break the app over an unmigrated table" posture
+    // as list_clients' is_archived fallback above.
+    if (action === 'get_tax_rates_by_fy') {
+      const { data, error } = await supabase.from('tax_rates_by_fy').select('fy, rates');
+      if (error) return { statusCode: 200, body: JSON.stringify({}) };
+      const byFy = Object.fromEntries((data || []).map((r) => [r.fy, r.rates]));
+      return { statusCode: 200, body: JSON.stringify(byFy) };
+    }
+
     // Lets the Xero Sync tab grey itself out with a clear message instead of
     // letting the user click "Sync" and get a raw {"error": "No Xero
     // connection found..."} dump back from xero-pull.js. No connect/OAuth
@@ -87,14 +100,27 @@ exports.handler = async (event) => {
         const { data: hsList } = await supabase.from('health_scores').select('period_end').eq('client_id', client_id).order('period_end', { ascending: false }).limit(1);
         targetPeriod = hsList?.[0]?.period_end || null;
       }
-      if (!targetPeriod) return { statusCode: 200, body: JSON.stringify({ diagnosis: null, getBetter: [], opportunities: [], taxPlanning: [], risks: [], growthTrajectoryCommentary: null }) };
+      if (!targetPeriod) return { statusCode: 200, body: JSON.stringify({ diagnosis: null, getBetter: [], opportunities: [], taxPlanning: [], risks: [], growthTrajectoryCommentary: null, briefSummary: {}, analysisId: null, analysisError: null }) };
 
-      const [{ data: diag }, { data: recs }, { data: riskFlags }, { data: growthDiag }] = await Promise.all([
+      const [{ data: diag }, { data: recs }, { data: riskFlags }, { data: growthDiag }, { data: briefRows }, { data: errorRow }] = await Promise.all([
         supabase.from('diagnostics').select('*').eq('client_id', client_id).eq('period_end', targetPeriod).eq('pillar', 'overall').limit(1).maybeSingle(),
         supabase.from('recommendations').select('*').eq('client_id', client_id).eq('period_end', targetPeriod),
         supabase.from('flags').select('*').eq('client_id', client_id).eq('period_end', targetPeriod).not('risk_category', 'is', null),
         supabase.from('diagnostics').select('cause_text').eq('client_id', client_id).eq('period_end', targetPeriod).eq('pillar', 'growth_trajectory').limit(1).maybeSingle(),
+        // 'brief_<domain>' rows hold the one-sentence Meeting-brief "so what"
+        // per domain (financial/growth/owner — see analyze.js point 9). Risk's
+        // equivalent comes from risk-summary.js instead, computed fresh from
+        // the live risk register rather than persisted here.
+        supabase.from('diagnostics').select('pillar, cause_text').eq('client_id', client_id).eq('period_end', targetPeriod).like('pillar', 'brief_%'),
+        // 'analysis_error' — a marker analyze-background.js writes on
+        // failure, since a background function's own return value never
+        // reaches the caller. index.html's run-analysis-btn poll watches
+        // both this and analysisId below to know when a triggered run has
+        // actually finished, success or failure.
+        supabase.from('diagnostics').select('cause_text').eq('client_id', client_id).eq('period_end', targetPeriod).eq('pillar', 'analysis_error').limit(1).maybeSingle(),
       ]);
+      const briefSummary = {};
+      (briefRows || []).forEach((r) => { briefSummary[r.pillar.slice('brief_'.length)] = r.cause_text; });
       return {
         statusCode: 200,
         body: JSON.stringify({
@@ -104,7 +130,14 @@ exports.handler = async (event) => {
           taxPlanning: (recs || []).filter((r) => r.type === 'tax_planning'),
           risks: riskFlags || [],
           growthTrajectoryCommentary: growthDiag?.cause_text || null,
+          briefSummary,
           period_end: targetPeriod,
+          analysisId: diag?.id || null,
+          // When this period's analysis last ran — the report compares it
+          // against financial_snapshots.synced_at to spot an analysis that
+          // describes figures which have since been edited.
+          analysedAt: diag?.created_at || null,
+          analysisError: errorRow?.cause_text || null,
         }),
       };
     }
@@ -134,12 +167,15 @@ exports.handler = async (event) => {
 
       const priorFs = priorFsList?.[0] || null;
       const priorPriorFs = priorFsList?.[1] || null;
-      // 'benchmark_<kpi key>' rows hold the separate AI-estimated benchmark line
-      // (see analyze.js) — split back out from the plain interpretation rows.
+      // 'benchmark_<kpi key>' rows hold the separate AI-estimated benchmark line,
+      // 'verdict_<kpi key>' rows hold a plain "good"/"ok"/"bad" read on that KPI's
+      // value (see analyze.js) — both split back out from the plain interpretation rows.
       const interpretations = {};
       const benchmarks = {};
+      const verdicts = {};
       (interpRows || []).forEach((r) => {
         if (r.pillar.startsWith('benchmark_')) benchmarks[r.pillar.slice('benchmark_'.length)] = r.cause_text;
+        else if (r.pillar.startsWith('verdict_')) verdicts[r.pillar.slice('verdict_'.length)] = r.cause_text;
         else interpretations[r.pillar] = r.cause_text;
       });
 
@@ -195,14 +231,25 @@ exports.handler = async (event) => {
       // only" on purpose).
       //
       // Investing (capex): estimated from the movement in fixed_assets
-      // SPECIFICALLY (PP&E net book value) plus depreciation charged —
-      // deliberately not total_assets - current_assets, which can include
+      // SPECIFICALLY (PP&E net book value) plus depreciation charged, plus
+      // two optional corrections worked out from a real client's fixed asset
+      // schedule (see the session that added these — the estimate was
+      // landing thousands off without them):
+      //   - capital_works_deduction: leasehold/structural improvements
+      //     amortise separately from plant & equipment depreciation on most
+      //     schedules (their own P&L line), so they're a second, independent
+      //     non-cash addback, not part of depreciation_amortisation.
+      //   - nbv_assets_sold: net book value of anything disposed of this
+      //     period. A disposal removes value from fixed_assets for reasons
+      //     that are neither a purchase nor depreciation — without adding it
+      //     back, the estimate understates capex by exactly that amount.
+      //     Happens to be $0 whenever the disposed asset was already fully
+      //     written down, which is easy to mistake for "disposals don't
+      //     matter" — they do, this field is just 0 in that specific case.
+      // Deliberately not total_assets - current_assets, which can include
       // unrelated non-current items (a loan receivable from a director,
-      // long-term investments) that would distort the estimate. Still
-      // distorted by any asset disposal during the period (no
-      // disposal-proceeds/gain-on-sale field to correct for that) — caveated
-      // in the frontend note, not silently presented as exact. Overridden by
-      // equipment_purchases when entered.
+      // long-term investments) that would distort the estimate. Overridden
+      // by equipment_purchases when entered.
       //
       // Financing: total_debt is expected to EXCLUDE any director/shareholder
       // loan (see FINANCIAL_FIELD_DEFS / pdf-extract guidance) — that's
@@ -221,14 +268,62 @@ exports.handler = async (event) => {
         const nonOperating = deltaCash - ocfValue;
 
         const deltaFixedAssets = (snap.fixed_assets != null && prior.fixed_assets != null) ? snap.fixed_assets - prior.fixed_assets : null;
-        const capexEstimate = (deltaFixedAssets != null && snap.depreciation_amortisation != null) ? deltaFixedAssets + snap.depreciation_amortisation : null;
+        const capexEstimate = (deltaFixedAssets != null && snap.depreciation_amortisation != null)
+          ? deltaFixedAssets + snap.depreciation_amortisation + (Number(snap.capital_works_deduction) || 0) + (Number(snap.nbv_assets_sold) || 0)
+          : null;
         const capexIsEstimate = snap.equipment_purchases == null && capexEstimate != null;
         const capex = snap.equipment_purchases != null ? snap.equipment_purchases : capexEstimate;
 
         const deltaDebt = (snap.total_debt != null && prior.total_debt != null) ? snap.total_debt - prior.total_debt : null;
         const loanRepayments = snap.loan_repayments != null ? snap.loan_repayments : null;
-        const newBorrowing = (deltaDebt != null && loanRepayments != null) ? deltaDebt + loanRepayments : null;
-        const interestPaid = (ocfDerived && snap.interest_expense != null) ? snap.interest_expense : null;
+        const oneOffRepayment = snap.one_off_loan_repayment != null ? Number(snap.one_off_loan_repayment) : null;
+        const totalRepayments = (loanRepayments != null || oneOffRepayment != null) ? (loanRepayments || 0) + (oneOffRepayment || 0) : null;
+        // Capitalised interest is its own independent fact (e.g. off a loan
+        // statement for a redraw/interest-only facility) — NOT derived from
+        // New borrowing vs the balance movement, because interest_expense
+        // alone can't say whether it was capitalised or paid in cash, and
+        // solving for it as "whatever closes the gap" would silently absorb
+        // a genuine data-entry error (wrong repayments figure, e.g.) into a
+        // number that always looks plausible. Defaults to 0 (not capitalised)
+        // when blank — that's the common case for a standard P&I loan.
+        const capitalisedInterest = snap.interest_capitalised != null ? Number(snap.interest_capitalised) : null;
+        // New borrowing is an independent fact once entered (e.g. a "proceeds
+        // from borrowings" line off a loan/cash flow statement) — before
+        // that, it's an estimate assuming the balance movement is pure
+        // borrowing/repayment plus whatever capitalised interest is already
+        // known, same "estimate-until-overridden" pattern capex_estimate
+        // uses below.
+        const newBorrowingEstimate = (deltaDebt != null) ? deltaDebt + (totalRepayments || 0) - (capitalisedInterest || 0) : null;
+        const newBorrowingEntered = snap.new_borrowing != null ? Number(snap.new_borrowing) : null;
+        const newBorrowingIsEstimate = newBorrowingEntered == null && newBorrowingEstimate != null;
+        // Two independent ways to arrive at "net change in borrowings" once
+        // New borrowing has been entered — one straight off the balances
+        // (deltaDebt, above), one built from New borrowing/repayments/
+        // capitalised interest as three separately-entered facts. Unlike a
+        // solved-for residual, these can genuinely disagree — a mismatch is
+        // real signal that one of the entered figures is wrong, not
+        // something to hide by adjusting capitalisedInterest to compensate.
+        const borrowingsNetCalculated = newBorrowingEntered != null
+          ? newBorrowingEntered - (totalRepayments || 0) + (capitalisedInterest || 0)
+          : null;
+        const interestExpense = (ocfDerived && snap.interest_expense != null) ? snap.interest_expense : null;
+        // The rest of interestExpense once capitalised interest is backed
+        // out — the portion that actually left the bank. Its own category
+        // below, separate from Borrowings: paying interest isn't itself a
+        // borrowing activity, it's a financing cost that happens to relate
+        // to debt (see recon-borrowings-tieout below for the reasoning).
+        const cashInterestPaid = (interestExpense != null) ? interestExpense - (capitalisedInterest || 0) : null;
+        // Borrowings, as a CASH-flow category, is new borrowing drawn down
+        // minus repayments made — capitalised interest never touched the
+        // bank, so it's excluded here even though it's part of the balance
+        // movement (deltaDebt) above. Falls back to deltaDebt minus whatever
+        // capitalised interest is already known when New borrowing hasn't
+        // been entered — identical to deltaDebt itself in the common case
+        // (capitalisedInterest defaults to 0), so this changes nothing for
+        // a client who never touches New borrowing or Interest capitalised.
+        const borrowingsCashFlow = (deltaDebt != null)
+          ? (newBorrowingEntered != null ? newBorrowingEntered : newBorrowingEstimate) - (totalRepayments || 0)
+          : null;
         const deltaDirectorLoan = (snap.director_loan_balance != null && prior.director_loan_balance != null) ? snap.director_loan_balance - prior.director_loan_balance : null;
         const fundsIntroduced = snap.funds_introduced != null ? snap.funds_introduced : null;
         const ownerDrawings = snap.owner_drawings != null ? snap.owner_drawings : null;
@@ -237,7 +332,7 @@ exports.handler = async (event) => {
         const adjustmentsTotal = adjustments.reduce((sum, a) => sum + (Number(a.amount) || 0), 0);
 
         const knownParts = [
-          deltaDebt, interestPaid != null ? -interestPaid : null, deltaDirectorLoan,
+          borrowingsCashFlow, cashInterestPaid != null ? -cashInterestPaid : null, deltaDirectorLoan,
           fundsIntroduced, ownerDrawings != null ? -ownerDrawings : null,
           capex != null ? -capex : null,
           adjustments.length ? adjustmentsTotal : null,
@@ -250,13 +345,25 @@ exports.handler = async (event) => {
           period_end: snap.period_end, prior_period_end: prior.period_end,
           cash_current: snap.cash, cash_prior: prior.cash,
           total_debt_current: snap.total_debt, total_debt_prior: prior.total_debt,
-          delta_debt: deltaDebt, new_borrowing: newBorrowing, loan_repayments: loanRepayments,
-          interest_paid: interestPaid, interest_applicable: ocfDerived,
+          delta_debt: deltaDebt, borrowings_cash_flow: borrowingsCashFlow,
+          // Same raw-value/estimate split as equipment_purchases/capex_estimate
+          // below — new_borrowing is null until an adviser actually types one
+          // in, so the input starts blank (estimate shown as a placeholder,
+          // not a value) rather than looking like a saved fact it isn't.
+          new_borrowing: newBorrowingEntered, new_borrowing_estimate: newBorrowingEstimate,
+          new_borrowing_is_estimate: newBorrowingIsEstimate,
+          loan_repayments: loanRepayments, one_off_loan_repayment: snap.one_off_loan_repayment,
+          total_repayments: totalRepayments,
+          borrowings_net_calculated: borrowingsNetCalculated, capitalised_interest: capitalisedInterest,
+          interest_paid: interestExpense, cash_interest_paid: cashInterestPaid, interest_applicable: ocfDerived,
           delta_director_loan: deltaDirectorLoan,
           director_loan_balance: snap.director_loan_balance != null ? snap.director_loan_balance : null,
           director_loan_balance_prior: prior.director_loan_balance != null ? prior.director_loan_balance : null,
           funds_introduced: fundsIntroduced, owner_drawings: ownerDrawings,
           capex, capex_is_estimate: capexIsEstimate, capex_estimate: capexEstimate, equipment_purchases: snap.equipment_purchases,
+          capital_works_deduction: snap.capital_works_deduction, nbv_assets_sold: snap.nbv_assets_sold,
+          delta_fixed_assets: deltaFixedAssets, depreciation_amortisation: snap.depreciation_amortisation,
+          fixed_assets_current: snap.fixed_assets, fixed_assets_prior: prior.fixed_assets,
           adjustments, adjustments_total: adjustmentsTotal,
           residual: nonOperating - financingKnown, has_financing_data: hasFinancingData,
         };
@@ -265,6 +372,10 @@ exports.handler = async (event) => {
       const kpis = (kpiLibrary || []).map((kpi) => {
         const value = computeKpiValue(fsForKpis, kpi, priorFs);
         const priorValue = kpi.kind === 'growth' ? null : computeKpiValue(priorFs, kpi, null);
+        // Raw prior numerator (e.g. last period's tax expense $, not just the
+        // ratio) — priorValue alone can't answer "vs last period" for a KPI's
+        // dollar components, only for the ratio itself.
+        const priorNumerator = kpi.kind === 'growth' ? null : sumFields(priorFs, kpi.numerator);
         let confidence = value === null ? 'red' : (kpi.estimation_note ? 'yellow' : 'green');
         let estimationNote = kpi.estimation_note;
         if (kpi.key === 'op_cash_conversion' && ocf.derived && value !== null) {
@@ -274,9 +385,10 @@ exports.handler = async (event) => {
         const result = {
           key: kpi.key, name: kpi.name, format: kpi.format, kind: kpi.kind, category: kpi.category,
           numerator: kpi.numerator, denominator: kpi.denominator,
-          value, priorValue, confidence, estimation_note: estimationNote,
+          value, priorValue, priorNumerator, confidence, estimation_note: estimationNote,
           interpretation: interpretations[kpi.key] || null,
           benchmark: benchmarks[kpi.key] || null,
+          verdict: verdicts[kpi.key] || null,
           improvement_tip: kpi.improvement_tip || null,
         };
         // Exposes the derivation's individual components so the frontend can
@@ -362,6 +474,83 @@ exports.handler = async (event) => {
       }));
 
       return { statusCode: 200, body: JSON.stringify({ periods, kpis }) };
+    }
+
+    // Same trend view as get_kpi_history, but scoped to each of the client's
+    // trading divisions (client_context.divisions) instead of the blended
+    // entity total — for clients with none, division_breakdown is always
+    // empty and this just returns { divisions: [], periods: [], byDivision: {} }.
+    // Reuses computeKpiValue/sumFields (duplicated here rather than shared,
+    // matching this file's own get_kpi_history right above) against each
+    // division's own breakdown entry treated as a mini snapshot: a division
+    // entry naturally has no equity/current_assets/etc., so any KPI needing
+    // one of those correctly comes back null with no extra filtering —
+    // whatever's in kpi_library that a division CAN answer (revenue_growth,
+    // gp_margin, wages_pct, debtor_days, creditor_days) just falls out.
+    if (action === 'get_division_kpi_history') {
+      const HISTORY_LENGTH = 6;
+      const [{ data: ctx, error: ctxErr }, { data: snapshots, error: snapErr }, { data: kpiLibrary, error: libErr }] = await Promise.all([
+        supabase.from('client_context').select('divisions').eq('client_id', client_id).maybeSingle(),
+        supabase.from('financial_snapshots').select('period_end, division_breakdown').eq('client_id', client_id).lte('period_end', period_end || '9999-12-31').order('period_end', { ascending: false }).limit(HISTORY_LENGTH + 1),
+        supabase.from('kpi_library').select('*').eq('active', true).order('sort_order'),
+      ]);
+      if (ctxErr) throw ctxErr;
+      if (snapErr) throw snapErr;
+      if (libErr) throw libErr;
+      const divisions = ctx?.divisions || [];
+      if (!divisions.length || !snapshots || !snapshots.length) {
+        return { statusCode: 200, body: JSON.stringify({ divisions: [], periods: [], byDivision: {} }) };
+      }
+
+      const chronological = [...snapshots].reverse();
+
+      const sumFields = (snapshot, fields) => {
+        if (!snapshot || !fields) return null;
+        let total = 0;
+        for (const f of fields) {
+          const v = snapshot[f];
+          if (v === null || v === undefined) return null;
+          total += Number(v);
+        }
+        return total;
+      };
+
+      const computeKpiValue = (snapshot, kpi, prior) => {
+        if (kpi.kind === 'growth') {
+          const cur = sumFields(snapshot, kpi.numerator);
+          const priorVal = sumFields(prior, kpi.numerator);
+          return (cur === null || priorVal === null || priorVal === 0) ? null : (cur - priorVal) / priorVal;
+        }
+        const num = sumFields(snapshot, kpi.numerator);
+        const den = sumFields(snapshot, kpi.denominator);
+        if (num === null || den === null || den === 0) return null;
+        return kpi.kind === 'days' ? (num / den) * 365 : num / den;
+      };
+
+      const hasSpareTrendRef = chronological.length > HISTORY_LENGTH;
+      const shown = hasSpareTrendRef ? chronological.slice(1) : chronological;
+      const priorFor = (i) => hasSpareTrendRef ? chronological[i] : (i > 0 ? chronological[i - 1] : null);
+      const periods = shown.map((s) => s.period_end);
+
+      // One division's breakdown entry for a given financial_snapshots row,
+      // or null if that division has no entry that period (e.g. it didn't
+      // exist yet, or divisions were only set up partway through the client's
+      // history) — computeKpiValue already handles a null snapshot cleanly.
+      const divisionEntry = (snap, divisionId) => (snap?.division_breakdown || []).find((d) => d.division_id === divisionId) || null;
+
+      const byDivision = {};
+      divisions.forEach((div) => {
+        byDivision[div.id] = {
+          name: div.name,
+          kpis: (kpiLibrary || []).map((kpi) => ({
+            key: kpi.key, name: kpi.name, format: kpi.format, kind: kpi.kind, category: kpi.category,
+            numerator: kpi.numerator, denominator: kpi.denominator,
+            values: shown.map((snap, i) => computeKpiValue(divisionEntry(snap, div.id), kpi, divisionEntry(priorFor(i), div.id))),
+          })),
+        };
+      });
+
+      return { statusCode: 200, body: JSON.stringify({ divisions, periods, byDivision }) };
     }
 
     // Growth trajectory chart's own dedicated action — deliberately NOT
@@ -489,14 +678,17 @@ exports.handler = async (event) => {
       return { statusCode: 200, body: JSON.stringify({ snapshots: snapshots || [], latestValuation: valuations?.[0] || null }) };
     }
 
-    // Risk Review domain — rolls up all sources sharing risk_items. Financial
-    // is period-scoped (re-synced every analyze.js run, see
-    // lib/financial-risk-sync.js) so it's filtered to the period being viewed;
-    // business and industry both don't change per period (business questions
-    // are answered once and resurface adaptively, see
-    // business-risk-questionnaire.js; industry is generated once per client),
-    // so both are fetched for the client regardless of which period is
-    // selected.
+    // Risk Review domain — rolls up all sources sharing risk_items. All four
+    // sources are persistent per risk_name now, not period-scoped (financial
+    // and owner_wealth are updated in place every sync — see
+    // lib/financial-risk-sync.js and lib/owner-wealth-risk-sync.js — rather
+    // than rebuilt every run/save; business questions are answered once and
+    // resurface adaptively, see business-risk-questionnaire.js; industry is
+    // generated once per client), so all four are fetched for the client
+    // regardless of which period is selected. period_end is still recorded
+    // on each row (last-touched, informational) but no longer filters what's
+    // returned — the true period-by-period history for financial lives
+    // separately in the `flags` table, untouched by any of this.
     if (action === 'get_risk_items') {
       // .order('id') as a tiebreaker on every query here: industry's rows
       // are all written in one bulk insert (see generateIndustryRiskItems),
@@ -507,18 +699,11 @@ exports.handler = async (event) => {
       // so adding it as a secondary sort makes the order deterministic and
       // stable across reads regardless of what's been updated. Same risk
       // exists for financial's severity ties, so it gets the tiebreaker too.
-      // owner_wealth is period-scoped like financial (not client-level like
-      // business/industry) — Owner Wealth is its own annual snapshot with
-      // its own period_end, same reasoning financial's query already uses.
       const [{ data: financial }, { data: industry }, { data: business }, { data: ownerWealth }] = await Promise.all([
-        period_end
-          ? supabase.from('risk_items').select('*').eq('client_id', client_id).eq('period_end', period_end).eq('source', 'financial').order('severity', { ascending: false }).order('id')
-          : Promise.resolve({ data: [] }),
+        supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'financial').order('severity', { ascending: false }).order('id'),
         supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'industry').order('created_at').order('id'),
         supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'business').order('created_at').order('id'),
-        period_end
-          ? supabase.from('risk_items').select('*').eq('client_id', client_id).eq('period_end', period_end).eq('source', 'owner_wealth').order('severity', { ascending: false }).order('id')
-          : Promise.resolve({ data: [] }),
+        supabase.from('risk_items').select('*').eq('client_id', client_id).eq('source', 'owner_wealth').order('severity', { ascending: false }).order('id'),
       ]);
 
       // Isolated from the block above on purpose — until migration_risk_items_v3.sql
